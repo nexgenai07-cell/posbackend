@@ -1,0 +1,41 @@
+from django.urls import path
+
+from .views import (
+    CloseOrderView,
+    CancelOrderView,
+    CashierReviewView,
+    AssignWaiterView,
+    WaiterConfirmView,
+    OrderHistoryView,
+    KitchenTicketsView,
+    OrderCustomerView,
+    OrderDetailView,
+    OrderItemDetailView,
+    OrderItemsView,
+    OrderItemStatusView,
+    OrderListCreateView,
+    OrderPaymentsView,
+    PublicOrderCreateView,
+    SendToKitchenView,
+    TableOpenOrderView,
+)
+
+urlpatterns = [
+    path("orders/qr/", PublicOrderCreateView.as_view(), name="order-qr-create"),
+    path("orders/", OrderListCreateView.as_view(), name="order-list-create"),
+    path("orders/<int:pk>/", OrderDetailView.as_view(), name="order-detail"),
+    path("orders/<int:pk>/history/", OrderHistoryView.as_view(), name="order-history"),
+    path("orders/<int:pk>/cashier-review/", CashierReviewView.as_view(), name="order-cashier-review"),
+    path("orders/<int:pk>/assign-waiter/", AssignWaiterView.as_view(), name="order-assign-waiter"),
+    path("orders/<int:pk>/waiter-confirm/", WaiterConfirmView.as_view(), name="order-waiter-confirm"),
+    path("orders/<int:pk>/cancel/", CancelOrderView.as_view(), name="order-cancel"),
+    path("tables/<int:pk>/open-order/", TableOpenOrderView.as_view(), name="table-open-order"),
+    path("orders/<int:pk>/items/", OrderItemsView.as_view(), name="order-items"),
+    path("orders/<int:pk>/items/<int:item_id>/", OrderItemDetailView.as_view(), name="order-item-detail"),
+    path("orders/<int:pk>/send-to-kitchen/", SendToKitchenView.as_view(), name="order-send-to-kitchen"),
+    path("orders/<int:pk>/customer/", OrderCustomerView.as_view(), name="order-customer"),
+    path("orders/<int:pk>/payments/", OrderPaymentsView.as_view(), name="order-payments"),
+    path("orders/<int:pk>/close/", CloseOrderView.as_view(), name="order-close"),
+    path("kds/tickets/", KitchenTicketsView.as_view(), name="kds-tickets"),
+    path("orders/<int:pk>/items/<int:item_id>/status/", OrderItemStatusView.as_view(), name="order-item-status"),
+]
