@@ -321,7 +321,14 @@ def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
     Returns (outcome, bill).
     """
     with transaction.atomic():
-        bill = Bill.objects.select_for_update().select_related("table", "branch").get(pk=bill_id)
+        # No select_related() here. Bill.table is nullable, so select_related
+        # would make it a LEFT OUTER JOIN, and Postgres refuses FOR UPDATE on
+        # the nullable side of an outer join ("FOR UPDATE cannot be applied to
+        # the nullable side of an outer join"). SQLite silently ignores
+        # select_for_update entirely, which is why the test suite cannot catch
+        # this — it only shows up on the real database. The row lock matters
+        # far more than saving two lazy-loaded queries.
+        bill = Bill.objects.select_for_update().get(pk=bill_id)
 
         if moyasar is not None:
             outcome = _record_moyasar_payment(bill, moyasar)

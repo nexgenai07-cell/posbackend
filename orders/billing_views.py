@@ -422,9 +422,10 @@ class BillReleaseTableView(APIView):
     def post(self, request, pk):
         with transaction.atomic():
             bill = get_object_or_404(
-                Bill.objects.select_for_update().select_related("table").filter(
-                    branch=request.user.branch
-                ),
+                # select_related("table") would be an outer join (table is
+                # nullable) and Postgres rejects FOR UPDATE on it — see the
+                # note in billing.mark_bill_paid().
+                Bill.objects.select_for_update().filter(branch=request.user.branch),
                 pk=pk,
             )
             try:
