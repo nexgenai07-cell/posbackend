@@ -1,5 +1,17 @@
 from django.urls import path
 
+from .billing_views import (
+    BillBySessionView,
+    BillCancelPayView,
+    BillDetailView,
+    BillListView,
+    BillMarkPaidView,
+    BillReleaseTableView,
+    BillReopenView,
+    BillRequestPayView,
+    BillVerifyOnlineView,
+    MoyasarWebhookView,
+)
 from .views import (
     CloseOrderView,
     CancelOrderView,
@@ -21,6 +33,23 @@ from .views import (
 )
 
 urlpatterns = [
+    # -- billing: customer-facing (AllowAny, authenticated by the table's QR
+    # session token, same as the public order endpoints below) --------------
+    path("bills/by-session/<str:token>/", BillBySessionView.as_view(), name="bill-by-session"),
+    path("bills/request-pay/", BillRequestPayView.as_view(), name="bill-request-pay"),
+    path("bills/cancel-pay-request/", BillCancelPayView.as_view(), name="bill-cancel-pay"),
+    path("bills/verify-online/", BillVerifyOnlineView.as_view(), name="bill-verify-online"),
+    # Machine caller. Must stay reachable without auth and without the
+    # customer's browser being open — this is what makes payment reliable.
+    path("payments/moyasar/webhook/", MoyasarWebhookView.as_view(), name="moyasar-webhook"),
+
+    # -- billing: cashier-facing (JWT, owner/manager/cashier) ---------------
+    path("bills/", BillListView.as_view(), name="bill-list"),
+    path("bills/<int:pk>/", BillDetailView.as_view(), name="bill-detail"),
+    path("bills/<int:pk>/mark-paid/", BillMarkPaidView.as_view(), name="bill-mark-paid"),
+    path("bills/<int:pk>/reopen/", BillReopenView.as_view(), name="bill-reopen"),
+    path("bills/<int:pk>/release-table/", BillReleaseTableView.as_view(), name="bill-release-table"),
+
     path("orders/qr/", PublicOrderCreateView.as_view(), name="order-qr-create"),
     path("orders/", OrderListCreateView.as_view(), name="order-list-create"),
     path("orders/<int:pk>/", OrderDetailView.as_view(), name="order-detail"),

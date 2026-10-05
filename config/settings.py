@@ -182,6 +182,13 @@ REST_FRAMEWORK = {
         # keys anonymous requests by IP.
         'menu': '60/min',
         'table-lookup': '60/min',
+        # Billing endpoints are AllowAny (authenticated by the table's
+        # session token), so they get their own tighter scopes. 'bill-pay'
+        # covers request-pay/cancel-pay-request — a customer taps those a
+        # handful of times at most. 'bill-verify' covers the callback page's
+        # verification, which costs us an outbound Moyasar API call per hit.
+        'bill-pay': '20/min',
+        'bill-verify': '30/min',
     },
 }
 
@@ -200,6 +207,43 @@ SIMPLE_JWT = {
 # CORS — restaurant-admin's Vite dev server needs to be listed here,
 # e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173
 CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[])
+
+
+# Moyasar payment gateway (orders/moyasar.py, orders/billing.py)
+# ---------------------------------------------------------------
+# Test vs live is ENTIRELY a matter of which keys are in .env — sk_test_…/
+# pk_test_… for sandbox, sk_live_…/pk_live_… for production. There is no mode
+# flag anywhere in the code, so going live never requires a deploy of new code.
+#
+# MOYASAR_SECRET_KEY is backend-only and must never reach a browser: it is
+# read in orders/moyasar.py and nowhere else, and no serializer exposes it.
+# MOYASAR_PUBLISHABLE_KEY is safe to hand out and is returned by
+# POST /api/bills/request-pay/ so the customer web app needs no Moyasar
+# config of its own.
+#
+# Defaults are blank so `manage.py check`/`migrate` work on a fresh clone;
+# requesting an online payment with a blank secret returns 503
+# error.paymentsNotConfigured rather than failing obscurely.
+MOYASAR_SECRET_KEY = env('MOYASAR_SECRET_KEY', default='')
+MOYASAR_PUBLISHABLE_KEY = env('MOYASAR_PUBLISHABLE_KEY', default='')
+MOYASAR_API_BASE = env('MOYASAR_API_BASE', default='https://api.moyasar.com/v1')
+# Optional shared secret echoed back in the webhook body's `secret_token`
+# field. Leave blank to skip the check — verification against the Moyasar API
+# is the real gate either way. See orders/moyasar.webhook_secret_matches().
+MOYASAR_WEBHOOK_SECRET = env('MOYASAR_WEBHOOK_SECRET', default='')
+
+# Every bill is charged in SAR, hard-coded in orders/billing.py. Moyasar takes
+# the amount in halalas (1 SAR = 100 halalas), computed server-side from
+# Decimal only. NOTE FOR GOING LIVE: catalog Product.price is a bare Decimal
+# with no currency column, so every menu price in the database is assumed to
+# already be in SAR. Loading a menu priced in anything else would charge the
+# wrong amount.
+BILL_CURRENCY = 'SAR'
+
+# Absolute origin of the customer-facing QR web app (burger_web). Used to
+# build the Moyasar callback_url the customer is redirected back to after
+# 3DS/STC Pay. Must be the public origin in production, not localhost.
+CUSTOMER_WEB_BASE_URL = env('CUSTOMER_WEB_BASE_URL', default='http://localhost:3000')
 
 
 # Email

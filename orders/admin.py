@@ -5,7 +5,7 @@ from django.db.models import Sum, Q
 
 from common.admin import SoftDeleteAdmin
 
-from .models import Order, OrderItem, Payment
+from .models import Bill, MoyasarPayment, Order, OrderItem, Payment
 
 
 class OrderItemInline(admin.TabularInline):
@@ -103,3 +103,57 @@ class PaymentAdmin(SoftDeleteAdmin):
     list_select_related = ("order",)
     date_hierarchy = "paid_at"
     ordering = ("-paid_at", "-id")
+
+
+@admin.register(Bill)
+class BillAdmin(admin.ModelAdmin):
+    """
+    Read-mostly on purpose. A bill's status is the output of the state machine
+    in orders/billing.py — editing it here would skip the Payment rows, the
+    order transitions and the cashier notifications that go with it. Use the
+    POS screen (or the API) to settle and release; this is for looking.
+
+    Not a SoftDeleteAdmin: Bill is not a BaseModel, because a financial record
+    must not be soft-deletable out from under its Payment rows.
+    """
+
+    list_display = ("id", "branch", "table", "status", "requested_method", "paid_method",
+                    "total_at_payment", "pay_requested_at", "paid_at", "closed_at")
+    list_filter = ("branch", "status", "paid_method")
+    search_fields = ("table__label_en", "table__label_ar")
+    list_select_related = ("branch", "table")
+    autocomplete_fields = ("branch", "table", "paid_by", "released_by")
+    date_hierarchy = "created_at"
+    ordering = ("-id",)
+    readonly_fields = ("total_at_payment", "pay_requested_at", "paid_at", "closed_at",
+                       "created_at", "updated_at")
+
+
+@admin.register(MoyasarPayment)
+class MoyasarPaymentAdmin(admin.ModelAdmin):
+    """
+    Fully read-only: every field is a verified copy of what Moyasar's API
+    returned. Changing one here would make the audit trail a lie.
+
+    `needs_review` is the one to watch — it marks a payment Moyasar reports as
+    paid that we could not reconcile with its bill (wrong amount, bill already
+    settled). Those need a refund or a manual settle; see
+    orders/billing._record_moyasar_payment().
+    """
+
+    list_display = ("payment_id", "bill", "status", "amount_halalas", "currency",
+                    "source_type", "source_company", "needs_review", "verified_at")
+    list_filter = ("needs_review", "status", "source_type", "source_company")
+    search_fields = ("payment_id", "bill__table__label_en")
+    list_select_related = ("bill",)
+    date_hierarchy = "verified_at"
+    ordering = ("-id",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        return [field.name for field in self.model._meta.fields]

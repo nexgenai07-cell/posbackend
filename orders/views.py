@@ -40,7 +40,7 @@ from .serializers import (
     PublicOrderSerializer,
     RecordPaymentSerializer,
 )
-from .services import get_or_create_open_order
+from .services import BillLocked, get_or_create_open_order
 from .workflow import (
     InvalidOrderTransition,
     TERMINAL_ORDER_STATUSES,
@@ -57,6 +57,25 @@ def _closed_order_response(order):
     if order.status in _TERMINAL_STATUSES:
         return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
     return None
+
+
+def _bill_locked_response():
+    """409 for "this table has asked to pay, so nothing new goes on the bill".
+
+    Distinct from error.orderClosed: the order itself may be perfectly open,
+    it is the *bill* that is locked, and the fix is a cashier reopening it
+    (POST /api/bills/<id>/reopen/) rather than starting a new order."""
+    return Response({"error": "error.billLocked"}, status=status.HTTP_409_CONFLICT)
+
+
+def _locked_bill_for_order(order):
+    """The order's bill if it is past `open`, else None. Read inside the
+    caller's transaction, after the table row is already locked."""
+    from .models import BillStatus
+    if order.bill_id is None:
+        return None
+    bill = order.bill
+    return bill if bill.status != BillStatus.OPEN else None
 
 
 def _order_queryset():
@@ -260,7 +279,12 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
         with transaction.atomic():
             if table_id:
                 table = get_object_or_404(Table.objects.select_for_update(), pk=table_id, branch=request.user.branch)
-                order, created = get_or_create_open_order(table, staff=request.user)
+                try:
+                    order, created = get_or_create_open_order(table, staff=request.user)
+                except BillLocked:
+                    # The customer has already asked to pay. A cashier must
+                    # reopen the bill before anything else goes on it.
+                    return _bill_locked_response()
             else:
                 order = Order.objects.create(branch=request.user.branch, staff=request.user, source=OrderSource.POS)
                 created = True
@@ -424,6 +448,10 @@ class OrderItemsView(APIView):
             guard = _closed_order_response(order)
             if guard:
                 return guard
+            # Adding a line to an existing order is as much "new food on this
+            # bill" as opening a new order is, so it is blocked the same way.
+            if _locked_bill_for_order(order):
+                return _bill_locked_response()
             if request.user.role == StaffRole.WAITER and (
                 order.assigned_waiter_id != request.user.pk or order.status != OrderStatus.AWAITING_WAITER
             ):
@@ -798,8 +826,18 @@ class PublicOrderCreateView(APIView):
                 return Response(PublicOrderSerializer(order).data, status=status.HTTP_200_OK)
 
             customer, _ = find_or_create_customer(table.branch, phone, request.data.get("name", ""))
+            try:
+                order, created = get_or_create_open_order(table, customer=customer, source=OrderSource.QR)
+            except BillLocked:
+                # This table has already asked for the bill. Blocking here is
+                # the whole point of pay_requested: the amount the customer is
+                # about to pay must not be able to change under them.
+                # Checked BEFORE table.open() below, which would otherwise
+                # flip the table back from `needs-bill` to `occupied` on a
+                # request we are about to refuse (a `return` inside
+                # transaction.atomic() commits — it does not roll back).
+                return _bill_locked_response()
             table.open()  # Preserve the permanent QR and mark occupied only when an order is placed.
-            order, created = get_or_create_open_order(table, customer=customer, source=OrderSource.QR)
             if created:
                 record_order_event(order, None, "order_created", details={"source": OrderSource.QR})
             if order.customer_id is None:
