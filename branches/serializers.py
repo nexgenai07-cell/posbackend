@@ -15,7 +15,10 @@ class BranchSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Branch
-        fields = ["id", "name_en", "name_ar", "address", "timezone", "currency", "created_at", "updated_at"]
+        fields = [
+            "id", "name_en", "name_ar", "address", "timezone", "currency",
+            "logo_url", "favicon_url", "created_at", "updated_at",
+        ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
     def validate(self, attrs):
@@ -43,3 +46,18 @@ class BranchLocationSerializer(serializers.ModelSerializer):
         if (latitude is None) != (longitude is None):
             raise serializers.ValidationError({"location": "error.locationCoordinatesPairRequired"})
         return attrs
+
+
+class PublicBranchSerializer(serializers.ModelSerializer):
+    """
+    The handful of branch fields a customer-facing client may see.
+
+    Deliberately narrow: no coordinates, no geofence radius, no attendance
+    settings. burger_web needs the restaurant's name and logo to brand itself
+    (requirement §17) and nothing else, and this endpoint is AllowAny.
+    """
+
+    class Meta:
+        model = Branch
+        fields = ["id", "name_en", "name_ar", "logo_url", "favicon_url", "currency"]
+        read_only_fields = fields

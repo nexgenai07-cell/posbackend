@@ -169,7 +169,7 @@ class ProductPerformanceView(BaseReportView):
             items = items.filter(product__category_id=category_param)
 
         results = list(
-            items.values("product_id", "name_en_snapshot")
+            items.values("product_id", "name_en_snapshot", "variant_name_en_snapshot")
             .annotate(quantity_sold=Sum("quantity"), revenue=Sum(F("price_snapshot") * F("quantity")))
             .order_by("-revenue")
         )
@@ -214,7 +214,7 @@ class MarginsView(BaseReportView):
             items = items.filter(product__category_id=category_param)
 
         rows = (
-            items.values("product_id", "name_en_snapshot")
+            items.values("product_id", "name_en_snapshot", "variant_name_en_snapshot")
             .annotate(
                 quantity_sold=Sum("quantity"),
                 revenue=Sum(F("price_snapshot") * F("quantity")),

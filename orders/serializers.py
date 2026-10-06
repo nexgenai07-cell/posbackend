@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from catalog.models import Product
+from catalog.models import Product, ProductVariant
 from catalog.services import current_price, is_available_today
 from inventory.services import check_product_stock
 
@@ -20,7 +20,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItem
         fields = [
-            "id", "order", "product", "name_en_snapshot", "name_ar_snapshot",
+            "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
+            "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at",
             "created_at", "updated_at",
         ]
@@ -28,7 +29,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
         # and never editable afterward — that's the whole point of a snapshot.
         # fired_at/ready_at are set only by SendToKitchenView/OrderItemStatusView.
         read_only_fields = [
-            "id", "order", "product", "name_en_snapshot", "name_ar_snapshot",
+            "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
+            "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "price_snapshot", "status", "fired_at", "ready_at", "created_at", "updated_at",
         ]
 
@@ -37,6 +39,11 @@ class AddOrderItemSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(
         queryset=Product.objects.all(),
         error_messages={"required": "error.productRequired", "does_not_exist": "error.productRequired"},
+    )
+    # Optional: products with no variants are ordered exactly as before.
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.all(), required=False, allow_null=True,
+        error_messages={"does_not_exist": "error.variantInvalid"},
     )
     quantity = serializers.IntegerField(default=1, min_value=1, error_messages={"min_value": "error.quantityInvalid"})
     notes = serializers.CharField(required=False, allow_blank=True, default="")
@@ -50,8 +57,21 @@ class AddOrderItemSerializer(serializers.Serializer):
     def validate(self, attrs):
         product = attrs.get("product")
         quantity = attrs.get("quantity", 1)
+        variant = attrs.get("variant")
+
+        if product and variant is not None:
+            # A variant id belonging to a DIFFERENT product would otherwise let
+            # a client pay the Half KG price for a 2 KG tray. Same class of
+            # cross-entity check as the bill/table one in billing_views.py.
+            if variant.product_id != product.pk:
+                raise serializers.ValidationError({"variant": "error.variantInvalid"})
+            if not variant.is_active:
+                raise serializers.ValidationError({"variant": "error.variantUnavailable"})
+
         if product:
-            available, _reason = check_product_stock(product, quantity)
+            # Stock is checked against the SELECTED portion: a 2 KG order needs
+            # twice the ingredients, so the base recipe passing proves nothing.
+            available, _reason = check_product_stock(product, quantity, variant=variant)
             if not available:
                 raise serializers.ValidationError({"product": "error.productUnavailable"})
         return attrs
@@ -59,15 +79,23 @@ class AddOrderItemSerializer(serializers.Serializer):
     def create(self, validated_data):
         order = self.context["order"]
         product = validated_data["product"]
+        variant = validated_data.get("variant")
         return OrderItem.objects.create(
             order=order,
             product=product,
+            variant=variant,
             name_en_snapshot=product.name_en,
             name_ar_snapshot=product.name_ar,
+            # Frozen at order time. Renaming a variant later must never rewrite
+            # what an old receipt says it was.
+            variant_name_en_snapshot=variant.name_en if variant else "",
+            variant_name_ar_snapshot=variant.name_ar if variant else "",
             # current_price(), not product.price directly — a product with an
             # active deal must snapshot the deal price, the same one the menu
-            # just showed, not the full price (see catalog/services.py).
-            price_snapshot=current_price(product),
+            # just showed, not the full price (see catalog/services.py). With a
+            # variant this resolves the variant's price, discounted if a deal
+            # window is open.
+            price_snapshot=current_price(product, variant),
             quantity=validated_data["quantity"],
             notes=validated_data.get("notes", ""),
         )
@@ -143,7 +171,7 @@ class PublicOrderItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItem
         fields = [
-            "id", "name_en_snapshot", "name_ar_snapshot", "price_snapshot",
+            "id", "name_en_snapshot", "name_ar_snapshot", "variant_name_en_snapshot", "variant_name_ar_snapshot", "price_snapshot",
             "quantity", "status", "notes", "fired_at", "ready_at",
         ]
         read_only_fields = fields

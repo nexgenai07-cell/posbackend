@@ -1,4 +1,5 @@
 from django.contrib.auth.hashers import check_password, make_password
+from django.core.exceptions import ValidationError
 from django.db import models
 
 from branches.models import Branch
@@ -27,6 +28,10 @@ class Staff(BaseModel):
     role = models.CharField(max_length=16, choices=StaffRole.choices)
     pin_hash = models.CharField(max_length=128)
     is_active = models.BooleanField(default=True)
+    shift_template = models.ForeignKey(
+        "accounts.ShiftTemplate", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="assigned_staff",
+    )
 
     # Not a Django auth user, but DRF's permission plumbing (and anything
     # checking request.user) expects these two attributes to exist.
@@ -59,6 +64,36 @@ class Shift(BaseModel):
     staff = models.ForeignKey(Staff, on_delete=models.CASCADE, related_name="shifts")
     clock_in = models.DateTimeField()
     clock_out = models.DateTimeField(null=True, blank=True)
+    is_late = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.staff.name} shift starting {self.clock_in:%Y-%m-%d %H:%M}"
+
+
+class ShiftTemplate(BaseModel):
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="shift_templates")
+    name = models.CharField(max_length=120)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["start_time", "name", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "name"], condition=models.Q(is_deleted=False),
+                name="unique_shift_template_name_per_branch",
+            ),
+        ]
+
+    @property
+    def crosses_midnight(self):
+        return self.end_time < self.start_time
+
+    def clean(self):
+        super().clean()
+        if self.start_time == self.end_time:
+            raise ValidationError({"end_time": "A shift cannot start and end at the same time."})
+
+    def __str__(self):
+        return f"{self.name} ({self.start_time:%H:%M}–{self.end_time:%H:%M})"

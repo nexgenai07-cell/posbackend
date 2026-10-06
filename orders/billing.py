@@ -374,6 +374,26 @@ def _record_moyasar_payment(bill, moyasar):
     source = moyasar.get("source") or {}
     expected = bill_total_halalas(bill)
 
+    # Keep an auditable provider snapshot without persisting arbitrary nested
+    # response fields (for example card fingerprints or customer details).
+    # Settlement logic uses the verified values above and the normalized DB
+    # columns; metadata.bill_id is retained for reconciliation.
+    metadata = moyasar.get("metadata") if isinstance(moyasar.get("metadata"), dict) else {}
+    raw_snapshot = {
+        key: moyasar[key]
+        for key in ("id", "status", "amount", "currency", "created_at", "paid_at")
+        if moyasar.get(key) is not None
+    }
+    source_snapshot = moyasar.get("source") if isinstance(moyasar.get("source"), dict) else {}
+    if source_snapshot:
+        raw_snapshot["source"] = {
+            key: source_snapshot[key]
+            for key in ("type", "company")
+            if source_snapshot.get(key) is not None
+        }
+    if metadata.get("bill_id") is not None:
+        raw_snapshot["metadata"] = {"bill_id": metadata["bill_id"]}
+
     review_reason = ""
     if amount != expected:
         review_reason = f"amount {amount} != bill total {expected}"
@@ -392,7 +412,7 @@ def _record_moyasar_payment(bill, moyasar):
                 source_company=str(source.get("company") or "")[:24],
                 needs_review=bool(review_reason),
                 review_reason=review_reason[:120],
-                raw=moyasar,
+                raw=raw_snapshot,
             )
     except IntegrityError:
         # The other racer (webhook vs callback) already inserted this exact

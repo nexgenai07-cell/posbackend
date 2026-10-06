@@ -16,6 +16,11 @@ class Table(BaseModel):
     branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="tables")
     label_en = models.CharField(max_length=100)
     label_ar = models.CharField(max_length=100)
+    # How many guests this table seats. Configurable per restaurant rather than
+    # assumed — staff answer "we are 8 people, do you have a table?" from this.
+    # Default 2 is the commonest small-table size and keeps existing rows valid
+    # without forcing a value into every historical table on migration.
+    seats = models.PositiveSmallIntegerField(default=2)
     qr_code = models.CharField(max_length=255, blank=True)
     # Stable per-table token used by its permanent QR code.
     session_token = models.CharField(max_length=64, null=True, blank=True, unique=True)

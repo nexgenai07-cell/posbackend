@@ -33,6 +33,30 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Table.objects.all()
     serializer_class = TableSerializer
 
+    def get_queryset(self):
+        """
+        Branch-scoped (via the mixin), plus two optional filters that exist so
+        the floor can answer "we are 8 people, do you have a table?" in one
+        request instead of pulling every table and filtering client-side:
+
+          ?min_seats=8   tables that seat at least 8
+          ?status=empty  only free tables
+
+        An unparseable min_seats is ignored rather than erroring — it is a
+        convenience filter, and a typo should not blank the floor plan.
+        """
+        queryset = super().get_queryset()
+        min_seats = self.request.query_params.get("min_seats")
+        if min_seats:
+            try:
+                queryset = queryset.filter(seats__gte=int(min_seats))
+            except (TypeError, ValueError):
+                pass
+        status_filter = self.request.query_params.get("status")
+        if status_filter in {choice for choice, _label in TableStatus.choices}:
+            queryset = queryset.filter(status=status_filter)
+        return queryset
+
     def get_permissions(self):
         # active_sessions is a read: it exposes exactly what list/retrieve
         # already return (TableSerializer includes session_token), just

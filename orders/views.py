@@ -777,8 +777,9 @@ class OrderCustomerView(APIView):
 
 class PublicOrderCreateView(APIView):
     """
-    Public (AllowAny) — a customer's phone submitting its cart, scoped to the
-    table it scanned (Phase 13). One call does what OrderListCreateView.post +
+    Public (AllowAny) — a customer's phone submitting its cart, scoped either
+    to a scanned table token or to the public website's default/selected branch.
+    One call does what OrderListCreateView.post +
     OrderItemsView.post + OrderCustomerView.post separately do for staff,
     since "submit my order" is a single customer action, not three requests.
     Also doubles as "add more items to an already-open QR order" — calling
@@ -787,16 +788,31 @@ class PublicOrderCreateView(APIView):
     """
 
     permission_classes = [AllowAny]
+    require_table = False
 
     def post(self, request):
         # Accepts the raw "/t/<token>" QR payload as well as a bare token,
         # via the same helper TableBySessionView uses — the phone can post
         # exactly what it scanned or had typed in, unnormalised.
-        token = parse_qr_payload(request.data.get("session_token"))
+        raw_token = request.data.get("session_token")
+        token = parse_qr_payload(raw_token)
         phone = str(request.data.get("phone", "")).strip()
         items_data = request.data.get("items")
-        if not token:
+        if raw_token and not token:
+            return Response({"error": "error.invalidSessionToken"}, status=status.HTTP_400_BAD_REQUEST)
+        if self.require_table and not token:
             return Response({"error": "error.sessionTokenRequired"}, status=status.HTTP_400_BAD_REQUEST)
+        branch = None
+        table = None
+        if token:
+            table = get_object_or_404(Table, session_token=token)
+            branch = table.branch
+        else:
+            from branches.models import Branch
+            branch_id = request.data.get("branch_id")
+            branch = get_object_or_404(Branch, pk=branch_id) if branch_id else Branch.objects.order_by("id").first()
+            if branch is None:
+                return Response({"error": "error.noBranch"}, status=status.HTTP_404_NOT_FOUND)
         if not phone:
             return Response({"error": "error.phoneRequired"}, status=status.HTTP_400_BAD_REQUEST)
         if not items_data:
@@ -806,14 +822,17 @@ class PublicOrderCreateView(APIView):
             return Response({"error": "error.idempotencyKeyRequired"}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
-            table = get_object_or_404(Table.objects.select_for_update(), session_token=token)
+            if table:
+                table = Table.objects.select_for_update().get(pk=table.pk)
             # Use server receipt time so timezone or clock differences between
             # phones on the same network don't reject an otherwise fresh fix.
-            location_payload = request.data.copy()
-            location_payload["location_timestamp"] = timezone.now().timestamp()
-            validate_branch_location(table.branch, location_payload)
+            if table:
+                location_payload = request.data.copy()
+                location_payload["location_timestamp"] = timezone.now().timestamp()
+                validate_branch_location(table.branch, location_payload)
             request_hash = hashlib.sha256(json.dumps({
-                "table": table.pk,
+                "branch": branch.pk,
+                "table": table.pk if table else None,
                 "phone": phone,
                 "name": str(request.data.get("name", "")),
                 "items": items_data,
@@ -825,9 +844,13 @@ class PublicOrderCreateView(APIView):
                 order = previous.order
                 return Response(PublicOrderSerializer(order).data, status=status.HTTP_200_OK)
 
-            customer, _ = find_or_create_customer(table.branch, phone, request.data.get("name", ""))
+            customer, _ = find_or_create_customer(branch, phone, request.data.get("name", ""))
             try:
-                order, created = get_or_create_open_order(table, customer=customer, source=OrderSource.QR)
+                if table:
+                    order, created = get_or_create_open_order(table, customer=customer, source=OrderSource.QR)
+                else:
+                    order = Order.objects.create(branch=branch, customer=customer, source=OrderSource.WEB)
+                    created = True
             except BillLocked:
                 # This table has already asked for the bill. Blocking here is
                 # the whole point of pay_requested: the amount the customer is
@@ -837,9 +860,10 @@ class PublicOrderCreateView(APIView):
                 # request we are about to refuse (a `return` inside
                 # transaction.atomic() commits — it does not roll back).
                 return _bill_locked_response()
-            table.open()  # Preserve the permanent QR and mark occupied only when an order is placed.
+            if table:
+                table.open()  # Preserve the permanent QR and mark occupied only when an order is placed.
             if created:
-                record_order_event(order, None, "order_created", details={"source": OrderSource.QR})
+                record_order_event(order, None, "order_created", details={"source": order.source})
             if order.customer_id is None:
                 order.customer = customer
                 order.save(update_fields=["customer", "updated_at"])
@@ -869,3 +893,26 @@ class PublicOrderCreateView(APIView):
 
         order = Order.objects.prefetch_related("items").get(pk=order.pk)
         return Response(PublicOrderSerializer(order).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class PublicOrderTrackView(APIView):
+    """Public status lookup requiring both the non-sequential order code and phone."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        code = str(request.query_params.get("order_code", "")).strip()
+        phone = str(request.query_params.get("phone", "")).strip()
+        try:
+            order_id = int(code.removeprefix("ORD-"))
+        except ValueError:
+            order_id = 0
+        order = Order.objects.filter(pk=order_id, customer__phone=phone).prefetch_related("items").first()
+        if order and order.order_code != code:
+            order = None
+        if not order:
+            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(PublicOrderSerializer(order).data)
+
+
+class PublicQrOrderCreateView(PublicOrderCreateView):
+    require_table = True

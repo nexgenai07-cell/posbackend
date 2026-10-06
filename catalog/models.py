@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import models
 
 from branches.models import Branch
@@ -73,3 +75,47 @@ class DealWindow(BaseModel):
 
     def __str__(self):
         return f"{self.day} {self.start_time}-{self.end_time}"
+
+
+class ProductVariant(BaseModel):
+    """
+    A size/portion a product can be ordered in — "Half KG", "1 KG", "Cup",
+    "Family Tray". The restaurant defines the names and prices; nothing here
+    assumes what a variant represents.
+
+    OPTIONAL by design. A product with no variants behaves exactly as it always
+    has, priced from Product.price, and no existing row needed migrating.
+    Product.price therefore stays — it is the price for unvarianted products
+    and the fallback everywhere else.
+
+    `recipe_multiplier` scales the product's recipe for this variant: a 1 KG
+    karahi consumes twice the chicken of a Half KG. Without it every variant
+    would deduct identical stock and quietly corrupt inventory and food-cost
+    reporting — nothing would error, the numbers would just be wrong. Costing
+    (catalog/costing.py) and stock deduction (inventory/services.py) both read
+    it, so the two can never disagree.
+    """
+
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="variants")
+    name_en = models.CharField(max_length=120)
+    name_ar = models.CharField(max_length=120)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    # 3 decimal places so a third-of-a-portion is expressible; 1.000 means
+    # "exactly the product's recipe", which is what an unconfigured variant
+    # should do rather than silently scaling anything.
+    recipe_multiplier = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("1.000"))
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "name_en"],
+                condition=models.Q(is_deleted=False),
+                name="unique_active_variant_name_per_product",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name_en} — {self.name_en}"

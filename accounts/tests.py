@@ -213,7 +213,9 @@ class AttendanceGeofenceTests(AccountsApiTestCase):
 
     def test_check_in_and_out_outside_radius_fail_without_mutation(self):
         self.client.force_authenticate(user=self.staff)
-        outside = self.fix(latitude=degrees(3 / 6_371_000))
+        # The branch's attendance radius defaults to 100 m; move clearly
+        # beyond that configured limit rather than beyond the separate 2 m QR radius.
+        outside = self.fix(latitude=degrees(103 / 6_371_000))
         response = self.client.post(f"{self.url}/clock-in/", outside, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertFalse(self.staff.shifts.exists())

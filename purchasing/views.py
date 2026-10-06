@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
+from django.http import HttpResponse
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -15,6 +16,7 @@ from inventory.services import adjust_stock
 from reports.filters import branch_datetime_bounds, parse_date_range
 
 from .models import Purchase, PurchaseStatus, Supplier
+from .services import apply_purchase_stock, reverse_purchase_stock
 from .serializers import PurchaseSerializer, SupplierSerializer
 
 
@@ -52,15 +54,53 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         return [IsOwnerOrManager()]
 
     def update(self, request, *args, **kwargs):
-        if self.get_object().status == PurchaseStatus.RECEIVED:
-            return Response({"error": "error.purchaseAlreadyReceived"}, status=status.HTTP_409_CONFLICT)
-        return super().update(request, *args, **kwargs)
+        """
+        Editing a RECEIVED purchase is allowed (owner/manager), and reconciles
+        inventory rather than leaving it stale.
+
+        Received POs take the reverse -> edit -> re-apply path, all inside one
+        transaction: if any step fails, stock is left exactly as it was rather
+        than half-adjusted. Changing 20 KG to 15 KG therefore leaves +15 in
+        stock, not the +20 the original receive added.
+        """
+        purchase = self.get_object()
+        if purchase.status != PurchaseStatus.RECEIVED:
+            return super().update(request, *args, **kwargs)
+
+        with transaction.atomic():
+            locked = Purchase.objects.select_for_update().get(pk=purchase.pk)
+            reverse_purchase_stock(locked, actor=request.user)
+            response = super().update(request, *args, **kwargs)
+            if response.status_code >= 400:
+                # Roll the reversal back with the failed edit — a rejected
+                # payload must not quietly empty the shelves.
+                transaction.set_rollback(True)
+                return response
+            locked.refresh_from_db()
+            apply_purchase_stock(
+                Purchase.objects.prefetch_related("items__inventory_item").get(pk=locked.pk),
+                actor=request.user,
+            )
+        return response
 
     def destroy(self, request, *args, **kwargs):
+        """
+        Deleting a RECEIVED purchase first takes its stock back out.
+
+        Dropping the row while leaving the inventory it added would overstate
+        stock permanently, with nothing in the ledger to explain the gap.
+        """
         purchase = self.get_object()
-        if purchase.status == PurchaseStatus.RECEIVED:
-            return Response({"error": "error.purchaseAlreadyReceived"}, status=status.HTTP_409_CONFLICT)
-        purchase.delete()
+        if purchase.status != PurchaseStatus.RECEIVED:
+            purchase.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        with transaction.atomic():
+            locked = Purchase.objects.select_for_update().get(pk=purchase.pk)
+            reverse_purchase_stock(locked, actor=request.user)
+            # Soft delete (BaseModel default): the StockMovement rows FK to this
+            # purchase and the ledger must stay readable for historical reports.
+            locked.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["get"], permission_classes=[IsOwnerOrManager], url_path="summary")
@@ -127,6 +167,31 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             "supplier_spend": list(supplier_costs.values()),
         })
 
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """
+        GET /api/purchases/<id>/pdf/ — the purchase order as a PDF.
+
+        Built server-side from the database so the PDF, the print view and the
+        on-screen PO can never disagree: all three read the same rows. A
+        browser-side generator could render whatever a stale tab was holding.
+
+        Branding is the configured Branch name/logo, not a hard-coded
+        restaurant.
+        """
+        purchase = self.get_object()
+        try:
+            from .pdf import build_purchase_pdf
+        except ImportError:
+            # reportlab missing -> a clear, actionable code instead of a 500.
+            return Response(
+                {"error": "error.pdfNotConfigured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        pdf_bytes = build_purchase_pdf(purchase)
+        response = HttpResponse(pdf_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="PO-{purchase.pk}.pdf"'
+        return response
+
     @action(detail=True, methods=["post"], url_path="receive")
     def receive(self, request, pk=None):
         """
@@ -146,16 +211,9 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             if purchase.status == PurchaseStatus.RECEIVED:
                 return Response({"error": "error.purchaseAlreadyReceived"}, status=status.HTTP_409_CONFLICT)
 
-            for purchase_item in purchase.items.select_related("inventory_item"):
-                adjust_stock(
-                    purchase_item.inventory_item_id,
-                    purchase_item.quantity,
-                    StockMovementReason.PURCHASE,
-                    purchase=purchase,
-                    purchase_item=purchase_item,
-                    unit_cost_snapshot=purchase_item.unit_cost,
-                )
-                InventoryItem.objects.filter(pk=purchase_item.inventory_item_id).update(cost_per_unit=purchase_item.unit_cost)
+            # Shared with the re-apply step of update() above, so receiving and
+            # re-receiving-after-an-edit can never drift apart.
+            apply_purchase_stock(purchase, actor=request.user)
 
             purchase.status = PurchaseStatus.RECEIVED
             purchase.received_at = timezone.now()

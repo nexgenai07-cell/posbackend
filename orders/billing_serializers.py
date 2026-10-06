@@ -28,6 +28,10 @@ class BillOrderSerializer(serializers.Serializer):
                 "id": item.id,
                 "name_en": item.name_en_snapshot,
                 "name_ar": item.name_ar_snapshot,
+                # The portion as ordered. Snapshotted, so a later rename never
+                # changes what an already-printed bill says.
+                "variant_name_en": item.variant_name_en_snapshot,
+                "variant_name_ar": item.variant_name_ar_snapshot,
                 "price": str(item.price_snapshot),
                 "quantity": item.quantity,
                 "status": item.status,

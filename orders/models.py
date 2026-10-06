@@ -11,6 +11,7 @@ from tables.models import Table
 class OrderSource(models.TextChoices):
     POS = "pos", "POS"
     QR = "qr", "QR"
+    WEB = "web", "Website"
 
 
 class OrderStatus(models.TextChoices):
@@ -172,8 +173,19 @@ class OrderItem(BaseModel):
     # Kept for traceability/reporting only — pricing always reads *_snapshot,
     # never this. See name_en_snapshot/price_snapshot below.
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="order_items")
+    # Traceability only — never read for display or pricing. SET_NULL so
+    # deleting a retired variant can't cascade away order history.
+    variant = models.ForeignKey(
+        "catalog.ProductVariant", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="order_items",
+    )
     name_en_snapshot = models.CharField(max_length=255)
     name_ar_snapshot = models.CharField(max_length=255)
+    # The variant's name AS ORDERED. Receipts, KDS tickets and reports read
+    # these, never variant.name_en — renaming "1 KG" to "Full KG" next week
+    # must not rewrite last week's receipts. Blank for unvarianted products.
+    variant_name_en_snapshot = models.CharField(max_length=120, blank=True)
+    variant_name_ar_snapshot = models.CharField(max_length=120, blank=True)
     price_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
     quantity = models.PositiveIntegerField(default=1)
     status = models.CharField(max_length=16, choices=OrderItemStatus.choices, default=OrderItemStatus.PENDING)

@@ -10,10 +10,15 @@ class TableSerializer(serializers.ModelSerializer):
     # in validate(), which only requires whichever one the admin UI has active.
     label_en = serializers.CharField(required=False, allow_blank=True)
     label_ar = serializers.CharField(required=False, allow_blank=True)
+    # A table that seats nobody is a data-entry mistake, not a configuration.
+    seats = serializers.IntegerField(
+        required=False, min_value=1, max_value=100,
+        error_messages={"min_value": "error.seatsInvalid", "max_value": "error.seatsInvalid", "invalid": "error.seatsInvalid"},
+    )
 
     class Meta:
         model = Table
-        fields = ["id", "branch", "label_en", "label_ar", "qr_code", "session_token", "status", "created_at", "updated_at"]
+        fields = ["id", "branch", "label_en", "label_ar", "seats", "qr_code", "session_token", "status", "created_at", "updated_at"]
         # qr_code/session_token/status are only ever changed via open/close/needs-bill.
         read_only_fields = ["id", "qr_code", "session_token", "status", "created_at", "updated_at"]
 

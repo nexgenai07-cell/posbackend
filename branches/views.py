@@ -1,12 +1,12 @@
 from rest_framework.generics import RetrieveAPIView, UpdateAPIView
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 
 from accounts.permissions import IsOwnerOrManager
 
 from .models import Branch
-from .serializers import BranchLocationSerializer, BranchSerializer
+from .serializers import BranchLocationSerializer, BranchSerializer, PublicBranchSerializer
 
 
 class ActiveBranchView(RetrieveAPIView):
@@ -46,3 +46,28 @@ class BranchLocationView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+
+class PublicBranchView(APIView):
+    """
+    Public (AllowAny) — the restaurant's own name and logo, so a customer-facing
+    client can brand itself from configuration instead of hard-coding it.
+
+    `?branch=` is optional and falls back to the lowest id, the same convention
+    PublicMenuView and LoginChoicesView already use for the single-branch case.
+    Throttled under the existing "menu" scope: it is read-only public data
+    fetched about as often as the menu is.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_scope = "menu"
+
+    def get(self, request):
+        branch_id = request.query_params.get("branch")
+        if branch_id:
+            branch = Branch.objects.filter(pk=branch_id).first()
+        else:
+            branch = Branch.objects.order_by("id").first()
+        if branch is None:
+            return Response({"error": "error.noBranch"}, status=404)
+        return Response(PublicBranchSerializer(branch).data)

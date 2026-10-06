@@ -1,4 +1,8 @@
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from django.shortcuts import get_object_or_404
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -13,12 +17,14 @@ from branches.serializers import BranchSerializer
 from common.mixins import BranchScopedQuerysetMixin
 from common.geofence import validate_branch_location
 
-from .models import Shift, Staff, StaffRole
+from .models import Shift, ShiftTemplate, Staff, StaffRole
 from .permissions import IsOwnerOrManager
 from .serializers import (
     LoginStaffChoiceSerializer,
     PinLoginSerializer,
+    AttendanceSettingsSerializer,
     ShiftSerializer,
+    ShiftTemplateSerializer,
     StaffSerializer,
 )
 
@@ -125,6 +131,35 @@ def _is_self_or_manager(request, staff):
     return request.user.pk == staff.pk or request.user.role in (StaffRole.OWNER, StaffRole.MANAGER)
 
 
+def _branch_timezone(branch):
+    try:
+        return ZoneInfo(branch.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.get_default_timezone()
+
+
+def _attendance_day_bounds(branch, now):
+    zone = _branch_timezone(branch)
+    local_now = timezone.localtime(now, zone)
+    start = datetime.combine(local_now.date(), time.min, tzinfo=zone)
+    end = datetime.combine(local_now.date() + timedelta(days=1), time.min, tzinfo=zone)
+    return local_now, start, end
+
+
+def _is_late_for_staff(staff, local_now):
+    template = staff.shift_template
+    if template is None or not template.active:
+        return False
+    scheduled_date = local_now.date()
+    if template.crosses_midnight and local_now.time() < template.end_time:
+        scheduled_date -= timedelta(days=1)
+    elif local_now.time() < template.start_time:
+        return False
+    start = datetime.combine(scheduled_date, template.start_time, tzinfo=local_now.tzinfo)
+    threshold = start + timedelta(minutes=staff.branch.late_threshold_minutes)
+    return local_now > threshold
+
+
 class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """CRUD is owner/manager only. clock-in/clock-out relax that to 'self or
     a manager', overriding permission_classes per-action below. Queryset is
@@ -149,9 +184,16 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         if not _is_self_or_manager(request, staff):
             return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
         validate_branch_location(staff.branch, request.data, radius_m=staff.branch.attendance_radius_m)
-        if staff.shifts.filter(clock_out__isnull=True).exists():
-            return Response({"error": "error.alreadyClockedIn"}, status=status.HTTP_400_BAD_REQUEST)
-        shift = Shift.objects.create(staff=staff, clock_in=timezone.now())
+        with transaction.atomic():
+            staff = Staff.objects.select_for_update().select_related("branch", "shift_template").get(pk=staff.pk)
+            if staff.shifts.filter(clock_out__isnull=True).exists():
+                return Response({"error": "error.alreadyClockedIn"}, status=status.HTTP_400_BAD_REQUEST)
+            now = timezone.now()
+            local_now, day_start, day_end = _attendance_day_bounds(staff.branch, now)
+            today_count = staff.shifts.filter(clock_in__gte=day_start, clock_in__lt=day_end).count()
+            if today_count >= staff.branch.max_clock_ins_per_day:
+                return Response({"error": "error.maxDailyClockInsReached"}, status=status.HTTP_400_BAD_REQUEST)
+            shift = Shift.objects.create(staff=staff, clock_in=now, is_late=_is_late_for_staff(staff, local_now))
         return Response(ShiftSerializer(shift).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="clock-out", permission_classes=[IsAuthenticated])
@@ -160,9 +202,37 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         if not _is_self_or_manager(request, staff):
             return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
         validate_branch_location(staff.branch, request.data, radius_m=staff.branch.attendance_radius_m)
-        shift = staff.shifts.filter(clock_out__isnull=True).order_by("-clock_in").first()
-        if not shift:
-            return Response({"error": "error.notClockedIn"}, status=status.HTTP_400_BAD_REQUEST)
-        shift.clock_out = timezone.now()
-        shift.save(update_fields=["clock_out", "updated_at"])
+        with transaction.atomic():
+            staff = Staff.objects.select_for_update().select_related("branch").get(pk=staff.pk)
+            shift = staff.shifts.filter(clock_out__isnull=True).order_by("-clock_in").first()
+            if not shift:
+                return Response({"error": "error.notClockedIn"}, status=status.HTTP_400_BAD_REQUEST)
+            now = timezone.now()
+            _local_now, day_start, day_end = _attendance_day_bounds(staff.branch, now)
+            today_count = staff.shifts.filter(clock_out__gte=day_start, clock_out__lt=day_end).count()
+            if today_count >= staff.branch.max_clock_outs_per_day:
+                return Response({"error": "error.maxDailyClockOutsReached"}, status=status.HTTP_400_BAD_REQUEST)
+            shift.clock_out = now
+            shift.save(update_fields=["clock_out", "updated_at"])
         return Response(ShiftSerializer(shift).data)
+
+
+class ShiftTemplateViewSet(viewsets.ModelViewSet):
+    serializer_class = ShiftTemplateSerializer
+    permission_classes = [IsOwnerOrManager]
+
+    def get_queryset(self):
+        return ShiftTemplate.objects.filter(branch_id=self.request.user.branch_id).prefetch_related("assigned_staff")
+
+
+class AttendanceSettingsView(APIView):
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request):
+        return Response(AttendanceSettingsSerializer(request.user.branch).data)
+
+    def patch(self, request):
+        serializer = AttendanceSettingsSerializer(request.user.branch, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)

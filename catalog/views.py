@@ -7,10 +7,10 @@ from rest_framework.views import APIView
 from accounts.permissions import IsOwnerOrManager
 from branches.models import Branch
 from common.mixins import BranchScopedQuerysetMixin
-from inventory.services import check_products_stock
+from inventory.services import check_product_stock, check_products_stock
 
-from .models import Category, Deal, Product
-from .serializers import CategorySerializer, DealSerializer, ProductSerializer
+from .models import Category, Deal, Product, ProductVariant
+from .serializers import CategorySerializer, DealSerializer, ProductSerializer, ProductVariantSerializer
 from .services import current_price, is_available_today
 
 class CategoryViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -131,19 +131,20 @@ class PublicMenuView(APIView):
 
         categories = Category.objects.filter(branch=branch).order_by("sort_order")
         products = (
-            Product.objects.filter(branch=branch, is_available=True)
+            Product.objects.filter(branch=branch)
             .select_related("category", "branch")
-            .prefetch_related("deal__windows", "recipe_items__inventory_item")
+            .prefetch_related("deal__windows", "recipe_items__inventory_item", "variants")
         )
         products = list(products)
         stock_status = check_products_stock(products)
 
         by_category = {}
         for product in products:
-            if not is_available_today(product):
-                continue
-            if not stock_status.get(product.pk, (False, None))[0]:
-                continue
+            is_orderable = (
+                product.is_available
+                and is_available_today(product)
+                and stock_status.get(product.pk, (False, None))[0]
+            )
 
             # current_price() is the single source of truth for deal pricing —
             # also used by AddOrderItemSerializer, so what an order actually
@@ -162,6 +163,28 @@ class PublicMenuView(APIView):
                 "on_deal": on_deal,
                 "image": product.image,
                 "badge": "Deal" if on_deal else product.badge,
+                "is_available": product.is_available,
+                "is_orderable": is_orderable,
+                # Active variants only — an inactive size must not be
+                # orderable. Each carries its own deal-resolved price via the
+                # same current_price(), so the menu and the order snapshot
+                # cannot disagree about what a 1 KG costs today.
+                #
+                # Deliberately NO cost, multiplier or margin here: this is an
+                # AllowAny endpoint and those are staff figures.
+                "variants": [
+                    {
+                        "id": variant.id,
+                        "name_en": variant.name_en,
+                        "name_ar": variant.name_ar,
+                        "price": str(current_price(product, variant)),
+                        "original_price": str(variant.price) if current_price(product, variant) != variant.price else None,
+                        "on_deal": current_price(product, variant) != variant.price,
+                        "is_orderable": is_orderable and check_product_stock(product, 1, variant=variant)[0],
+                    }
+                    for variant in product.variants.all()
+                    if variant.is_active
+                ],
             })
 
         results = [
@@ -170,13 +193,45 @@ class PublicMenuView(APIView):
                 "name_en": category.name_en,
                 "name_ar": category.name_ar,
                 "sort_order": category.sort_order,
-                "products": by_category[category.id],
+                "products": by_category.get(category.id, []),
             }
             for category in categories
-            if category.id in by_category
         ]
 
         return Response({
             "branch": {"id": branch.id, "name_en": branch.name_en, "name_ar": branch.name_ar, "currency": branch.currency},
             "categories": results,
         })
+
+
+class ProductVariantViewSet(viewsets.ModelViewSet):
+    """
+    Configurable portions for one product — /api/products/<id>/variants/.
+
+    Read is any authenticated staff (POS and KDS both need to show which size
+    was ordered); write is owner/manager only, matching every other
+    administrative configuration surface (requirement §22).
+
+    Scoped to the product in the URL AND to the requester's branch, so a
+    manager of one branch cannot edit another branch's pricing by guessing an
+    id — the same scoping rule _get_order_or_404 applies in orders/views.py.
+    """
+
+    serializer_class = ProductVariantSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated()]
+        return [IsOwnerOrManager()]
+
+    def get_queryset(self):
+        return ProductVariant.objects.filter(
+            product_id=self.kwargs["product_pk"],
+            product__branch=self.request.user.branch,
+        ).select_related("product")
+
+    def perform_create(self, serializer):
+        product = get_object_or_404(
+            Product, pk=self.kwargs["product_pk"], branch=self.request.user.branch,
+        )
+        serializer.save(product=product)

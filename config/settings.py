@@ -240,6 +240,23 @@ MOYASAR_WEBHOOK_SECRET = env('MOYASAR_WEBHOOK_SECRET', default='')
 # wrong amount.
 BILL_CURRENCY = 'SAR'
 
+
+# Cloudinary (common/cloudinary.py)
+# ---------------------------------
+# Product images and the restaurant logo are uploaded straight from the browser
+# to Cloudinary using a signature this backend generates — the file never
+# passes through Django, and the API SECRET never reaches the frontend.
+#
+# Cloud name and API key are public by design (both appear in delivered URLs or
+# the upload request). CLOUDINARY_API_SECRET is the only one that matters, and
+# it is read in common/cloudinary.py and nowhere else.
+#
+# All three blank -> uploads are simply switched off and the admin falls back
+# to entering an image URL by hand, which keeps working either way.
+CLOUDINARY_CLOUD_NAME = env('CLOUDINARY_CLOUD_NAME', default='')
+CLOUDINARY_API_KEY = env('CLOUDINARY_API_KEY', default='')
+CLOUDINARY_API_SECRET = env('CLOUDINARY_API_SECRET', default='')
+
 # Absolute origin of the customer-facing QR web app (burger_web). Used to
 # build the Moyasar callback_url the customer is redirected back to after
 # 3DS/STC Pay. Must be the public origin in production, not localhost.

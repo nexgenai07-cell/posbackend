@@ -28,6 +28,8 @@ from .views import (
     OrderListCreateView,
     OrderPaymentsView,
     PublicOrderCreateView,
+    PublicQrOrderCreateView,
+    PublicOrderTrackView,
     SendToKitchenView,
     TableOpenOrderView,
 )
@@ -50,7 +52,9 @@ urlpatterns = [
     path("bills/<int:pk>/reopen/", BillReopenView.as_view(), name="bill-reopen"),
     path("bills/<int:pk>/release-table/", BillReleaseTableView.as_view(), name="bill-release-table"),
 
-    path("orders/qr/", PublicOrderCreateView.as_view(), name="order-qr-create"),
+    path("orders/qr/", PublicQrOrderCreateView.as_view(), name="order-qr-create"),
+    path("orders/customer/", PublicOrderCreateView.as_view(), name="order-customer-create"),
+    path("orders/track/", PublicOrderTrackView.as_view(), name="order-public-track"),
     path("orders/", OrderListCreateView.as_view(), name="order-list-create"),
     path("orders/<int:pk>/", OrderDetailView.as_view(), name="order-detail"),
     path("orders/<int:pk>/history/", OrderHistoryView.as_view(), name="order-history"),

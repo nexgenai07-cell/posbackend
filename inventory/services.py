@@ -81,8 +81,28 @@ def units_compatible(recipe_unit, stock_unit):
     return bool(recipe_unit and recipe_unit == stock_unit)
 
 
-def check_products_stock(products, quantity=1, *, lock=False):
-    """Return availability by product using shared recipe and stock rules."""
+def variant_multiplier(variant):
+    """
+    How much of the product's recipe one portion of this variant uses.
+
+    None (no variant selected, or a product with no variants at all) means
+    exactly one recipe — the behaviour every product had before variants
+    existed.
+    """
+    if variant is None:
+        return Decimal("1")
+    return Decimal(variant.recipe_multiplier)
+
+
+def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
+    """
+    Return availability by product using shared recipe and stock rules.
+
+    `multiplier` scales the recipe for a specific variant — pass
+    variant_multiplier(variant) when checking whether a particular size can be
+    made. Omitted, it checks the base recipe, which is what the public menu
+    wants: a product is listed if ANY portion of it can be made.
+    """
     products = list(products)
     if not products:
         return {}
@@ -123,7 +143,7 @@ def check_products_stock(products, quantity=1, *, lock=False):
             if required is None or required <= 0:
                 invalid = True
                 break
-            required_by_item[stock_item.pk] += required * quantity
+            required_by_item[stock_item.pk] += required * quantity * (multiplier or Decimal("1"))
         if invalid:
             availability[product_id] = (False, "invalid_recipe")
         elif any(items[item_id].current_stock <= 0 or items[item_id].current_stock < required
@@ -134,9 +154,14 @@ def check_products_stock(products, quantity=1, *, lock=False):
     return availability
 
 
-def check_product_stock(product, quantity=1, *, lock=False):
-    """Check a product's complete recipe with common units and branch safety."""
-    return check_products_stock([product], quantity, lock=lock)[product.pk]
+def check_product_stock(product, quantity=1, *, lock=False, variant=None):
+    """Check a product's complete recipe with common units and branch safety.
+
+    Pass `variant` to check a specific portion size rather than the base recipe.
+    """
+    return check_products_stock(
+        [product], quantity, lock=lock, multiplier=variant_multiplier(variant),
+    )[product.pk]
 
 
 def require_product_stock(product, quantity=1, *, lock=False):
@@ -219,7 +244,15 @@ def deduct_stock_for_order_items(order_items):
                     or inventory_item.pk in seen_ingredients):
                 raise ProductStockUnavailable("invalid_recipe")
             seen_ingredients.add(inventory_item.pk)
-            amount = _required_in_inventory_unit(recipe_item, inventory_item) * order_item.quantity
+            # A 1 KG portion consumes twice the chicken of a Half KG, so the
+            # recipe is scaled by the ordered VARIANT's multiplier. Without
+            # this every variant would deduct identical stock and nothing
+            # would error — inventory and food-cost reports would just drift.
+            amount = (
+                _required_in_inventory_unit(recipe_item, inventory_item)
+                * order_item.quantity
+                * variant_multiplier(getattr(order_item, "variant", None))
+            )
             if amount <= 0:
                 raise ProductStockUnavailable("invalid_recipe")
             line_required[inventory_item.pk] += amount
