@@ -68,14 +68,34 @@ def _bill_locked_response():
     return Response({"error": "error.billLocked"}, status=status.HTTP_409_CONFLICT)
 
 
-def _locked_bill_for_order(order):
-    """The order's bill if it is past `open`, else None. Read inside the
-    caller's transaction, after the table row is already locked."""
+def _locked_bill_for_order(order, actor=None):
+    """
+    The order's bill if staff may NOT add to it, else None.
+
+    Two different situations, deliberately treated differently:
+
+      pay_requested  the customer is mid-payment and the amount must not move
+                     under them -> blocked, a cashier reopens first.
+
+      paid           the money is in, but the table has not been released and
+                     the guest has ordered a coffee. Staff may add: the bill
+                     reopens and the guest pays the difference. Blocking here
+                     would force a void-and-rekey for one extra item.
+
+    `closed` means the table is already released, so that is blocked too.
+    """
+    from .billing import reopen_for_additional_items
     from .models import BillStatus
+
     if order.bill_id is None:
         return None
     bill = order.bill
-    return bill if bill.status != BillStatus.OPEN else None
+    if bill.status == BillStatus.OPEN:
+        return None
+    if bill.status == BillStatus.PAID:
+        reopen_for_additional_items(bill, actor=actor)
+        return None
+    return bill
 
 
 def _order_queryset():
@@ -450,7 +470,7 @@ class OrderItemsView(APIView):
                 return guard
             # Adding a line to an existing order is as much "new food on this
             # bill" as opening a new order is, so it is blocked the same way.
-            if _locked_bill_for_order(order):
+            if _locked_bill_for_order(order, actor=request.user):
                 return _bill_locked_response()
             if request.user.role == StaffRole.WAITER and (
                 order.assigned_waiter_id != request.user.pk or order.status != OrderStatus.AWAITING_WAITER
@@ -824,11 +844,8 @@ class PublicOrderCreateView(APIView):
         with transaction.atomic():
             if table:
                 table = Table.objects.select_for_update().get(pk=table.pk)
-            # Use server receipt time so timezone or clock differences between
-            # phones on the same network don't reject an otherwise fresh fix.
             if table:
                 location_payload = request.data.copy()
-                location_payload["location_timestamp"] = timezone.now().timestamp()
                 validate_branch_location(table.branch, location_payload)
             request_hash = hashlib.sha256(json.dumps({
                 "branch": branch.pk,

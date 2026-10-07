@@ -162,7 +162,12 @@ class ProductSerializer(serializers.ModelSerializer):
         max_digits=10,
         decimal_places=2,
         min_value=0,
-        error_messages={"min_value": "error.costPriceInvalid", "required": "error.costPriceInvalid", "invalid": "error.costPriceInvalid"},
+        # Optional: when a product has a recipe, its cost is DERIVED from the
+        # ingredients (see costing.recipe_cost) and the admin should not have
+        # to keep a second copy in sync by hand. Still writable for bought-in
+        # goods — a canned drink has a real cost and no recipe.
+        required=False,
+        error_messages={"min_value": "error.costPriceInvalid", "invalid": "error.costPriceInvalid"},
     )
     category = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
@@ -195,6 +200,28 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_costing(self, product):
         from .costing import costing as compute_costing
         return compute_costing(product)
+
+    def _recipe_cost_or_none(self, product):
+        """The product's ingredient cost, or None when it has no recipe."""
+        from .costing import recipe_cost
+        if product is None or not product.recipe_items.exists():
+            return None
+        return recipe_cost(product)
+
+    def create(self, validated_data):
+        # A new product has no recipe yet, so there is nothing to derive from;
+        # default to 0 rather than rejecting the form over a field the user
+        # should not have to think about.
+        validated_data.setdefault("cost_price", 0)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Not supplied -> keep it in step with the recipe automatically.
+        if "cost_price" not in validated_data:
+            derived = self._recipe_cost_or_none(instance)
+            if derived is not None:
+                validated_data["cost_price"] = derived
+        return super().update(instance, validated_data)
 
     def get_is_orderable(self, product):
         if hasattr(product, "_is_orderable"):

@@ -86,6 +86,20 @@ class StockMovementListView(ListAPIView):
         return qs
 
 
+def _sync_product_cost_price(product):
+    """
+    Keep Product.cost_price in step with the recipe it was derived from.
+
+    Live margin figures are computed on the fly (catalog/costing.py), but
+    reports/ aggregates on the stored `product__cost_price` column, so the two
+    would silently diverge if saving a recipe left the column stale. Writing it
+    here means the admin never types a cost that the ingredients already know.
+    """
+    from catalog.costing import recipe_cost
+
+    Product.objects.filter(pk=product.pk).update(cost_price=recipe_cost(product))
+
+
 class ProductRecipeView(APIView):
     """GET the recipe, PUT replaces the whole set of ingredients, DELETE
     clears it — same replace-all shape as catalog's ProductDealView."""
@@ -115,6 +129,7 @@ class ProductRecipeView(APIView):
         with transaction.atomic():
             RecipeItem.objects.filter(product=product).delete()
             RecipeItem.objects.bulk_create([RecipeItem(product=product, **item) for item in serializer.validated_data])
+            _sync_product_cost_price(product)
 
         items = RecipeItem.objects.filter(product=product).select_related("inventory_item")
         return Response(RecipeItemSerializer(items, many=True).data)
@@ -122,6 +137,9 @@ class ProductRecipeView(APIView):
     def delete(self, request, pk):
         product = get_object_or_404(Product, pk=pk, branch=request.user.branch)
         RecipeItem.objects.filter(product=product).delete()
+        # No recipe left, so there is nothing to derive a cost from. Left as it
+        # was rather than zeroed: a product may legitimately have a hand-entered
+        # cost (a bought-in drink), and blanking it would misreport margins.
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

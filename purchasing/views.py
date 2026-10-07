@@ -167,6 +167,56 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             "supplier_spend": list(supplier_costs.values()),
         })
 
+    @action(detail=True, methods=["post"], url_path="set-status", permission_classes=[IsOwnerOrManager])
+    def set_status(self, request, pk=None):
+        """
+        POST /api/purchases/<id>/set-status/  {"status": "draft|ordered|received"}
+
+        Change a purchase order's status at ANY time, including moving it back
+        out of `received` — a PO marked received by mistake has to be
+        correctable without deleting it and re-keying every line.
+
+        Stock follows the status, which is the whole point:
+          -> received      adds the lines to stock (same path as receive())
+          received ->      takes them back out again
+          neither          no stock movement, just a label change
+
+        All inside one transaction, so a failure leaves both the status and the
+        shelves exactly as they were rather than half-applied.
+        """
+        new_status = str(request.data.get("status", "")).strip()
+        valid = {choice for choice, _label in PurchaseStatus.choices}
+        if new_status not in valid:
+            return Response({"error": "error.purchaseStatusInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            purchase = Purchase.objects.select_for_update().get(
+                pk=self.get_object().pk, branch=request.user.branch,
+            )
+            was_received = purchase.status == PurchaseStatus.RECEIVED
+            now_received = new_status == PurchaseStatus.RECEIVED
+            if was_received == now_received:
+                # Same side of the received line: nothing to reconcile.
+                purchase.status = new_status
+                purchase.save(update_fields=["status", "updated_at"])
+            elif now_received:
+                apply_purchase_stock(
+                    Purchase.objects.prefetch_related("items__inventory_item").get(pk=purchase.pk),
+                    actor=request.user,
+                )
+                purchase.status = new_status
+                purchase.received_at = timezone.now()
+                purchase.save(update_fields=["status", "received_at", "updated_at"])
+            else:
+                reverse_purchase_stock(purchase, actor=request.user)
+                purchase.status = new_status
+                # Clear the timestamp too, or the PO claims a receipt date it
+                # no longer has.
+                purchase.received_at = None
+                purchase.save(update_fields=["status", "received_at", "updated_at"])
+
+        return Response(PurchaseSerializer(self.get_queryset().get(pk=purchase.pk)).data)
+
     @action(detail=True, methods=["get"], url_path="pdf")
     def pdf(self, request, pk=None):
         """

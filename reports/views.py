@@ -2,7 +2,7 @@ from decimal import Decimal
 from collections import defaultdict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, OuterRef, Q, Subquery, Sum
+from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Max, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import ExtractHour, TruncDate
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -311,13 +311,39 @@ class RepeatCustomersView(BaseReportView):
             )
             .exclude(status=OrderStatus.CANCELLED)
         )
+        # Spend and last-visit come from the same query rather than being left
+        # for the client to invent: the page showed a hard-coded 0.00 spend and
+        # a blank date for every row, which is why it read as broken.
         results = list(
             orders.values("customer_id", "customer__phone", "customer__name")
-            .annotate(order_count=Count("id"))
+            .annotate(
+                order_count=Count("id", distinct=True),
+                total_spend=Sum(
+                    F("items__price_snapshot") * F("items__quantity"),
+                    filter=~Q(items__status=OrderItemStatus.VOIDED),
+                ),
+                last_order_at=Max("opened_at"),
+            )
             .filter(order_count__gt=1)
             .order_by("-order_count")
         )
-        return Response({"from": from_date, "to": to_date, "results": results})
+        for row in results:
+            row["total_spend"] = row["total_spend"] or Decimal("0.00")
+
+        # Share of orders in range that came from a returning customer — the
+        # single number this report exists to answer.
+        total_orders = orders.count()
+        repeat_orders = sum(row["order_count"] for row in results)
+        repeat_share = (
+            (Decimal(repeat_orders) / Decimal(total_orders) * 100).quantize(Decimal("0.01"))
+            if total_orders else Decimal("0.00")
+        )
+
+        return Response({
+            "from": from_date, "to": to_date,
+            "results": results,
+            "repeat_order_share": repeat_share,
+        })
 
 
 def _financial_context(request):

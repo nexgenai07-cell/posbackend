@@ -239,6 +239,61 @@ def request_payment(bill, method, actor=None):
     return bill
 
 
+def reopen_for_additional_items(bill, actor=None):
+    """
+    A PAID bill goes back to `pay_requested` because staff added more food
+    before the table was released.
+
+    The guest orders a coffee after settling: the money already taken stays
+    recorded (its Payment rows and total_at_payment are untouched), the bill
+    reopens, and what is now owed is the NEW total minus what was already
+    paid — see amount_outstanding() below.
+
+    Deliberately NOT reopen_bill(): that one returns a bill to `open` and
+    clears requested_method, which would lose the fact that money has already
+    changed hands. This keeps the payment history and simply reopens the tab.
+    """
+    if bill.status == BillStatus.CLOSED:
+        raise BillTransitionError("error.billClosed")
+    if bill.status != BillStatus.PAID:
+        # Nothing to reconcile — an open or pay_requested bill is handled by
+        # the ordinary lock rules.
+        return bill
+
+    bill.status = BillStatus.PAY_REQUESTED
+    bill.save(update_fields=["status", "updated_at"])
+
+    for order in billable_orders(bill):
+        record_order_event(
+            order, actor, "bill_reopened_for_items",
+            details={"bill_id": bill.pk, "already_paid": str(amount_paid(bill))},
+        )
+    notify_cashiers(bill, "bill:updated", reopened=True)
+    logger.info(
+        "Bill %s reopened for additional items by staff %s (already paid %s)",
+        bill.pk, getattr(actor, "pk", None), amount_paid(bill),
+    )
+    return bill
+
+
+def amount_paid(bill):
+    """What has actually been taken for this bill so far, from the Payment rows."""
+    return sum(
+        (payment.amount for order in bill.orders.all() for payment in order.payments.all()),
+        _ZERO,
+    )
+
+
+def amount_outstanding(bill):
+    """
+    What is still owed: current total minus what has already been paid.
+
+    Never negative — if items were removed after payment the difference is a
+    refund decision for a human, not a negative balance the customer can pay.
+    """
+    return max(bill_total(bill) - amount_paid(bill), _ZERO)
+
+
 def reopen_bill(bill, actor=None):
     """
     pay_requested -> open. The unlock for a stuck bill: a customer taps Pay by

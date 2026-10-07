@@ -8,7 +8,15 @@ outward, computed by orders/billing.py from the database.
 
 from rest_framework import serializers
 
-from .billing import bill_total, bill_total_halalas, is_ready_to_pay, order_total, unserved_orders
+from .billing import (
+    amount_outstanding,
+    amount_paid,
+    bill_total,
+    bill_total_halalas,
+    is_ready_to_pay,
+    order_total,
+    unserved_orders,
+)
 from .models import Bill, BillMethod, MoyasarPayment
 
 
@@ -62,6 +70,11 @@ class BillSerializer(serializers.ModelSerializer):
     ready_to_pay = serializers.SerializerMethodField()
     unserved_order_ids = serializers.SerializerMethodField()
     needs_review = serializers.SerializerMethodField()
+    # What has already been taken, and what is still owed. These differ from
+    # `total` only when staff added items to an already-paid bill before the
+    # table was released — the guest then pays the difference, not the total.
+    amount_paid = serializers.SerializerMethodField()
+    amount_outstanding = serializers.SerializerMethodField()
 
     class Meta:
         model = Bill
@@ -69,6 +82,7 @@ class BillSerializer(serializers.ModelSerializer):
             "id", "bill_code", "branch", "table", "table_label", "status",
             "requested_method", "paid_method", "total", "total_halalas", "currency",
             "total_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
+            "amount_paid", "amount_outstanding",
             "orders", "pay_requested_at", "paid_at", "closed_at", "created_at", "updated_at",
         ]
         read_only_fields = fields
@@ -94,6 +108,12 @@ class BillSerializer(serializers.ModelSerializer):
 
     def get_unserved_order_ids(self, bill):
         return [order.pk for order in unserved_orders(bill)]
+
+    def get_amount_paid(self, bill):
+        return str(amount_paid(bill))
+
+    def get_amount_outstanding(self, bill):
+        return str(amount_outstanding(bill))
 
     def get_needs_review(self, bill):
         return any(payment.needs_review for payment in bill.moyasar_payments.all())
