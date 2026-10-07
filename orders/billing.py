@@ -439,7 +439,7 @@ def _record_moyasar_payment(bill, moyasar):
     payment_id = str(moyasar.get("id"))
     amount = int(moyasar.get("amount") or 0)
     source = moyasar.get("source") or {}
-        expected = to_halalas(amount_outstanding(bill))
+    expected = to_halalas(amount_outstanding(bill))
 
     # Keep an auditable provider snapshot without persisting arbitrary nested
     # response fields (for example card fingerprints or customer details).
