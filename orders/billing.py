@@ -152,7 +152,13 @@ def unserved_orders(bill):
     customer is told to wait rather than being handed a form that would strand
     their money against an order that cannot transition.
     """
-    return [order for order in billable_orders(bill) if order.status != OrderStatus.SERVED]
+    return [
+        order for order in billable_orders(bill)
+        if order.status != OrderStatus.PAID and (
+            order.status != OrderStatus.SERVED
+            or order.items.exclude(status__in=(OrderItemStatus.SERVED, OrderItemStatus.VOIDED)).exists()
+        )
+    ]
 
 
 def is_ready_to_pay(bill):
@@ -241,17 +247,18 @@ def request_payment(bill, method, actor=None):
 
 def reopen_for_additional_items(bill, actor=None):
     """
-    A PAID bill goes back to `pay_requested` because staff added more food
-    before the table was released.
+    A PAID bill goes back to `open` because the guest or staff added more food
+    before the table was released. Existing Payment rows remain untouched;
+    the next payment only covers orders that do not already have a payment.
 
     The guest orders a coffee after settling: the money already taken stays
     recorded (its Payment rows and total_at_payment are untouched), the bill
     reopens, and what is now owed is the NEW total minus what was already
     paid — see amount_outstanding() below.
 
-    Deliberately NOT reopen_bill(): that one returns a bill to `open` and
-    clears requested_method, which would lose the fact that money has already
-    changed hands. This keeps the payment history and simply reopens the tab.
+    This preserves payment history in the order Payment rows, while allowing
+    another order to be added. The outstanding amount is current bill total
+    minus those recorded payments.
     """
     if bill.status == BillStatus.CLOSED:
         raise BillTransitionError("error.billClosed")
@@ -260,8 +267,13 @@ def reopen_for_additional_items(bill, actor=None):
         # the ordinary lock rules.
         return bill
 
-    bill.status = BillStatus.PAY_REQUESTED
-    bill.save(update_fields=["status", "updated_at"])
+    bill.status = BillStatus.OPEN
+    bill.requested_method = ""
+    bill.pay_requested_at = None
+    bill.save(update_fields=["status", "requested_method", "pay_requested_at", "updated_at"])
+
+    if bill.table_id:
+        bill.table.open()
 
     for order in billable_orders(bill):
         record_order_event(
@@ -427,7 +439,7 @@ def _record_moyasar_payment(bill, moyasar):
     payment_id = str(moyasar.get("id"))
     amount = int(moyasar.get("amount") or 0)
     source = moyasar.get("source") or {}
-    expected = bill_total_halalas(bill)
+        expected = to_halalas(amount_outstanding(bill))
 
     # Keep an auditable provider snapshot without persisting arbitrary nested
     # response fields (for example card fingerprints or customer details).

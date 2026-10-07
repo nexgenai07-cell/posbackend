@@ -185,7 +185,9 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
         validate_branch_location(staff.branch, request.data, radius_m=staff.branch.attendance_radius_m)
         with transaction.atomic():
-            staff = Staff.objects.select_for_update().select_related("branch", "shift_template").get(pk=staff.pk)
+            # Lock only Staff: shift_template is nullable, and PostgreSQL
+            # rejects FOR UPDATE on the nullable side of select_related's join.
+            staff = Staff.objects.select_for_update(of=("self",)).select_related("branch", "shift_template").get(pk=staff.pk)
             if staff.shifts.filter(clock_out__isnull=True).exists():
                 return Response({"error": "error.alreadyClockedIn"}, status=status.HTTP_400_BAD_REQUEST)
             now = timezone.now()

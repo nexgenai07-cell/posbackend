@@ -382,6 +382,9 @@ class BillMarkPaidView(APIView):
             # error, and must not write a second set of Payment rows.
             return _bill_response(bill, result=billing.ALREADY_PROCESSED)
 
+        if not billing.is_ready_to_pay(bill):
+            return Response({"error": "error.billNotServed"}, status=status.HTTP_409_CONFLICT)
+
         outcome, bill = billing.mark_bill_paid(bill.pk, method, actor=request.user)
         return _bill_response(bill, result=outcome)
 

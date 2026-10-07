@@ -12,9 +12,9 @@ from .billing import (
     amount_outstanding,
     amount_paid,
     bill_total,
-    bill_total_halalas,
     is_ready_to_pay,
     order_total,
+    to_halalas,
     unserved_orders,
 )
 from .models import Bill, BillMethod, MoyasarPayment
@@ -56,10 +56,9 @@ class BillSerializer(serializers.ModelSerializer):
     """
     The shape every billing endpoint returns.
 
-    `total` and `total_halalas` are always recomputed here rather than read
-    from a column, so a client can never be shown a stale amount. The only
-    exception is a settled bill, where `total_at_payment` is the audit record
-    of what was actually charged.
+    `total` and `total_halalas` are recomputed from current bill lines. The
+    payment request amount (`total_halalas`) is the outstanding balance, so
+    an already-paid order is never charged twice after more items are added.
     """
 
     table_label = serializers.SerializerMethodField()
@@ -91,10 +90,10 @@ class BillSerializer(serializers.ModelSerializer):
         return bill.table.label_en if bill.table_id else None
 
     def get_total(self, bill):
-        return str(bill.total_at_payment if bill.total_at_payment is not None else bill_total(bill))
+        return str(bill_total(bill))
 
     def get_total_halalas(self, bill):
-        return bill_total_halalas(bill)
+        return to_halalas(amount_outstanding(bill))
 
     def get_currency(self, bill):
         from django.conf import settings

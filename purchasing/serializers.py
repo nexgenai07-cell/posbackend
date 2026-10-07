@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from rest_framework import serializers
+from django.db import transaction
 
 from common.validators import reject_branch_mismatch, require_bilingual_pair
 from inventory.models import InventoryItem, StockMovement
@@ -116,16 +117,18 @@ class PurchaseSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         items_data = validated_data.pop("items")
-        purchase = Purchase.objects.create(**validated_data)
-        PurchaseItem.objects.bulk_create([PurchaseItem(purchase=purchase, **item) for item in items_data])
+        with transaction.atomic():
+            purchase = Purchase.objects.create(**validated_data)
+            PurchaseItem.objects.bulk_create([PurchaseItem(purchase=purchase, **item) for item in items_data])
         return purchase
 
     def update(self, instance, validated_data):
         items_data = validated_data.pop("items", None)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-        if items_data is not None:
-            instance.items.all().delete()
-            PurchaseItem.objects.bulk_create([PurchaseItem(purchase=instance, **item) for item in items_data])
+        with transaction.atomic():
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+            if items_data is not None:
+                instance.items.all().delete()
+                PurchaseItem.objects.bulk_create([PurchaseItem(purchase=instance, **item) for item in items_data])
         return instance

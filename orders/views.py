@@ -141,7 +141,7 @@ def _set_payment_status(order, value, actor, event, details=None):
     record_order_event(order, actor, event, details=details or {"from": previous, "to": value})
 
 
-def _dispatch_confirmed_order(order, actor):
+def _dispatch_confirmed_order(order, actor, *, move_order_to_sent=True):
     """Fire only pending items after waiter confirmation; unconfirmed items stay off KDS."""
     pending_items = list(
         order.items.select_for_update().filter(status=OrderItemStatus.PENDING).select_related("product")
@@ -152,9 +152,13 @@ def _dispatch_confirmed_order(order, actor):
     OrderItem.objects.filter(pk__in=[item.pk for item in pending_items]).update(
         status=OrderItemStatus.FIRED, fired_at=timezone.now()
     )
-    conflict = _transition_or_conflict(order, OrderStatus.SENT, actor, "sent_to_kitchen", details={"item_count": len(pending_items)})
-    if conflict:
-        return conflict
+    details = {"item_count": len(pending_items)}
+    if move_order_to_sent:
+        conflict = _transition_or_conflict(order, OrderStatus.SENT, actor, "sent_to_kitchen", details=details)
+        if conflict:
+            return conflict
+    else:
+        record_order_event(order, actor, "additional_items_sent_to_kitchen", details=details)
     return None
 
 
@@ -227,9 +231,12 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
     permission_classes = [IsPOSStaff]
 
     def get_permissions(self):
-        # Waiters may read their own assigned queue, but order creation remains POS-only.
+        # Waiters can open an assigned table to add a round; the table and
+        # assignment are checked again in post().
         if self.request.method == "GET":
             return [IsOrderStaff()]
+        if getattr(self.request.user, "role", None) == StaffRole.WAITER:
+            return [IsWaiterStaff()]
         return super().get_permissions()
 
     def get_queryset(self):
@@ -289,6 +296,12 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
 
     def post(self, request):
         table_id = request.data.get("table")
+        if request.user.role == StaffRole.WAITER:
+            if not table_id or not Order.objects.filter(
+                table_id=table_id, branch=request.user.branch,
+                assigned_waiter=request.user,
+            ).exclude(status__in=(OrderStatus.CLOSED, OrderStatus.CANCELLED)).exists():
+                return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
         
 
         # select_for_update() on the table row makes this atomic against a
@@ -309,6 +322,9 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
                 order = Order.objects.create(branch=request.user.branch, staff=request.user, source=OrderSource.POS)
                 created = True
             if created:
+                if request.user.role == StaffRole.WAITER:
+                    order.assigned_waiter = request.user
+                    order.save(update_fields=["assigned_waiter", "updated_at"])
                 record_order_event(order, request.user, "order_created", details={"source": order.source})
 
         order = _order_queryset().get(pk=order.pk)
@@ -472,9 +488,7 @@ class OrderItemsView(APIView):
             # bill" as opening a new order is, so it is blocked the same way.
             if _locked_bill_for_order(order, actor=request.user):
                 return _bill_locked_response()
-            if request.user.role == StaffRole.WAITER and (
-                order.assigned_waiter_id != request.user.pk or order.status != OrderStatus.AWAITING_WAITER
-            ):
+            if request.user.role == StaffRole.WAITER and order.assigned_waiter_id != request.user.pk:
                 return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
             serializer = AddOrderItemSerializer(data=request.data, context={"order": order})
             serializer.is_valid(raise_exception=True)
@@ -483,9 +497,15 @@ class OrderItemsView(APIView):
                 order.table.open()
             details = {"item_id": item.pk, "product_id": item.product_id, "quantity": item.quantity}
             if request.user.role == StaffRole.WAITER:
-                record_order_event(order, request.user, "waiter_item_added", details=details)
-                _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item.pk)
-                _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                if order.status == OrderStatus.OPEN:
+                    queue_order_for_cashier(order, request.user, "waiter_order_created", details=details)
+                else:
+                    record_order_event(order, request.user, "waiter_item_added", details=details)
+                    _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item.pk)
+                    _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+            elif order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED):
+                record_order_event(order, request.user, "cashier_item_added", details=details)
+                _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_waiter_id} - {None}, change_id=item.pk)
             else:
                 queue_order_for_cashier(order, request.user, "item_added", details=details)
         return Response(OrderItemSerializer(item).data, status=status.HTTP_201_CREATED)
@@ -573,19 +593,40 @@ class SendToKitchenView(APIView):
     the plan called out by name.
     """
 
-    permission_classes = [IsWaiterStaff]
+    permission_classes = [IsOrderStaff]
 
     def post(self, request, pk):
         order = _get_order_or_404(pk, request.user.branch)
-        if order.status == OrderStatus.SENT:
-            return Response(OrderSerializer(order).data)
-        if order.status != OrderStatus.CONFIRMED:
+        is_additional_batch = order.status in (
+            OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED,
+        )
+        if not is_additional_batch and request.user.role not in (
+            StaffRole.OWNER, StaffRole.MANAGER, StaffRole.WAITER,
+        ):
+            return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
+        if request.user.role == StaffRole.WAITER and order.assigned_waiter_id != request.user.pk:
+            return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
+        if not is_additional_batch and order.status != OrderStatus.CONFIRMED:
             return Response({"error": "error.waiterConfirmationRequired"}, status=status.HTTP_409_CONFLICT)
+        if is_additional_batch and request.user.role not in (StaffRole.WAITER, StaffRole.CASHIER, StaffRole.OWNER, StaffRole.MANAGER):
+            return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
         try:
             with transaction.atomic():
-                dispatch_error = _dispatch_confirmed_order(order, request.user)
+                order = Order.objects.select_for_update().get(pk=order.pk, branch=request.user.branch)
+                if is_additional_batch and order.status not in (
+                    OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED,
+                ):
+                    return Response({"error": "error.orderTransitionInvalid"}, status=status.HTTP_409_CONFLICT)
+                dispatch_error = _dispatch_confirmed_order(
+                    order, request.user, move_order_to_sent=not is_additional_batch,
+                )
                 if dispatch_error:
                     return dispatch_error
+                if is_additional_batch and order.status in (OrderStatus.READY, OrderStatus.SERVED):
+                    transition_order(order, OrderStatus.PREPARING, request.user, "additional_items_started")
+                if is_additional_batch:
+                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
+                    _notify_order_staff(order, "order:changed", request.user.pk)
         except ProductStockUnavailable:
             return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
 
@@ -864,7 +905,12 @@ class PublicOrderCreateView(APIView):
             customer, _ = find_or_create_customer(branch, phone, request.data.get("name", ""))
             try:
                 if table:
-                    order, created = get_or_create_open_order(table, customer=customer, source=OrderSource.QR)
+                    # Each customer checkout is a distinct kitchen ticket. This
+                    # lets guests add another round while an earlier ticket is
+                    # preparing without rewriting or re-queuing that ticket.
+                    order, created = get_or_create_open_order(
+                        table, customer=customer, source=OrderSource.QR, force_new=True,
+                    )
                 else:
                     order = Order.objects.create(branch=branch, customer=customer, source=OrderSource.WEB)
                     created = True
