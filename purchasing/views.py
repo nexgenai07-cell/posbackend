@@ -28,6 +28,18 @@ class SupplierViewSet(viewsets.ModelViewSet):
     queryset = Supplier.objects.all()
     serializer_class = SupplierSerializer
 
+    def get_queryset(self):
+        from common.filters import text_filter
+        qs = super().get_queryset()
+        params = self.request.query_params
+        qs = text_filter(qs, params, "search", ["name_en", "name_ar", "contact_info"])
+        has_contact = (params.get("has_contact") or "").strip().lower()
+        if has_contact in ("true", "1", "yes"):
+            qs = qs.exclude(contact_info="").exclude(contact_info__isnull=True)
+        elif has_contact in ("false", "0", "no"):
+            qs = qs.filter(contact_info__in=["", None])
+        return qs
+
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated()]
@@ -52,6 +64,32 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated()]
         return [IsOwnerOrManager()]
+
+    def get_queryset(self):
+        from common.filters import choice_filter, fk_filter
+        from reports.filters import branch_datetime_bounds, parse_date_range
+        qs = super().get_queryset()
+        params = self.request.query_params
+        qs = fk_filter(qs, params, "supplier", field="supplier_id")
+        qs = choice_filter(
+            qs, params, "status", field="status",
+            allowed=[choice for choice, _ in PurchaseStatus.choices]
+        )
+        search = (params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(supplier__name_en__icontains=search) |
+                Q(supplier__name_ar__icontains=search) |
+                Q(pk__icontains=search)
+            ).distinct()
+        from_date, to_date = parse_date_range(self.request)
+        if from_date or to_date:
+            start, end = branch_datetime_bounds(self.request.user.branch, from_date, to_date)
+            if from_date:
+                qs = qs.filter(ordered_at__gte=start)
+            if to_date:
+                qs = qs.filter(ordered_at__lt=end)
+        return qs
 
     def update(self, request, *args, **kwargs):
         """

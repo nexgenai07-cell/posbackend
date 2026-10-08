@@ -170,6 +170,17 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = StaffSerializer
     permission_classes = [IsOwnerOrManager]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        from common.filters import text_filter, choice_filter
+        params = self.request.query_params
+        qs = text_filter(qs, params, "search", ["name"])
+        qs = choice_filter(
+            qs, params, "role", field="role",
+            allowed=["owner", "manager", "cashier", "waiter", "kitchen"]
+        )
+        return qs
+
     @action(detail=True, methods=["get"], url_path="shifts", permission_classes=[IsAuthenticated])
     def shifts(self, request, pk=None):
         staff = self.get_object()

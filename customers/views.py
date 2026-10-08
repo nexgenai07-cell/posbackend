@@ -31,9 +31,12 @@ class CustomerViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        phone = self.request.query_params.get("phone")
+        params = self.request.query_params
+        phone = params.get("phone")
         if phone:
             qs = qs.filter(phone=phone)
+        from common.filters import text_filter
+        qs = text_filter(qs, params, "search", ["name", "phone"])
         # nulls_last: Postgres puts NULLs first on a DESC sort otherwise, which
         # would float every never-ordered customer to the top of the list.
         return qs.order_by(F("last_order_at").desc(nulls_last=True), "-id")

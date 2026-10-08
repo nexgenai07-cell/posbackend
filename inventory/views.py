@@ -29,6 +29,22 @@ class InventoryItemViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = InventoryItem.objects.select_related("supplier")
     serializer_class = InventoryItemSerializer
 
+    def get_queryset(self):
+        from common.filters import text_filter, choice_filter, fk_filter
+        qs = super().get_queryset()
+        params = self.request.query_params
+        qs = text_filter(qs, params, "search", ["name"])
+        qs = fk_filter(qs, params, "supplier", field="supplier_id")
+        qs = choice_filter(qs, params, "unit", field="unit")
+        stock_status = (params.get("stock_status") or "").strip()
+        if stock_status == "out":
+            qs = qs.filter(current_stock__lte=0)
+        elif stock_status == "low":
+            qs = qs.filter(current_stock__gt=0, current_stock__lte=F("par_level"))
+        elif stock_status == "ok":
+            qs = qs.filter(current_stock__gt=F("par_level"))
+        return qs
+
     def get_permissions(self):
         return [IsOwnerOrManager()]
 

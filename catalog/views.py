@@ -20,6 +20,19 @@ class CategoryViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
 
+    def get_queryset(self):
+        from django.db.models import Count
+        from common.filters import text_filter
+        qs = super().get_queryset()
+        params = self.request.query_params
+        qs = text_filter(qs, params, "search", ["name_en", "name_ar"])
+        has_products = (params.get("has_products") or "").strip().lower()
+        if has_products in ("true", "1", "yes"):
+            qs = qs.annotate(product_count=Count("products")).filter(product_count__gt=0)
+        elif has_products in ("false", "0", "no"):
+            qs = qs.annotate(product_count=Count("products")).filter(product_count=0)
+        return qs
+
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated()]
@@ -41,13 +54,30 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Product.objects.select_related("category").prefetch_related("deal__windows")
 
     def get_queryset(self):
+        from django.db.models import Exists, OuterRef
+        from common.filters import text_filter, numeric_range_filter
         qs = super().get_queryset()
-        category_id = self.request.query_params.get("category")
-        available = self.request.query_params.get("available")
+        params = self.request.query_params
+        category_id = params.get("category")
+        available = params.get("available")
         if category_id:
             qs = qs.filter(category_id=category_id)
         if available is not None:
             qs = qs.filter(is_available=available.lower() in ("1", "true", "yes"))
+        qs = text_filter(qs, params, "search", ["name_en", "name_ar", "description_en", "description_ar"])
+        badge = (params.get("badge") or "").strip()
+        if badge == "none":
+            qs = qs.filter(badge="")
+        elif badge and badge != "all":
+            qs = qs.filter(badge=badge)
+        qs = numeric_range_filter(qs, params, "price", "price_min", "price_max")
+        has_recipe = (params.get("has_recipe") or "").strip().lower()
+        if has_recipe in ("true", "1", "yes"):
+            from inventory.models import RecipeItem
+            qs = qs.filter(Exists(RecipeItem.objects.filter(product=OuterRef("pk"))))
+        elif has_recipe in ("false", "0", "no"):
+            from inventory.models import RecipeItem
+            qs = qs.exclude(Exists(RecipeItem.objects.filter(product=OuterRef("pk"))))
         return qs
 
     def list(self, request, *args, **kwargs):

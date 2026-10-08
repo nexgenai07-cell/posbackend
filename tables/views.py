@@ -46,13 +46,16 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         convenience filter, and a typo should not blank the floor plan.
         """
         queryset = super().get_queryset()
-        min_seats = self.request.query_params.get("min_seats")
+        params = self.request.query_params
+        from common.filters import text_filter
+        queryset = text_filter(queryset, params, "search", ["label_en", "label_ar"])
+        min_seats = params.get("min_seats")
         if min_seats:
             try:
                 queryset = queryset.filter(seats__gte=int(min_seats))
             except (TypeError, ValueError):
                 pass
-        status_filter = self.request.query_params.get("status")
+        status_filter = params.get("status")
         if status_filter in {choice for choice, _label in TableStatus.choices}:
             queryset = queryset.filter(status=status_filter)
         return queryset
