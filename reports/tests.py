@@ -55,7 +55,9 @@ class PaymentMethodReportTests(TestCase):
         today_order = self.add_order()
         Payment.objects.create(order=today_order, amount=Decimal("10.00"), method="cash")
         old_order = self.add_order(days_ago=5)
-        Payment.objects.create(order=old_order, amount=Decimal("10.00"), method="card")
+        old_payment = Payment.objects.create(order=old_order, amount=Decimal("10.00"), method="card")
+        # Sales are dated by when they were paid, so the old sale's payment is old too.
+        Payment.objects.filter(pk=old_payment.pk).update(paid_at=timezone.now() - timedelta(days=5))
         today = timezone.localdate().isoformat()
         response = self.client.get(f"/api/reports/sales-overview/?from={today}&to={today}")
         self.assertEqual(response.status_code, 200)

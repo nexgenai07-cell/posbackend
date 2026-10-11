@@ -11,6 +11,7 @@ from .views import (
     RecentOrdersView,
     RepeatCustomersView,
     SalesOverviewView,
+    StaffAttendanceView,
     TableTurnoverView,
     WastageView,
 )
@@ -28,4 +29,5 @@ urlpatterns = [
     path("reports/table-turnover/", TableTurnoverView.as_view(), name="report-table-turnover"),
     path("reports/wastage/", WastageView.as_view(), name="report-wastage"),
     path("reports/repeat-customers/", RepeatCustomersView.as_view(), name="report-repeat-customers"),
+    path("reports/staff-attendance/", StaffAttendanceView.as_view(), name="report-staff-attendance"),
 ]

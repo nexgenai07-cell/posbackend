@@ -3,7 +3,7 @@ from collections import defaultdict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Max, OuterRef, Q, Subquery, Sum
-from django.db.models.functions import ExtractHour, TruncDate
+from django.db.models.functions import Coalesce, ExtractHour, TruncDate
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -18,14 +18,39 @@ from orders.serializers import OrderSerializer
 from .filters import branch_datetime_bounds, parse_date_range
 
 
+def branch_zone(branch):
+    try:
+        return ZoneInfo(branch.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def sales_orders(branch, start, end):
+    """
+    The orders every revenue report counts: PAID (money taken), not
+    cancelled, dated by WHEN THEY WERE PAID — latest payment time, falling
+    back to closed/opened time for old rows without one.
+
+    Previously only orders whose table had been RELEASED counted, dated by
+    release time, so "Today" stayed empty until tables were released and an
+    order paid at 23:50 but released at 00:10 landed on the next day.
+    `start`/`end` are branch-timezone day bounds (branch_datetime_bounds).
+    """
+    last_paid = Subquery(Payment.objects.filter(order=OuterRef("pk")).order_by("-paid_at").values("paid_at")[:1])
+    return (
+        Order.objects.filter(branch=branch, payment_status=PaymentStatus.PAID)
+        .exclude(status=OrderStatus.CANCELLED)
+        .annotate(sold_at=Coalesce(last_paid, "closed_at", "opened_at"))
+        .filter(sold_at__gte=start, sold_at__lt=end)
+    )
+
+
 class BaseReportView(APIView):
     """
-    All reports are owner/manager only and share the same ?days=&from=&to=
-    convention (parse_date_range). Revenue-oriented reports (all but
-    recent-orders and wastage) count only CLOSED orders — an open tab isn't
-    "sales" yet — for a consistent definition across dashboard-summary,
-    sales-overview, product-performance, peak-hours, margins and
-    table-turnover.
+    All reports are owner/manager only and share the same ?preset=/?days=/
+    ?from=&to= convention (parse_date_range), with days in the BRANCH
+    timezone. Revenue reports count paid orders on the day they were paid
+    (sales_orders); order lists filter on opened_at in branch-local days.
     """
 
     permission_classes = [IsOwnerOrManager]
@@ -33,15 +58,13 @@ class BaseReportView(APIView):
     def get_range(self, request):
         return parse_date_range(request)
 
+    def bounds(self, request, from_date, to_date):
+        return branch_datetime_bounds(request.user.branch, from_date, to_date)
+
     def closed_orders(self, request, from_date, to_date):
-        start, end = branch_datetime_bounds(request.user.branch, from_date, to_date)
-        return Order.objects.filter(
-            branch=request.user.branch,
-            status=OrderStatus.CLOSED,
-        ).filter(
-            Q(closed_at__gte=start, closed_at__lt=end)
-            | Q(closed_at__isnull=True, opened_at__gte=start, opened_at__lt=end)
-        )
+        """Kept under its old name: the paid orders in range (see sales_orders)."""
+        start, end = self.bounds(request, from_date, to_date)
+        return sales_orders(request.user.branch, start, end)
 
 
 class DashboardSummaryView(BaseReportView):
@@ -54,9 +77,10 @@ class DashboardSummaryView(BaseReportView):
         order_count = orders.count()
         average_order_value = (total_sales / order_count) if order_count else Decimal("0.00")
 
+        # Still being served: not paid, closed or cancelled.
         open_orders_count = (
             Order.objects.filter(branch=request.user.branch)
-            .exclude(status__in=(OrderStatus.CLOSED, OrderStatus.CANCELLED))
+            .exclude(status__in=(OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED))
             .count()
         )
         low_stock_count = InventoryItem.objects.filter(
@@ -75,25 +99,42 @@ class DashboardSummaryView(BaseReportView):
 
 
 class RecentOrdersView(BaseReportView):
-    """?limit= (default 25, capped at 100) — the only report endpoint that
-    isn't an aggregate, matching the frontend's getRecentOrders(filters, limit=25)."""
+    """
+    Orders opened in range (branch-local days), newest first. Every filter is
+    applied HERE, before ?limit= (default 25, max 100) — filtering the first
+    25 in the browser used to drop matching orders entirely:
+      ?status=  ?table=  ?method= (paid with)  ?search= (order number or table)
+    """
 
     def get(self, request):
+        from orders.codes import resolve_order_code
+
         from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
         try:
             limit = int(request.query_params.get("limit", 25))
         except ValueError:
             return Response({"error": "error.limitInvalid"}, status=400)
         limit = max(1, min(limit, 100))
 
+        orders = Order.objects.filter(branch=request.user.branch, opened_at__gte=start, opened_at__lt=end)
+        params = request.query_params
+        if params.get("status") and params["status"] != "all":
+            orders = orders.filter(status=params["status"])
+        if params.get("table") and params["table"] != "all":
+            orders = orders.filter(table_id=params["table"])
+        if params.get("method") and params["method"] != "all":
+            orders = orders.filter(payments__method=params["method"]).distinct()
+        search = (params.get("search") or "").strip()
+        if search:
+            order_id = resolve_order_code(search)
+            match = Q(table__label_en__icontains=search) | Q(table__label_ar__icontains=search)
+            if order_id:
+                match |= Q(pk=order_id)
+            orders = orders.filter(match)
         orders = (
-            Order.objects.filter(
-                branch=request.user.branch,
-                opened_at__date__gte=from_date,
-                opened_at__date__lte=to_date,
-            )
-            .select_related("table", "customer", "staff")
-            .prefetch_related("items", "payments")
+            orders.select_related("table", "customer", "staff")
+            .prefetch_related("items", "payments", "history")
             .order_by("-opened_at")[:limit]
         )
         return Response(OrderSerializer(orders, many=True).data)
@@ -110,13 +151,10 @@ class SalesOverviewView(BaseReportView):
         paid_payments = list(Payment.objects.filter(order__in=paid_orders).select_related("order"))
         total_sales = sum((payment.amount for payment in paid_payments), Decimal("0"))
         by_day_map = defaultdict(lambda: {"total": Decimal("0"), "orders": set()})
-        try:
-            branch_tz = ZoneInfo(request.user.branch.timezone)
-        except (ZoneInfoNotFoundError, ValueError):
-            branch_tz = ZoneInfo("UTC")
+        branch_tz = branch_zone(request.user.branch)
         for payment in paid_payments:
-            day_value = payment.order.closed_at or payment.order.opened_at
-            day = day_value.astimezone(branch_tz).date().isoformat()
+            # The day the money was taken, in the branch's own timezone.
+            day = payment.paid_at.astimezone(branch_tz).date().isoformat()
             by_day_map[day]["total"] += payment.amount
             by_day_map[day]["orders"].add(payment.order_id)
         by_day = [
@@ -184,8 +222,9 @@ class PeakHoursView(BaseReportView):
         from_date, to_date = self.get_range(request)
         orders = self.closed_orders(request, from_date, to_date)
 
+        # Hour on the restaurant's clock, not UTC (Riyadh is UTC+3).
         results = list(
-            orders.annotate(hour=ExtractHour("opened_at"))
+            orders.annotate(hour=ExtractHour("opened_at", tzinfo=branch_zone(request.user.branch)))
             .values("hour")
             .annotate(order_count=Count("id"))
             .order_by("hour")
@@ -266,11 +305,12 @@ class TableTurnoverView(BaseReportView):
 class WastageView(BaseReportView):
     def get(self, request):
         from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
         movements = StockMovement.objects.filter(
             inventory_item__branch=request.user.branch,
             reason=StockMovementReason.WASTE,
-            created_at__date__gte=from_date,
-            created_at__date__lte=to_date,
+            created_at__gte=start,
+            created_at__lt=end,
         )
         rows = (
             movements.values("inventory_item_id", "inventory_item__name", "inventory_item__cost_per_unit")
@@ -302,12 +342,13 @@ class RepeatCustomersView(BaseReportView):
 
     def get(self, request):
         from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
         orders = (
             Order.objects.filter(
                 branch=request.user.branch,
                 customer__isnull=False,
-                opened_at__date__gte=from_date,
-                opened_at__date__lte=to_date,
+                opened_at__gte=start,
+                opened_at__lt=end,
             )
             .exclude(status=OrderStatus.CANCELLED)
         )
@@ -350,13 +391,7 @@ def _financial_context(request):
     branch = request.user.branch
     from_date, to_date = parse_date_range(request)
     start, end = branch_datetime_bounds(branch, from_date, to_date)
-    orders = Order.objects.filter(
-        branch=branch,
-        status=OrderStatus.CLOSED,
-        payment_status=PaymentStatus.PAID,
-        closed_at__gte=start,
-        closed_at__lt=end,
-    )
+    orders = sales_orders(branch, start, end)
     items = OrderItem.objects.filter(order__in=orders).exclude(status=OrderItemStatus.VOIDED).select_related("product")
     payments = Payment.objects.filter(order__in=orders)
     movements = StockMovement.objects.filter(
@@ -560,5 +595,49 @@ class IngredientCostView(BaseReportView):
                     ingredient.current_stock * latest_actual_costs[ingredient.pk]
                     if ingredient.pk in latest_actual_costs else None
                 ),
+            })
+        return Response({"from": from_date, "to": to_date, "results": results})
+
+
+class StaffAttendanceView(BaseReportView):
+    """
+    One row per staff member: on shift now, last clock-in/out, and hours
+    worked on shifts that STARTED inside the range (branch-local days; an
+    open shift counts up to now). Optional ?role=.
+
+    Replaces the page fetching every staff member's full shift history one
+    request at a time and comparing UTC dates in the browser.
+    """
+
+    def get(self, request):
+        from django.utils import timezone as dj_timezone
+
+        from accounts.models import Shift, Staff
+
+        from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
+        staff = Staff.objects.filter(branch=request.user.branch).order_by("name")
+        role = request.query_params.get("role")
+        if role and role != "all":
+            staff = staff.filter(role=role)
+        staff = list(staff)
+        latest = {}
+        for shift in Shift.objects.filter(staff__in=staff).order_by("staff_id", "-clock_in").distinct():
+            latest.setdefault(shift.staff_id, shift)
+        now = dj_timezone.now()
+        hours = defaultdict(float)
+        for shift in Shift.objects.filter(staff__in=staff, clock_in__gte=start, clock_in__lt=end):
+            hours[shift.staff_id] += ((shift.clock_out or now) - shift.clock_in).total_seconds() / 3600
+        results = []
+        for member in staff:
+            last = latest.get(member.pk)
+            results.append({
+                "staff_id": member.pk,
+                "name": member.name,
+                "role": member.role,
+                "on_shift": bool(last and last.clock_out is None),
+                "last_clock_in": last.clock_in if last else None,
+                "last_clock_out": last.clock_out if last else None,
+                "hours_in_window": round(hours.get(member.pk, 0.0), 2),
             })
         return Response({"from": from_date, "to": to_date, "results": results})
