@@ -120,6 +120,21 @@ DATABASES = {
     'default': env.db('DATABASE_URL', default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}"),
 }
 
+# Reuse open Postgres connections instead of a fresh TLS connect + auth to
+# Neon on every request (~0.5-1s each). Daphne serves over ASGI, where
+# CONN_MAX_AGE persistent connections aren't reused, so this uses psycopg 3's
+# pool. CONN_MAX_AGE must stay 0 with a pool.
+if DATABASES['default']['ENGINE'] == 'django.db.backends.postgresql':
+    DATABASES['default'].setdefault('OPTIONS', {})['pool'] = {
+        'min_size': env.int('DB_POOL_MIN_SIZE', default=2),
+        'max_size': env.int('DB_POOL_MAX_SIZE', default=10),
+        'timeout': 10,
+    }
+    DATABASES['default']['CONN_MAX_AGE'] = 0
+    # Neon's "-pooler" host is PgBouncer in transaction mode, which can't hold
+    # server-side cursors open across transactions.
+    DATABASES['default']['DISABLE_SERVER_SIDE_CURSORS'] = True
+
 
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
