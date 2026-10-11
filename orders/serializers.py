@@ -32,7 +32,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at",
-            "created_at", "updated_at", "is_new",
+            "created_at", "updated_at", "is_new", "is_additional_batch",
         ]
         # Snapshot fields are write-once at creation (see AddOrderItemSerializer)
         # and never editable afterward — that's the whole point of a snapshot.
@@ -147,6 +147,7 @@ class OrderSerializer(serializers.ModelSerializer):
         }
         items = instance.items.all()
         for item in items:
+            item._is_additional_batch_any = item.pk in new_ids
             item._is_additional_batch = item.pk in new_ids
         return super().to_representation(instance)
 
@@ -206,9 +207,13 @@ class PublicOrderItemSerializer(serializers.ModelSerializer):
     FKs a customer's phone has no use for) — used by the public QR endpoints."""
 
     is_new = serializers.SerializerMethodField()
+    is_additional_batch = serializers.SerializerMethodField()
 
     def get_is_new(self, item):
         return bool(getattr(item, "_is_additional_batch", False) and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED))
+
+    def get_is_additional_batch(self, item):
+        return bool(getattr(item, "_is_additional_batch_any", False))
 
     class Meta:
         model = OrderItem
