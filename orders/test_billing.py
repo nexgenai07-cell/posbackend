@@ -56,6 +56,25 @@ billing_settings = override_settings(
 )
 
 
+# The fixture bill's customer. Each phone has its own bill at a table, so the
+# customer bill endpoints need the phone; CustomerPhoneClient adds this one
+# unless a test sends its own.
+CUSTOMER_PHONE = "0500000000"
+_CUSTOMER_BILL_PATHS = ("/api/bills/by-session/", "/api/bills/request-pay/", "/api/bills/cancel-pay-request/")
+
+
+class CustomerPhoneClient(APIClient):
+    def get(self, path, data=None, **extra):
+        if path.startswith(_CUSTOMER_BILL_PATHS) and not (data or {}).get("phone"):
+            data = {**(data or {}), "phone": CUSTOMER_PHONE}
+        return super().get(path, data, **extra)
+
+    def post(self, path, data=None, *args, **extra):
+        if path.startswith(_CUSTOMER_BILL_PATHS) and isinstance(data, dict) and "phone" not in data:
+            data = {**data, "phone": CUSTOMER_PHONE}
+        return super().post(path, data, *args, **extra)
+
+
 def moyasar_payload(bill_id, amount, status="paid", payment_id="pay_1", request_at=None):
     """A trimmed version of the real GET /v1/payments/{id} response."""
     bill = Bill.objects.filter(pk=bill_id).first()
@@ -76,7 +95,7 @@ class BillingTestBase(TestCase):
         # The module-level location payload may outlive the QR endpoint's
         # freshness window during a long full-suite run.
         AT_THE_RESTAURANT["location_timestamp"] = time.time()
-        self.client = APIClient()
+        self.client = CustomerPhoneClient()
         # PublicOrderCreateView geofences every QR order, and a branch with no
         # coordinates is rejected outright (error.locationNotConfigured). Give
         # it a position and a wide radius so the location check passes and the
@@ -110,7 +129,9 @@ class BillingTestBase(TestCase):
         self.waiter = self._staff("Waiter", StaffRole.WAITER)
         self.kitchen = self._staff("Chef", StaffRole.KITCHEN)
 
-        self.bill = Bill.objects.create(branch=self.branch, table=self.table)
+        from customers.services import find_or_create_customer
+        self.customer, _ = find_or_create_customer(self.branch, CUSTOMER_PHONE)
+        self.bill = Bill.objects.create(branch=self.branch, table=self.table, customer=self.customer)
         self.order = self._order(self.bill, OrderStatus.SERVED)
         self._item(self.order, quantity=2)  # 2 x 25.50 = 51.00
 
@@ -123,6 +144,7 @@ class BillingTestBase(TestCase):
     def _order(self, bill, status, table=None):
         return Order.objects.create(
             branch=self.branch, table=table or self.table, bill=bill, status=status,
+            customer=bill.customer if bill is not None else None,
         )
 
     def _item(self, order, quantity=1, status=OrderItemStatus.SERVED, price=None):
@@ -831,6 +853,11 @@ class OpenBillLifecycleTests(BillingTestBase):
             **AT_THE_RESTAURANT,
         }, format="json")
         self.assertEqual(created.status_code, 201)
-        current = self.client.get(f"/api/bills/by-session/{self.table.session_token}/")
+        current = self.client.get(f"/api/bills/by-session/{self.table.session_token}/", {"phone": "0500000002"})
         self.assertNotEqual(current.data["id"], old_bill_id)
         self.assertEqual(created.data["bill_id"], current.data["id"])
+        # The old party's phone no longer has an open bill here, and its pinned
+        # old bill reports the session as ended rather than adopting the new one.
+        self.assertEqual(self.client.get(f"/api/bills/by-session/{self.table.session_token}/").status_code, 404)
+        ended = self.client.get(f"/api/bills/by-session/{self.table.session_token}/", {"bill_id": old_bill_id})
+        self.assertEqual(ended.status_code, 409)
