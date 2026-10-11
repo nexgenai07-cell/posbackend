@@ -12,6 +12,7 @@ from common.mixins import BranchScopedQuerysetMixin
 
 # Imported here (views), not in tables/models.py, to keep the model layer's
 # dependency one-directional (orders depends on tables, not the reverse).
+from orders.billing import close_bills_for_released_table
 from orders.models import Order, OrderStatus
 from orders.serializers import PublicOrderSerializer
 
@@ -112,6 +113,7 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
                         for order in open_orders
                     ],
                 }, status=status.HTTP_409_CONFLICT)
+            close_bills_for_released_table(table, request.user)
             table.close()
         return Response(TableSerializer(table).data)
 

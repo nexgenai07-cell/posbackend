@@ -416,6 +416,32 @@ def release_table(bill, actor):
     return bill
 
 
+def close_bills_for_released_table(table, actor):
+    """
+    Staff released the table itself (POST /tables/<id>/close/): end every bill
+    still on it, so customers' phones see the session end and the next party
+    — even with the same phone — starts a fresh bill.
+
+    The caller must hold the table lock and have checked that no order on the
+    table is still owed (only paid/closed/cancelled remain), so nothing here
+    can drop unpaid food. Without this the table went empty while its bills
+    stayed open/paid forever.
+    """
+    now = timezone.now()
+    bills = Bill.objects.select_for_update().filter(table=table).exclude(status=BillStatus.CLOSED)
+    for bill in bills:
+        bill.status = BillStatus.CLOSED
+        bill.closed_at = now
+        bill.released_by = actor
+        bill.save(update_fields=["status", "closed_at", "released_by", "updated_at"])
+        for order in bill.orders.all():
+            if order.status == OrderStatus.PAID:
+                transition_order(order, OrderStatus.CLOSED, actor, "bill_released",
+                                 details={"bill_id": bill.pk}, extra_fields={"closed_at": now})
+        transaction.on_commit(lambda bill=bill: notify_cashiers(bill, "bill:released"))
+        logger.info("Bill %s closed by table release (staff %s)", bill.pk, getattr(actor, "pk", None))
+
+
 # -- the one way a bill becomes paid ----------------------------------------
 
 SETTLED = "settled"
