@@ -180,7 +180,9 @@ class OrderStockWorkflowTests(TestCase):
         response = self.client.post(
             f"/api/orders/{self.order.pk}/items/", {"product": self.second_product.pk, "quantity": 1}, format="json"
         )
-        self.assertEqual(response.status_code, 400)
+        # 409 error.productUnavailable — the same status dispatch uses.
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {"error": "error.productUnavailable"})
         self.assertNotIn("Salt", str(response.data))
         self.assertEqual(self.order.items.filter(product=self.second_product).count(), existing_count)
 
@@ -190,7 +192,9 @@ class OrderStockWorkflowTests(TestCase):
         response = self.client.post(
             f"/api/orders/{self.order.pk}/items/", {"product": self.second_product.pk, "quantity": 1}, format="json"
         )
-        self.assertEqual(response.status_code, 400)
+        # 409 error.productUnavailable — the same status dispatch uses.
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {"error": "error.productUnavailable"})
         self.assertNotIn("Salt", str(response.data))
         self.assertEqual(self.order.items.filter(product=self.second_product).count(), existing_count)
 

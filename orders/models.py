@@ -160,12 +160,24 @@ class Order(BaseModel):
     closed_at = models.DateTimeField(null=True, blank=True)
 
     @property
+    def order_number(self):
+        """The short, readable number shown on every screen, receipt and report."""
+        from .codes import format_order_number
+        return format_order_number(self.pk)
+
+    @property
     def order_code(self):
-        """Stable, signed and opaque label suitable for receipts and tickets."""
+        """Deprecated alias of order_number, kept so older clients still show
+        the short number instead of breaking."""
+        return self.order_number
+
+    @property
+    def tracking_token(self):
+        """Signed, opaque lookup value for a customer's device. Never displayed."""
         if not self.pk:
             return ""
-        from .codes import make_order_code
-        return make_order_code(self.pk)
+        from .codes import make_tracking_token
+        return make_tracking_token(self.pk)
 
     def __str__(self):
         return f"Order #{self.pk} ({self.status})"
@@ -227,7 +239,7 @@ class OrderHistory(BaseModel):
         ordering = ["created_at", "id"]
 
     def __str__(self):
-        return f"{self.order.order_code}: {self.event}"
+        return f"{self.order.order_number}: {self.event}"
 
 
 class CustomerOrderSubmission(BaseModel):

@@ -14,16 +14,22 @@ from .billing import (
     bill_total,
     is_ready_to_pay,
     order_total,
+    payment_request_cancelled_by_add,
     to_halalas,
     unserved_orders,
 )
-from .models import Bill, BillMethod, MoyasarPayment
+from .models import Bill, BillMethod, MoyasarPayment, OrderItemStatus
+from .serializers import additional_batch_item_ids
 
 
 class BillOrderSerializer(serializers.Serializer):
-    """An order as it appears on a bill — enough to itemise a receipt."""
+    """An order as it appears on a bill — enough to itemise a receipt.
+
+    With context {"public": True} (the customer's phone) voided lines are left
+    out; staff views keep them, marked by their `voided` status."""
 
     id = serializers.IntegerField()
+    order_number = serializers.CharField()
     order_code = serializers.CharField()
     status = serializers.CharField()
     opened_at = serializers.DateTimeField()
@@ -31,6 +37,10 @@ class BillOrderSerializer(serializers.Serializer):
     total = serializers.SerializerMethodField()
 
     def get_items(self, order):
+        new_ids = additional_batch_item_ids(order)
+        items = order.items.all()
+        if self.context.get("public"):
+            items = [item for item in items if item.status != OrderItemStatus.VOIDED]
         return [
             {
                 "id": item.id,
@@ -44,8 +54,9 @@ class BillOrderSerializer(serializers.Serializer):
                 "quantity": item.quantity,
                 "status": item.status,
                 "notes": item.notes,
+                "is_additional_batch": item.pk in new_ids,
             }
-            for item in order.items.all()
+            for item in items
         ]
 
     def get_total(self, order):
@@ -102,7 +113,7 @@ class BillSerializer(serializers.ModelSerializer):
         return settings.BILL_CURRENCY
 
     def get_orders(self, bill):
-        return BillOrderSerializer(bill.orders.all(), many=True).data
+        return BillOrderSerializer(bill.orders.all(), many=True, context=self.context).data
 
     def get_ready_to_pay(self, bill):
         return is_ready_to_pay(bill)
@@ -117,20 +128,7 @@ class BillSerializer(serializers.ModelSerializer):
         return str(amount_outstanding(bill))
 
     def get_payment_request_cancelled_by_add(self, bill):
-        history = [
-            entry
-            for order in bill.orders.all()
-            for entry in order.history.all()
-            if entry.event in ("bill_pay_requested", "bill_pay_cancelled")
-            and (entry.details or {}).get("bill_id") == bill.pk
-        ]
-        if not history:
-            return False
-        latest = max(history, key=lambda entry: (entry.created_at, entry.pk))
-        return (
-            latest.event == "bill_pay_cancelled"
-            and (latest.details or {}).get("reason") == "additional_items"
-        )
+        return payment_request_cancelled_by_add(bill)
 
     def get_needs_review(self, bill):
         return any(payment.needs_review for payment in bill.moyasar_payments.all())

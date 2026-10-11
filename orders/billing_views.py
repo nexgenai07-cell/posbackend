@@ -57,10 +57,16 @@ def _transition_error(exc):
     return Response({"error": exc.code}, status=status.HTTP_409_CONFLICT)
 
 
-def _bill_response(bill, http_status=status.HTTP_200_OK, **extra):
-    data = BillSerializer(_bill_queryset().get(pk=bill.pk)).data
+def _bill_response(bill, http_status=status.HTTP_200_OK, *, public=False, **extra):
+    """`public=True` for responses that go to a customer's phone: voided lines
+    are left out of the itemisation (totals already excluded them)."""
+    data = BillSerializer(_bill_queryset().get(pk=bill.pk), context={"public": public}).data
     data.update(extra)
     return Response(data, status=http_status)
+
+
+def _session_ended_response():
+    return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
 
 
 # -- customer-facing (AllowAny, table session token) -------------------------
@@ -68,23 +74,36 @@ def _bill_response(bill, http_status=status.HTTP_200_OK, **extra):
 
 class BillBySessionView(APIView):
     """
-    GET /api/bills/by-session/<token>/
+    GET /api/bills/by-session/<token>/?bill_id=<pinned>
 
     The open bill for the scanned table, with a server-computed total. This is
-    what the customer's phone polls on the pay screen.
+    what the customer's phone polls on its order and pay screens.
+
+    The client pins the bill it first saw and sends it on every poll. If that
+    bill has been released, or the table has moved on to another party's bill,
+    the answer is 409 error.billSessionEnded with no data from the new bill.
+
+    Deliberately not throttled: a successful poll with a valid table token is
+    cheap, and a whole restaurant's customers often share one wifi IP. The
+    token itself is a CSPRNG secret, so there is nothing to brute-force.
     """
 
     permission_classes = [AllowAny]
-    throttle_scope = "table-lookup"
 
     def get(self, request, token):
         table = _table_for_token(token)
         if table is None:
             return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
         bill = billing.current_bill_for_table(table)
+        pinned = str(request.query_params.get("bill_id", "")).strip()
+        if pinned:
+            if not pinned.isdigit():
+                return Response({"error": "error.billIdInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+            if bill is None or bill.pk != int(pinned):
+                return _session_ended_response()
         if bill is None:
             return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
-        return _bill_response(bill)
+        return _bill_response(bill, public=True)
 
 
 class BillRequestPayView(APIView):
@@ -140,7 +159,7 @@ class BillRequestPayView(APIView):
                 "callback_url": _callback_url(table, bill),
                 "description": f"{bill.bill_code} — {table.label_en}",
             }
-        return _bill_response(bill, **extra)
+        return _bill_response(bill, public=True, **extra)
 
 
 def _callback_url(table, bill):
@@ -187,7 +206,7 @@ class BillCancelPayView(APIView):
                 billing.reopen_bill(bill, reason="customer_cancelled")
             except billing.BillTransitionError as exc:
                 return _transition_error(exc)
-        return _bill_response(bill)
+        return _bill_response(bill, public=True)
 
 
 class BillVerifyOnlineView(APIView):
@@ -229,7 +248,7 @@ class BillVerifyOnlineView(APIView):
         outcome, bill, error = settle_from_moyasar(payload, expected_table=table)
         if error:
             return error
-        return _bill_response(bill, result=outcome)
+        return _bill_response(bill, public=True, result=outcome)
 
 
 class MoyasarWebhookView(APIView):

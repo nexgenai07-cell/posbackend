@@ -144,8 +144,9 @@ class TableBySessionView(APIView):
     as "not found" rather than querying with it.
     """
 
+    # Not throttled: customers poll this, many share one restaurant wifi IP,
+    # and the token is a CSPRNG secret with nothing to brute-force.
     permission_classes = [AllowAny]
-    throttle_scope = "table-lookup"
 
     def get(self, request, token):
         token = parse_qr_payload(token)

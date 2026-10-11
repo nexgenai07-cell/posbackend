@@ -183,6 +183,7 @@ def bill_event_payload(bill, **extra):
         "method": bill.paid_method or bill.requested_method or "",
         "total": str(bill.total_at_payment if bill.total_at_payment is not None else bill_total(bill)),
         "order_ids": [order.pk for order in bill.orders.all()],
+        "order_numbers": [order.order_number for order in bill.orders.all()],
         **extra,
     }
 
@@ -288,6 +289,22 @@ def reopen_for_additional_items(bill, actor=None):
         bill.pk, getattr(actor, "pk", None), amount_paid(bill),
     )
     return bill
+
+
+def payment_request_cancelled_by_add(bill):
+    """True when the bill's latest payment request was cancelled because new
+    items were added — the customer must request payment again once served."""
+    history = [
+        entry
+        for order in bill.orders.all()
+        for entry in order.history.all()
+        if entry.event in ("bill_pay_requested", "bill_pay_cancelled")
+        and (entry.details or {}).get("bill_id") == bill.pk
+    ]
+    if not history:
+        return False
+    latest = max(history, key=lambda entry: (entry.created_at, entry.pk))
+    return latest.event == "bill_pay_cancelled" and (latest.details or {}).get("reason") == "additional_items"
 
 
 def amount_paid(bill):

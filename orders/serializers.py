@@ -4,15 +4,35 @@ from rest_framework import serializers
 
 from catalog.models import Product, ProductVariant
 from catalog.services import current_price, is_available_today
+from common.exceptions import ConflictCode
 from inventory.services import check_product_stock
 
 from .models import Order, OrderHistory, OrderItem, OrderItemStatus, Payment
 
+# History events whose details.item_ids mark lines added after the first batch.
+ADDITIONAL_BATCH_EVENTS = (
+    "customer_items_added", "customer_items_reviewed_and_sent",
+    "cashier_item_added_and_sent", "waiter_item_added_and_sent",
+)
+
+
+def additional_batch_item_ids(order):
+    """Ids of the order's lines that arrived as a later batch ("Added later")."""
+    return {
+        int(item_id)
+        for entry in order.history.all()
+        if entry.event in ADDITIONAL_BATCH_EVENTS
+        for item_id in (entry.details or {}).get("item_ids", [])
+        if str(item_id).isdigit()
+    }
+
 
 class OrderHistorySerializer(serializers.ModelSerializer):
+    order_number = serializers.CharField(source="order.order_number", read_only=True)
+
     class Meta:
         model = OrderHistory
-        fields = ["id", "actor", "event", "from_status", "to_status", "details", "created_at"]
+        fields = ["id", "order", "order_number", "actor", "event", "from_status", "to_status", "details", "created_at"]
         read_only_fields = fields
 
 
@@ -60,7 +80,8 @@ class AddOrderItemSerializer(serializers.Serializer):
     def validate_product(self, product):
         order = self.context["order"]
         if product.branch_id != order.branch_id or not is_available_today(product):
-            raise serializers.ValidationError("error.productUnavailable")
+            # 409, the same status dispatch uses for this code.
+            raise ConflictCode("error.productUnavailable")
         return product
 
     def validate(self, attrs):
@@ -82,7 +103,7 @@ class AddOrderItemSerializer(serializers.Serializer):
             # twice the ingredients, so the base recipe passing proves nothing.
             available, _reason = check_product_stock(product, quantity, variant=variant)
             if not available:
-                raise serializers.ValidationError({"product": "error.productUnavailable"})
+                raise ConflictCode("error.productUnavailable")
         return attrs
 
     def create(self, validated_data):
@@ -137,14 +158,7 @@ class OrderSerializer(serializers.ModelSerializer):
     total = serializers.SerializerMethodField()
 
     def to_representation(self, instance):
-        history = instance.history.all()
-        new_ids = {
-            int(item_id)
-            for entry in history
-            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
-            for item_id in (entry.details or {}).get("item_ids", [])
-            if str(item_id).isdigit()
-        }
+        new_ids = additional_batch_item_ids(instance)
         items = instance.items.all()
         for item in items:
             item._is_additional_batch_any = item.pk in new_ids
@@ -154,7 +168,7 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = [
-            "id", "order_code", "branch", "table", "customer", "source", "staff",
+            "id", "order_number", "order_code", "branch", "table", "customer", "source", "staff",
             "assigned_cashier", "assigned_waiter", "waiter_confirmed_at", "waiter_confirmed_by",
             "status", "payment_status", "items", "payments", "history", "total",
             "opened_at", "closed_at", "cancelled_at", "cancel_reason", "created_at", "updated_at",
@@ -180,17 +194,11 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Order
-        fields = ["id", "order_code", "table", "assigned_waiter", "status", "items", "opened_at"]
+        fields = ["id", "order_number", "order_code", "table", "assigned_waiter", "status", "items", "opened_at"]
         read_only_fields = fields
 
     def get_items(self, order):
-        new_ids = {
-            int(item_id)
-            for entry in order.history.all()
-            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
-            for item_id in (entry.details or {}).get("item_ids", [])
-            if str(item_id).isdigit()
-        }
+        new_ids = additional_batch_item_ids(order)
         active_batch = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING))
         additional_batch = order.items.filter(pk__in=new_ids, status__in=(
             OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY,
@@ -226,29 +234,42 @@ class PublicOrderItemSerializer(serializers.ModelSerializer):
 
 class PublicOrderSerializer(serializers.ModelSerializer):
     """OrderSerializer without `branch`/`staff`/`customer` — nothing a public,
-    unauthenticated client (a customer's phone) needs or should see."""
+    unauthenticated client (a customer's phone) needs or should see.
 
-    items = PublicOrderItemSerializer(many=True, read_only=True)
+    Voided lines are left out entirely (the total already excluded them), and
+    the bill's state rides along so the customer screen can say "request
+    payment again" straight from the order response."""
+
+    items = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
     bill_id = serializers.IntegerField(read_only=True, allow_null=True)
-
-    def to_representation(self, instance):
-        new_ids = {
-            int(item_id)
-            for entry in instance.history.all()
-            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
-            for item_id in (entry.details or {}).get("item_ids", [])
-            if str(item_id).isdigit()
-        }
-        for item in instance.items.all():
-            item._is_additional_batch_any = item.pk in new_ids
-            item._is_additional_batch = item.pk in new_ids and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED)
-        return super().to_representation(instance)
+    bill_status = serializers.SerializerMethodField()
+    payment_request_cancelled_by_add = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
-        fields = ["id", "order_code", "table", "bill_id", "source", "status", "items", "total", "opened_at", "closed_at"]
+        fields = [
+            "id", "order_number", "order_code", "tracking_token", "table", "bill_id", "bill_status",
+            "payment_request_cancelled_by_add", "source", "status", "items", "total", "opened_at", "closed_at",
+        ]
         read_only_fields = fields
+
+    def get_items(self, order):
+        new_ids = additional_batch_item_ids(order)
+        visible = [item for item in order.items.all() if item.status != OrderItemStatus.VOIDED]
+        for item in visible:
+            item._is_additional_batch_any = item.pk in new_ids
+            item._is_additional_batch = item.pk in new_ids and item.status != OrderItemStatus.SERVED
+        return PublicOrderItemSerializer(visible, many=True).data
+
+    def get_bill_status(self, order):
+        return order.bill.status if order.bill_id else None
+
+    def get_payment_request_cancelled_by_add(self, order):
+        if not order.bill_id:
+            return False
+        from .billing import payment_request_cancelled_by_add
+        return payment_request_cancelled_by_add(order.bill)
 
     def get_total(self, order):
         return sum(

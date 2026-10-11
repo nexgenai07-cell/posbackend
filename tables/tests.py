@@ -320,9 +320,11 @@ class PublicQrOrderTests(TablesApiTestCase):
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_tracking_order_code_is_signed_and_tampering_is_rejected(self):
+        # The displayed number is short; only the hidden tracking_token is signed.
         submitted = self.post_qr(self.payload(self.open_table.session_token))
-        code = submitted.json()["order_code"]
-        self.assertNotEqual(code, f"ORD-{submitted.json()['id']:08d}")
+        self.assertEqual(submitted.json()["order_number"], f"ORD-{submitted.json()['id']:08d}")
+        code = submitted.json()["tracking_token"]
+        self.assertNotEqual(code, submitted.json()["order_number"])
         tampered = code[:-1] + ("A" if code[-1] != "A" else "B")
         response = self.client.get("/api/orders/track/", {
             "order_code": tampered, "phone": "0770000001",
@@ -332,12 +334,15 @@ class PublicQrOrderTests(TablesApiTestCase):
     def test_public_order_tracking_is_rate_limited(self):
         from django.core.cache import cache
 
+        # Only FAILED lookups count toward the limit; successful ones never do.
         submitted = self.post_qr(self.payload(self.open_table.session_token))
         cache.clear()
         url = "/api/orders/track/"
-        params = {"order_code": submitted.json()["order_code"], "phone": "0770000001"}
-        responses = [self.client.get(url, params) for _ in range(31)]
-        self.assertEqual(responses[-1].status_code, 429)
+        good = {"order_code": submitted.json()["order_number"], "phone": "0770000001"}
+        bad = {"order_code": submitted.json()["order_number"], "phone": "0779999999"}
+        self.assertTrue(all(self.client.get(url, good).status_code == 200 for _ in range(31)))
+        failures = [self.client.get(url, bad) for _ in range(31)]
+        self.assertEqual(failures[-1].status_code, 429)
         cache.clear()
 
     def test_customer_tracking_returns_per_line_status_and_batch_after_each_poll(self):
@@ -438,12 +443,14 @@ class PublicQrOrderTests(TablesApiTestCase):
         for product_id in (other_product.id,):
             payload = self.payload(self.open_table.session_token)
             payload["items"][0]["product"] = product_id
-            self.assertEqual(self.post_qr(payload).status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(self.post_qr(payload).status_code, status.HTTP_409_CONFLICT)
         unavailable = Product.objects.create(branch=self.riyadh, category=self.category,
             name_en="Unavailable", name_ar="Unavailable", price="5.00", cost_price="2.00", is_available=False)
         payload = self.payload(self.open_table.session_token)
         payload["items"][0]["product"] = unavailable.id
-        self.assertEqual(self.post_qr(payload).status_code, status.HTTP_400_BAD_REQUEST)
+        response = self.post_qr(payload)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.json(), {"error": "error.productUnavailable"})
 
     def test_table_session_returns_new_active_order_not_old_paid_order(self):
         from orders.models import Order, OrderStatus
@@ -1017,10 +1024,12 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
             self.client.patch(f"/api/orders/{order_id}/items/{item_ids[0]}/status/", {"status": "ready"}, format="json")
         self.assertEqual(Order.objects.get(pk=order_id).status, "preparing")
         self.auth_as(self.waiter, "4444")
+        # Serving is per line now: a line that is still cooking cannot be served.
         early_serve = self.client.patch(
-            f"/api/orders/{order_id}/items/{item_ids[0]}/status/", {"status": "served"}, format="json"
+            f"/api/orders/{order_id}/items/{item_ids[1]}/status/", {"status": "served"}, format="json"
         )
         self.assertEqual(early_serve.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(early_serve.json()["error"], "error.itemNotReady")
 
         self.auth_as(self.kitchen, "6666")
         with self.captureOnCommitCallbacks(execute=True):

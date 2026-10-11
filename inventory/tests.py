@@ -154,7 +154,9 @@ class InventoryAvailabilityTests(TestCase):
             "location_timestamp": time.time(),
             "items": [{"product": self.product.pk, "quantity": 1}],
         }, format="json")
-        self.assertEqual(response.status_code, 400)
+        # 409 error.productUnavailable — the same status dispatch uses.
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"error": "error.productUnavailable"})
         self.assertFalse(Order.objects.filter(table=table).exists())
 
 

@@ -21,6 +21,7 @@ from accounts.models import Staff, StaffRole
 from accounts.permissions import IsCashierStaff, IsKitchenStaff, IsOrderStaff, IsPOSStaff, IsWaiterStaff
 from catalog.services import is_available_today
 from common.geofence import validate_branch_location
+from common.throttles import FailedLookupLimiter
 from customers.models import Customer
 from customers.services import find_or_create_customer
 from inventory.services import ProductStockUnavailable, check_product_stock, deduct_stock_for_order_items
@@ -40,6 +41,7 @@ from .serializers import (
     PaymentSerializer,
     PublicOrderSerializer,
     RecordPaymentSerializer,
+    additional_batch_item_ids,
 )
 from .services import BillLocked, get_or_create_open_order
 from .codes import resolve_order_code
@@ -172,7 +174,8 @@ def _order_event_payload(order, actor_id=None, staff_id=None, **extra):
     return {
         "id": order.pk,
         "order_id": order.pk,
-        "order_code": order.order_code,
+        "order_number": order.order_number,
+        "order_code": order.order_number,
         "table_id": order.table_id,
         "table_label": order.table.label_en if order.table_id else None,
         "status": order.status,
@@ -207,13 +210,7 @@ def _item_notice(item):
 
 
 def _additional_batch_ready_items(order):
-    batch_ids = {
-        int(item_id)
-        for entry in order.history.all()
-        if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
-        for item_id in (entry.details or {}).get("item_ids", [])
-        if str(item_id).isdigit()
-    }
+    batch_ids = additional_batch_item_ids(order)
     return list(order.items.filter(pk__in=batch_ids, status=OrderItemStatus.READY)) if batch_ids else []
 
 
@@ -270,16 +267,10 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
             qs = qs.filter(assigned_cashier_id=cashier_param)
         search = self.request.query_params.get("search", "").strip()
         if search:
-            order_number = search
-            if order_number[:4].upper() == "ORD-":
-                order_id = resolve_order_code(order_number)
-                if order_id:
-                    qs = qs.filter(pk=order_id)
-                else:
-                    qs = qs.none()
-            else:
-                order_number = order_number.lstrip("0")
-                qs = qs.filter(pk=int(order_number)) if order_number.isdigit() else qs.none()
+            # Short order number in any staff-typed form: ORD-00000020,
+            # ord-20, 00000020, #20 or 20.
+            order_id = resolve_order_code(search)
+            qs = qs.filter(pk=order_id) if order_id else qs.none()
 
         date_from = self.request.query_params.get("from")
         date_to = self.request.query_params.get("to")
@@ -359,7 +350,7 @@ class OrderHistoryView(ListAPIView):
         if self.request.user.role == StaffRole.WAITER:
             order_qs = order_qs.filter(assigned_waiter=self.request.user)
         get_object_or_404(order_qs)
-        return OrderHistory.objects.filter(order_id=self.kwargs["pk"], order__branch=self.request.user.branch).select_related("actor")
+        return OrderHistory.objects.filter(order_id=self.kwargs["pk"], order__branch=self.request.user.branch).select_related("actor", "order")
 
 
 class CashierReviewView(APIView):
@@ -417,11 +408,14 @@ class AssignWaiterView(APIView):
             return Response({"error": "error.waiterRequired"}, status=status.HTTP_400_BAD_REQUEST)
         with transaction.atomic():
             order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
-            recover_ready_order = order.status in (OrderStatus.READY, OrderStatus.SERVED)
-            if recover_ready_order and order.assigned_waiter_id is not None:
+            # AWAITING_WAITER is the normal assignment step (and may reassign).
+            # Any other live order may only be given a waiter when it has none —
+            # e.g. a null-waiter order already cooking an extra batch. Status
+            # and lines are never touched here.
+            if order.status in TERMINAL_ORDER_STATUSES:
+                return Response({"error": "error.orderAlreadyClosed"}, status=status.HTTP_409_CONFLICT)
+            if order.status != OrderStatus.AWAITING_WAITER and order.assigned_waiter_id is not None:
                 return Response({"error": "error.orderAlreadyAssigned"}, status=status.HTTP_409_CONFLICT)
-            if order.status != OrderStatus.AWAITING_WAITER and not recover_ready_order:
-                return Response({"error": "error.orderNotAwaitingWaiter"}, status=status.HTTP_409_CONFLICT)
             waiter = get_object_or_404(Staff, pk=waiter_id, branch=request.user.branch,
                 role=StaffRole.WAITER, is_active=True)
             previous_waiter = order.assigned_waiter_id
@@ -841,12 +835,16 @@ class OrderItemStatusView(APIView):
         if request.user.role == StaffRole.WAITER:
             if new_status != OrderItemStatus.SERVED or order.assigned_waiter_id != request.user.pk:
                 return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
-            if order.status != OrderStatus.READY:
-                return Response({"error": "error.orderNotReady"}, status=status.HTTP_409_CONFLICT)
         elif request.user.role == StaffRole.KITCHEN and new_status == OrderItemStatus.SERVED:
             return Response({"error": "error.statusInvalid"}, status=status.HTTP_403_FORBIDDEN)
+        if order.status in TERMINAL_ORDER_STATUSES:
+            return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
         if item.status == OrderItemStatus.PENDING:
             return Response({"error": "error.itemNotFired"}, status=status.HTTP_409_CONFLICT)
+        # Serving is per line: a READY line can be served while other lines of
+        # the same order are still cooking; the parent is recomputed below.
+        if new_status == OrderItemStatus.SERVED and item.status != OrderItemStatus.READY:
+            return Response({"error": "error.itemNotReady"}, status=status.HTTP_409_CONFLICT)
         if item.status not in _KDS_ITEM_TRANSITIONS or new_status not in _KDS_ITEM_TRANSITIONS[item.status]:
             return Response({"error": "error.itemAlreadyFinal"}, status=status.HTTP_409_CONFLICT)
 
@@ -857,6 +855,17 @@ class OrderItemStatusView(APIView):
             sale_movements = StockMovement.objects.filter(order_item=item, reason=StockMovementReason.SALE)
             reclassified_waste = sale_movements.count()
             sale_movements.update(reason=StockMovementReason.WASTE)
+            # A void always happens after dispatch here (pending lines are
+            # removed, not voided), so the stock is already gone: say so in
+            # plain words on the order's history.
+            record_order_event(order, request.user, "item_voided_after_dispatch", details={
+                "item_id": item.pk,
+                "items": [_item_notice(item)],
+                "from": previous_item_status,
+                "waste_movements": reclassified_waste,
+                "message": "Line voided after dispatch, stock moved to waste",
+                "actor_role": request.user.role,
+            })
         item.status = new_status
         update_fields = ["status", "updated_at"]
         if new_status == OrderItemStatus.READY and item.ready_at is None:
@@ -918,6 +927,16 @@ class OrderCustomerView(APIView):
 
         order.save(update_fields=["customer", "updated_at"])
         return Response(OrderSerializer(order).data)
+
+
+def _submission_session_finished(submission):
+    """True when a stored customer submission belongs to a finished seating."""
+    from .models import BillStatus
+
+    order = submission.order
+    if order.status in (OrderStatus.CLOSED, OrderStatus.CANCELLED):
+        return True
+    return bool(order.bill_id and order.bill.status == BillStatus.CLOSED)
 
 
 class PublicOrderCreateView(APIView):
@@ -984,6 +1003,14 @@ class PublicOrderCreateView(APIView):
                 "items": items_data,
             }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
             previous = CustomerOrderSubmission.objects.select_for_update().filter(idempotency_key=idempotency_key).first()
+            if previous and _submission_session_finished(previous):
+                # The key was last used for an order that is closed/cancelled
+                # or whose bill was released — a new seating reusing a stale
+                # key must get a new order, not the old one back. The record
+                # is re-pointed below instead of inserted.
+                stale_submission, previous = previous, None
+            else:
+                stale_submission = None
             if previous:
                 legacy_hash = hashlib.sha256(json.dumps({
                     "branch": branch.pk,
@@ -997,7 +1024,7 @@ class PublicOrderCreateView(APIView):
                 order = previous.order
                 return Response(PublicOrderSerializer(order).data, status=status.HTTP_200_OK)
 
-            customer, _ = find_or_create_customer(branch, phone, request.data.get("name", ""))
+            customer, _ = find_or_create_customer(branch, submitted_phone, request.data.get("name", ""))
             try:
                 if table:
                     # Keep one order per active table session so later rounds
@@ -1043,11 +1070,16 @@ class PublicOrderCreateView(APIView):
                 record_order_event(order, None, "customer_items_added", details=details)
             else:
                 queue_order_for_cashier(order, None, "customer_order_placed", details=details)
-            CustomerOrderSubmission.objects.create(
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                order=order,
-            )
+            if stale_submission is not None:
+                stale_submission.order = order
+                stale_submission.request_hash = request_hash
+                stale_submission.save(update_fields=["order", "request_hash", "updated_at"])
+            else:
+                CustomerOrderSubmission.objects.create(
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    order=order,
+                )
             _notify_role_staff(order, "order:cashier_review", {StaffRole.CASHIER}, None, items=details["items"])
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, None)
 
@@ -1059,24 +1091,33 @@ class PublicOrderCreateView(APIView):
 
 
 class PublicOrderTrackView(APIView):
-    """Public status lookup requiring both the non-sequential order code and phone."""
+    """
+    Optional fallback lookup for another device: order number (or the hidden
+    tracking token) plus the customer's phone. The normal customer page reads
+    the table session instead and never needs this.
+
+    Only FAILED lookups are rate-limited (per IP, the public-order-track rate):
+    successful lookups are never counted, so a dining room sharing one wifi IP
+    is not locked out by its own polling.
+    """
     permission_classes = [AllowAny]
-    throttle_scope = "public-order-track"
+    failed_lookups = FailedLookupLimiter("public-order-track")
 
     def get(self, request):
+        from customers.services import phones_match
+
+        if self.failed_lookups.is_blocked(request):
+            return Response({"error": "error.tooManyRequests"}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         code = str(request.query_params.get("order_code", "")).strip()
         phone = str(request.query_params.get("phone", "")).strip()
-        from customers.services import normalize_phone
         order_id = resolve_order_code(code)
-        if not order_id:
-            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
-        order = Order.objects.filter(pk=order_id).select_related("customer").prefetch_related("items", "history").first()
-        if not phone or not order or not order.customer_id or normalize_phone(order.customer.phone) != normalize_phone(phone):
-            order = None
-        legacy_code = f"ORD-{order_id:08d}" if order else ""
-        if order and order.order_code != code and code.upper() != legacy_code:
+        order = None
+        if order_id:
+            order = Order.objects.filter(pk=order_id).select_related("customer", "bill").prefetch_related("items", "history").first()
+        if order and (not order.customer_id or not phones_match(order.customer.phone, phone)):
             order = None
         if not order:
+            self.failed_lookups.record_failure(request)
             return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
         return Response(PublicOrderSerializer(order).data)
 
@@ -1087,15 +1128,15 @@ class PublicOrderBySessionView(APIView):
 
     def get(self, request, token, order_id):
         token = parse_qr_payload(token)
-        from customers.services import normalize_phone
-        phone = normalize_phone(request.query_params.get("phone", ""))
+        from customers.services import phones_match
+        phone = str(request.query_params.get("phone", "")).strip()
         if not token or not phone:
             return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
         table = Table.objects.filter(session_token=token).first()
         if table is None:
             return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
-        order = Order.objects.filter(pk=order_id, table=table).select_related("customer").prefetch_related("items", "history").first()
-        if order and (not order.customer_id or normalize_phone(order.customer.phone) != phone):
+        order = Order.objects.filter(pk=order_id, table=table).select_related("customer", "bill").prefetch_related("items", "history").first()
+        if order and (not order.customer_id or not phones_match(order.customer.phone, phone)):
             order = None
         if order is None:
             return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
