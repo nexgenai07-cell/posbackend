@@ -154,8 +154,8 @@ class OrderNumberTests(CustomerSessionTestCase):
             "waiter_list": self.waiter_client.get("/api/orders/").json()["results"][0],
             "kds": self.kitchen_client.get("/api/kds/tickets/").json()["results"][0],
             "tracking": self.track(expected, "0501234567").json(),
-            "session_open_order": self.public.get(f"/api/tables/by-session/{table.session_token}/").json()["open_order"],
-            "customer_bill_order": self.public.get(f"/api/bills/by-session/{table.session_token}/").json()["orders"][0],
+            "session_open_order": self.public.get(f"/api/tables/by-session/{table.session_token}/", {"phone": "0501234567"}).json()["open_order"],
+            "customer_bill_order": self.public.get(f"/api/bills/by-session/{table.session_token}/", {"phone": "0501234567"}).json()["orders"][0],
             "cashier_bill_order": self.cashier_client.get(f"/api/bills/{bill_id}/").json()["orders"][0],
             "cashier_bill_list_order": self.cashier_client.get("/api/bills/").json()["results"][0]["orders"][0],
             "history": self.cashier_client.get(f"/api/orders/{order_id}/history/").json()["results"][0],
@@ -214,8 +214,8 @@ class RateLimitTests(CustomerSessionTestCase):
         table = self.new_table()
         self.qr(table)
         for _ in range(80):
-            self.assertEqual(self.public.get(f"/api/bills/by-session/{table.session_token}/").status_code, 200)
-            self.assertEqual(self.public.get(f"/api/tables/by-session/{table.session_token}/").status_code, 200)
+            self.assertEqual(self.public.get(f"/api/bills/by-session/{table.session_token}/", {"phone": "0501234567"}).status_code, 200)
+            self.assertEqual(self.public.get(f"/api/tables/by-session/{table.session_token}/", {"phone": "0501234567"}).status_code, 200)
 
     def test_successful_fallback_lookups_are_not_counted(self):
         body = self.qr(self.new_table()).json()
@@ -322,7 +322,7 @@ class PinnedBillTests(CustomerSessionTestCase):
     def test_pinned_current_bill_is_returned(self):
         table = self.new_table()
         bill_id = self.qr(table).json()["bill_id"]
-        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": bill_id})
+        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": bill_id, "phone": "0501234567"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["id"], bill_id)
 
@@ -330,7 +330,7 @@ class PinnedBillTests(CustomerSessionTestCase):
         table = self.new_table()
         bill_id = self._served_and_paid(table)
         self.pay_and_release(bill_id)
-        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": bill_id})
+        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": bill_id, "phone": "0501234567"})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"error": "error.billSessionEnded"})
 
@@ -340,7 +340,7 @@ class PinnedBillTests(CustomerSessionTestCase):
         self.pay_and_release(old_bill)
         new_bill = self.qr(table, phone="0507777777", items=[{"product": self.burger.pk}]).json()["bill_id"]
         self.assertNotEqual(new_bill, old_bill)
-        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": old_bill})
+        response = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"bill_id": old_bill, "phone": "0501234567"})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"error": "error.billSessionEnded"})
         self.assertNotIn("Burger", response.content.decode())
@@ -357,7 +357,7 @@ class VoidedLinesTests(CustomerSessionTestCase):
         self.assertEqual([item["id"] for item in tracking["items"]], [fries_id])
         self.assertEqual(Decimal(str(tracking["total"])), Decimal("10.00"))
 
-        customer_bill = self.public.get(f"/api/bills/by-session/{table.session_token}/").json()
+        customer_bill = self.public.get(f"/api/bills/by-session/{table.session_token}/", {"phone": "0501234567"}).json()
         self.assertEqual([item["id"] for item in customer_bill["orders"][0]["items"]], [fries_id])
         self.assertEqual(customer_bill["total"], "10.00")
 
@@ -375,7 +375,7 @@ class QrResponseBillStateTests(CustomerSessionTestCase):
         self.assertEqual(body["bill_status"], "open")
         self.assertFalse(body["payment_request_cancelled_by_add"])
         self.serve_everything(order_id)
-        self.assertEqual(self.public.post("/api/bills/request-pay/", {"session_token": table.session_token, "method": "cash"},
+        self.assertEqual(self.public.post("/api/bills/request-pay/", {"session_token": table.session_token, "method": "cash", "phone": "0501234567"},
                                           format="json").status_code, 200)
         response = self.qr(table, items=[{"product": self.burger.pk}])
         self.assertEqual(response.status_code, 200)

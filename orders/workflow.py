@@ -12,7 +12,9 @@ ALLOWED_ORDER_TRANSITIONS = {
     OrderStatus.PREPARING: {OrderStatus.READY, OrderStatus.SERVED, OrderStatus.PENDING_CASHIER, OrderStatus.CANCELLED},
     OrderStatus.READY: {OrderStatus.PREPARING, OrderStatus.SERVED, OrderStatus.PENDING_CASHIER, OrderStatus.CANCELLED},
     OrderStatus.SERVED: {OrderStatus.PREPARING, OrderStatus.PAID, OrderStatus.PENDING_CASHIER, OrderStatus.CANCELLED},
-    OrderStatus.PAID: {OrderStatus.CLOSED},
+    # PAID -> SERVED: the same customer added items after paying, before the
+    # table was released; the order reopens and only the new lines are owed.
+    OrderStatus.PAID: {OrderStatus.CLOSED, OrderStatus.SERVED},
     OrderStatus.CLOSED: set(),
     OrderStatus.CANCELLED: set(),
 }
@@ -48,6 +50,20 @@ def transition_order(order, to_status, actor, event, *, details=None, extra_fiel
     order.save(update_fields=update_fields)
     record_order_event(order, actor, event, details=details, from_status=from_status, to_status=to_status)
     return True
+
+
+def reopen_paid_order_for_items(order, actor):
+    """A paid (not yet released) order takes more items: back to `served`
+    with payment `partial`, so the new lines go through review/kitchen and
+    the customer then pays only for them."""
+    from .models import PaymentStatus
+
+    if order.status != OrderStatus.PAID:
+        return False
+    return transition_order(
+        order, OrderStatus.SERVED, actor, "paid_order_reopened_for_items",
+        extra_fields={"payment_status": PaymentStatus.PARTIAL},
+    )
 
 
 def queue_order_for_cashier(order, actor, event, *, details=None):

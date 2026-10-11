@@ -306,8 +306,12 @@ class PublicQrOrderTests(TablesApiTestCase):
         self.assertEqual(len(tracked.json()["items"]), 2)
         self.assertTrue(any(item["is_new"] for item in tracked.json()["items"]))
         self.assertEqual(tracked.json()["bill_id"], first.json()["bill_id"])
-        session = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/")
+        session = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/", {"phone": phone})
         self.assertEqual(session.json()["bill_id"], first.json()["bill_id"])
+        # Without the phone the table token reveals no order or bill.
+        anonymous = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/").json()
+        self.assertIsNone(anonymous["bill_id"])
+        self.assertIsNone(anonymous["open_order"])
 
     def test_tracking_phone_normalization_accepts_local_and_international_formats(self):
         submitted = self.post_qr(self.payload(self.open_table.session_token, phone="03001234567"))
@@ -453,10 +457,14 @@ class PublicQrOrderTests(TablesApiTestCase):
         self.assertEqual(response.json(), {"error": "error.productUnavailable"})
 
     def test_table_session_returns_new_active_order_not_old_paid_order(self):
-        from orders.models import Order, OrderStatus
-        old = Order.objects.create(branch=self.riyadh, table=self.open_table, status=OrderStatus.PAID)
-        current = Order.objects.create(branch=self.riyadh, table=self.open_table, status=OrderStatus.PENDING_CASHIER)
-        response = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/")
+        from customers.services import find_or_create_customer
+        from orders.models import Bill, BillStatus, Order, OrderStatus
+        customer, _ = find_or_create_customer(self.riyadh, "0770000012")
+        old_bill = Bill.objects.create(branch=self.riyadh, table=self.open_table, customer=customer, status=BillStatus.CLOSED)
+        bill = Bill.objects.create(branch=self.riyadh, table=self.open_table, customer=customer)
+        old = Order.objects.create(branch=self.riyadh, table=self.open_table, customer=customer, bill=old_bill, status=OrderStatus.CLOSED)
+        current = Order.objects.create(branch=self.riyadh, table=self.open_table, customer=customer, bill=bill, status=OrderStatus.PENDING_CASHIER)
+        response = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/", {"phone": "+966770000012"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()["open_order"]["id"], current.id)
         self.assertNotEqual(response.json()["open_order"]["id"], old.id)
@@ -743,7 +751,12 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
     def test_customer_addition_waits_for_cashier_review_then_dispatches_to_same_order(self):
         from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
 
-        order = Order.objects.create(branch=self.riyadh, table=self.open_table,
+        from customers.services import find_or_create_customer
+        from orders.models import Bill
+        # The customer's own order (each phone has its own bill at a table).
+        customer, _ = find_or_create_customer(self.riyadh, "0770000099")
+        bill = Bill.objects.create(branch=self.riyadh, table=self.open_table, customer=customer)
+        order = Order.objects.create(branch=self.riyadh, table=self.open_table, customer=customer, bill=bill,
             assigned_waiter=self.waiter, status=OrderStatus.READY)
         old_item = OrderItem.objects.create(order=order, product=self.product,
             name_en_snapshot="Already ready", name_ar_snapshot="Already ready",
@@ -970,9 +983,12 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         self.assertEqual(Payment.objects.filter(order_id=order_id).count(), 1)
         self.assertEqual(str(Payment.objects.get(order_id=order_id).tip), "2.50")
         self.open_table.refresh_from_db()
-        self.assertEqual(self.open_table.status, "occupied")
+        # Paid in full at the till: the bill is settled, but the table is not
+        # released (needs-bill, never empty) until a cashier releases it.
+        self.assertEqual(self.open_table.status, "needs-bill")
         from orders.models import Order
         order = Order.objects.get(pk=order_id)
+        self.assertEqual(order.bill.status, "paid")
         self.assertEqual(order.status, "paid")
         self.assertEqual(order.payment_status, "paid")
         from orders.models import OrderHistory

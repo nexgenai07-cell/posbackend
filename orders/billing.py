@@ -109,29 +109,39 @@ def bill_total_halalas(bill):
 # -- lookup / creation ------------------------------------------------------
 
 
-def get_or_create_open_bill(table):
+def get_or_create_open_bill(table, customer=None):
     """
-    The one open bill for this table, creating it on first order.
+    The open bill for this table and customer (phone), creating it on first
+    order. Each phone number at a table has its own bill; `customer=None` is
+    the staff (POS) bill for the table.
 
     The caller must already hold select_for_update() on `table` inside a
     transaction (PublicOrderCreateView and OrderListCreateView both do), which
-    is what serialises two phones scanning the same QR at once. The
-    one_open_bill_per_table constraint is the backstop if a caller forgets.
+    is what serialises two submissions at once. The
+    one_open_bill_per_table_customer constraint is the backstop.
     """
-    bill = Bill.objects.select_for_update().filter(table=table).exclude(status=BillStatus.CLOSED).first()
-    if bill:
-        return bill, False
-    return Bill.objects.create(branch=table.branch, table=table), True
-
-
-def current_bill_for_table(table):
-    """The open/pay_requested/paid bill for a table, or None. Read-only."""
-    return (
-        Bill.objects.filter(table=table)
+    bill = (
+        Bill.objects.select_for_update()
+        .filter(table=table, customer=customer)
         .exclude(status=BillStatus.CLOSED)
-        .prefetch_related("orders__items")
         .first()
     )
+    if bill:
+        return bill, False
+    return Bill.objects.create(branch=table.branch, table=table, customer=customer), True
+
+
+def customer_bills_for_table(table, phone):
+    """Unfinished bills at this table that belong to `phone` (newest first)."""
+    from customers.services import phones_match
+
+    bills = (
+        Bill.objects.filter(table=table, customer__isnull=False)
+        .exclude(status=BillStatus.CLOSED)
+        .select_related("customer")
+        .order_by("-id")
+    )
+    return [bill for bill in bills if phones_match(bill.customer.phone, phone)]
 
 
 def attach_order_to_bill(order, bill):
@@ -163,7 +173,9 @@ def unserved_orders(bill):
 
 
 def is_ready_to_pay(bill):
-    return bool(billable_orders(bill)) and not unserved_orders(bill)
+    """Everything served AND something still owed — a bill whose orders are
+    already paid in full is never offered as "Pay 0.00"."""
+    return bool(billable_orders(bill)) and not unserved_orders(bill) and amount_outstanding(bill) > _ZERO
 
 
 # -- notifications ----------------------------------------------------------
@@ -222,8 +234,10 @@ def request_payment(bill, method, actor=None):
         raise BillTransitionError("error.billClosed")
     if not billable_orders(bill):
         raise BillTransitionError("error.billEmpty")
-    if not is_ready_to_pay(bill):
+    if unserved_orders(bill):
         raise BillTransitionError("error.billNotServed")
+    if amount_outstanding(bill) <= _ZERO:
+        raise BillTransitionError("error.billNothingDue")
 
     already_requested = bill.status == BillStatus.PAY_REQUESTED
     bill.status = BillStatus.PAY_REQUESTED
@@ -237,7 +251,8 @@ def request_payment(bill, method, actor=None):
     for order in billable_orders(bill):
         record_order_event(
             order, actor, "bill_pay_requested",
-            details={"bill_id": bill.pk, "method": method, "total": str(bill_total(bill))},
+            details={"bill_id": bill.pk, "method": method, "total": str(bill_total(bill)),
+                     "amount_due": str(amount_outstanding(bill))},
         )
 
     # Only cash needs a cashier to act. An online request still notifies so
@@ -307,22 +322,33 @@ def payment_request_cancelled_by_add(bill):
     return latest.event == "bill_pay_cancelled" and (latest.details or {}).get("reason") == "additional_items"
 
 
+def order_paid(order):
+    """Money actually recorded against one order (Payment rows)."""
+    return sum((payment.amount for payment in order.payments.all()), _ZERO)
+
+
+def order_due(order):
+    """What one order still owes. Never negative: an overpayment is a refund
+    decision for a human, not credit against another order."""
+    return max(order_total(order) - order_paid(order), _ZERO)
+
+
 def amount_paid(bill):
-    """What has actually been taken for this bill so far, from the Payment rows."""
-    return sum(
-        (payment.amount for order in bill.orders.all() for payment in order.payments.all()),
-        _ZERO,
-    )
+    """What has actually been taken for this bill's billable orders.
+
+    Payments on cancelled orders are left out — that money is a refund
+    question, and counting it would silently discount someone else's food."""
+    return sum((order_paid(order) for order in billable_orders(bill)), _ZERO)
 
 
 def amount_outstanding(bill):
     """
-    What is still owed: current total minus what has already been paid.
+    What is still owed: the sum of each billable order's own unpaid balance.
 
-    Never negative — if items were removed after payment the difference is a
-    refund decision for a human, not a negative balance the customer can pay.
+    Computed per order (not bill total minus everything paid) so a payment
+    taken at the till for one order can never hide what another order owes.
     """
-    return max(bill_total(bill) - amount_paid(bill), _ZERO)
+    return sum((order_due(order) for order in billable_orders(bill)), _ZERO)
 
 
 def reopen_bill(bill, actor=None, *, reason="customer_cancelled"):
@@ -542,42 +568,80 @@ def _record_moyasar_payment(bill, moyasar):
 
 def _write_order_payments(bill, method, actor, now):
     """
-    One Payment row per billable order, so reports/, the POS receipt and
-    OrderDetailsPage all keep working unchanged — they read orders.Payment and
-    know nothing about bills.
+    One Payment row per billable order for exactly what that order still
+    owed, so reports/, the POS receipt and OrderDetailsPage keep reading
+    orders.Payment — and the rows add up to the money actually collected.
 
-    The idempotency_key is deterministic (`bill-<id>-order-<id>`), so if this
-    ever runs twice the UNIQUE constraint makes the second pass a no-op rather
-    than doubling the day's takings.
+    Orders already paid in full (at the till, or by an earlier settlement of
+    this bill) get no new row. The key carries the settlement time, so a
+    reopened bill's second settlement can record the new items' money while
+    the bill row lock and the paid/closed guard in mark_bill_paid() still stop
+    the same settlement being written twice.
     """
     payment_method = _PAYMENT_METHOD_FOR[method]
+    stamp = int(now.timestamp() * 1_000_000)
     for order in billable_orders(bill):
-        amount = order_total(order)
-        _, created = Payment.objects.get_or_create(
-            idempotency_key=f"bill-{bill.pk}-order-{order.pk}",
-            defaults={"order": order, "amount": amount, "method": payment_method},
-        )
-        if not created:
-            continue
-        order.payment_status = PaymentStatus.PAID
-        if order.status == OrderStatus.SERVED:
-            transition_order(
-                order, OrderStatus.PAID, actor, "bill_settled",
-                details={"bill_id": bill.pk, "method": method, "amount": str(amount)},
-                extra_fields={"payment_status": PaymentStatus.PAID},
+        due = order_due(order)
+        if due > _ZERO:
+            Payment.objects.create(
+                order=order, amount=due, method=payment_method,
+                idempotency_key=f"bill-{bill.pk}-order-{order.pk}-{stamp}",
             )
-        else:
-            # request_payment() refuses to leave `open` unless every billable
-            # order is served, so this is unreachable through the API. It can
-            # only happen if an order was moved backwards in Django admin
-            # between the request and the settle — record the money, leave the
-            # order status alone rather than forcing an illegal transition.
+            order._prefetched_objects_cache = {}
+        _mark_order_paid_if_settled(order, actor, bill, method, recorded=due)
+
+
+def _mark_order_paid_if_settled(order, actor, bill, method, recorded=_ZERO):
+    """Order fully paid -> payment_status paid, and served -> paid."""
+    if order_due(order) > _ZERO:
+        if order_paid(order) > _ZERO and order.payment_status != PaymentStatus.PARTIAL:
+            order.payment_status = PaymentStatus.PARTIAL
             order.save(update_fields=["payment_status", "updated_at"])
-            record_order_event(
-                order, actor, "bill_settled_unserved",
-                details={"bill_id": bill.pk, "order_status": order.status},
-            )
-            logger.warning(
-                "Bill %s settled while order %s was %s, not served",
-                bill.pk, order.pk, order.status,
-            )
+        return
+    if order.status == OrderStatus.SERVED:
+        transition_order(
+            order, OrderStatus.PAID, actor, "bill_settled",
+            details={"bill_id": bill.pk, "method": method, "amount": str(recorded)},
+            extra_fields={"payment_status": PaymentStatus.PAID},
+        )
+    elif order.payment_status != PaymentStatus.PAID:
+        order.payment_status = PaymentStatus.PAID
+        order.save(update_fields=["payment_status", "updated_at"])
+
+
+_BILL_METHOD_FOR_PAYMENT = {
+    PaymentMethod.CASH: BillMethod.CASH,
+    PaymentMethod.CARD: BillMethod.CARD,
+    PaymentMethod.OTHER: BillMethod.CARD,
+}
+
+
+def settle_bill_if_covered(bill_id, payment_method, actor=None):
+    """
+    Mark a bill paid when payments taken order-by-order at the till already
+    cover it — without writing any further Payment rows.
+
+    Called after OrderPaymentsView records a till payment. Without this the
+    bill stayed `open` with nothing left to pay, and a later bill settlement
+    wrote the same orders' money a second time.
+    """
+    with transaction.atomic():
+        bill = Bill.objects.select_for_update().get(pk=bill_id)
+        if bill.status not in (BillStatus.OPEN, BillStatus.PAY_REQUESTED):
+            return False
+        if not billable_orders(bill) or unserved_orders(bill) or amount_outstanding(bill) > _ZERO:
+            return False
+        now = timezone.now()
+        bill.status = BillStatus.PAID
+        bill.paid_method = _BILL_METHOD_FOR_PAYMENT.get(payment_method, BillMethod.CASH)
+        bill.total_at_payment = bill_total(bill)
+        bill.paid_at = now
+        bill.paid_by = actor
+        bill.save(update_fields=["status", "paid_method", "total_at_payment", "paid_at", "paid_by", "updated_at"])
+        if bill.table_id:
+            bill.table.mark_needs_bill()
+        transaction.on_commit(lambda: notify_cashiers(
+            Bill.objects.prefetch_related("orders").get(pk=bill.pk), "bill:paid"
+        ))
+        logger.info("Bill %s settled by till payments", bill.pk)
+        return True

@@ -69,6 +69,64 @@ def _session_ended_response():
     return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
 
 
+def _customer_bill(table, phone, bill_id=None):
+    """
+    The caller's own unfinished bill at this table, as (bill, None), or
+    (None, error_response).
+
+    Every phone number has its own bill at a table, so the phone is required:
+    without it a table token alone would expose whichever party ordered last.
+    A pinned `bill_id` that is closed or belongs to another phone gives the
+    same "session ended" answer, never someone else's data.
+    """
+    from customers.services import phone_key
+
+    if not phone_key(phone):
+        return None, Response({"error": "error.phoneRequired"}, status=status.HTTP_400_BAD_REQUEST)
+    bills = billing.customer_bills_for_table(table, phone)
+    if bill_id is not None:
+        match = [bill for bill in bills if bill.pk == int(bill_id)]
+        return (match[0], None) if match else (None, _session_ended_response())
+    if not bills:
+        return None, Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
+    return bills[0], None
+
+
+def _previous_orders(table, phone, exclude_bill_id=None, limit=10):
+    """This phone's orders from earlier, already released visits to this
+    restaurant (read-only history for the customer page)."""
+    from customers.services import phones_match
+
+    from .models import Order
+
+    orders = (
+        Order.objects.filter(branch=table.branch, bill__status=BillStatus.CLOSED, customer__isnull=False)
+        .exclude(bill_id=exclude_bill_id)
+        .select_related("customer", "table")
+        .prefetch_related("items")
+        .order_by("-opened_at")
+    )
+    found = []
+    for order in orders:
+        if not phones_match(order.customer.phone, phone):
+            continue
+        found.append({
+            "id": order.pk,
+            "order_number": order.order_number,
+            "status": order.status,
+            "opened_at": order.opened_at,
+            "table_label": order.table.label_en if order.table_id else None,
+            "total": str(billing.order_total(order)),
+            "items": [
+                {"name_en": item.name_en_snapshot, "name_ar": item.name_ar_snapshot, "quantity": item.quantity}
+                for item in order.items.all() if item.status != "voided"
+            ],
+        })
+        if len(found) >= limit:
+            break
+    return found
+
+
 # -- customer-facing (AllowAny, table session token) -------------------------
 
 
@@ -94,16 +152,17 @@ class BillBySessionView(APIView):
         table = _table_for_token(token)
         if table is None:
             return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
-        bill = billing.current_bill_for_table(table)
         pinned = str(request.query_params.get("bill_id", "")).strip()
-        if pinned:
-            if not pinned.isdigit():
-                return Response({"error": "error.billIdInvalid"}, status=status.HTTP_400_BAD_REQUEST)
-            if bill is None or bill.pk != int(pinned):
-                return _session_ended_response()
-        if bill is None:
-            return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
-        return _bill_response(bill, public=True)
+        if pinned and not pinned.isdigit():
+            return Response({"error": "error.billIdInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+        phone = str(request.query_params.get("phone", "")).strip()
+        bill, error = _customer_bill(table, phone, pinned or None)
+        if error is not None:
+            if error.status_code == status.HTTP_404_NOT_FOUND:
+                # No open bill — still show this phone's earlier visits.
+                error.data["previous_orders"] = _previous_orders(table, phone)
+            return error
+        return _bill_response(bill, public=True, previous_orders=_previous_orders(table, phone, exclude_bill_id=bill.pk))
 
 
 class BillRequestPayView(APIView):
@@ -139,14 +198,12 @@ class BillRequestPayView(APIView):
             # Lock the table first, then the bill — the same order
             # PublicOrderCreateView takes, so the two can't deadlock.
             table = Table.objects.select_for_update().get(pk=table.pk)
-            bill = Bill.objects.select_for_update().filter(table=table).exclude(
-                status=BillStatus.CLOSED
-            ).first()
-            if bill is None:
-                return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
-            expected_bill_id = serializer.validated_data.get("bill_id")
-            if expected_bill_id is not None and expected_bill_id != bill.pk:
-                return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
+            found, error = _customer_bill(
+                table, serializer.validated_data["phone"], serializer.validated_data.get("bill_id"),
+            )
+            if error is not None:
+                return error
+            bill = Bill.objects.select_for_update().get(pk=found.pk)
             try:
                 billing.request_payment(bill, method)
             except billing.BillTransitionError as exc:
@@ -194,14 +251,12 @@ class BillCancelPayView(APIView):
             return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
 
         with transaction.atomic():
-            bill = Bill.objects.select_for_update().filter(table=table).exclude(
-                status=BillStatus.CLOSED
-            ).first()
-            if bill is None:
-                return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
-            expected_bill_id = serializer.validated_data.get("bill_id")
-            if expected_bill_id is not None and expected_bill_id != bill.pk:
-                return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
+            found, error = _customer_bill(
+                table, serializer.validated_data["phone"], serializer.validated_data.get("bill_id"),
+            )
+            if error is not None:
+                return error
+            bill = Bill.objects.select_for_update().get(pk=found.pk)
             try:
                 billing.reopen_bill(bill, reason="customer_cancelled")
             except billing.BillTransitionError as exc:

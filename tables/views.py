@@ -156,15 +156,23 @@ class TableBySessionView(APIView):
         if not token:
             raise Http404
         table = get_object_or_404(Table, session_token=token)
-        order = (
-            Order.objects.filter(table=table)
-            .exclude(status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED])
-            .prefetch_related("items")
-            .order_by("-opened_at", "-id")
-            .first()
-        )
-        from orders.models import Bill, BillStatus
-        bill = Bill.objects.filter(table=table).exclude(status=BillStatus.CLOSED).first()
+        # Each phone has its own bill at a table, so the order and bill are
+        # only returned for the phone that owns them (?phone=). The table token
+        # alone never reveals another party's order.
+        bill = order = None
+        phone = str(request.query_params.get("phone", "")).strip()
+        if phone:
+            from orders.billing import customer_bills_for_table
+            bills = customer_bills_for_table(table, phone)
+            bill = bills[0] if bills else None
+            if bill:
+                order = (
+                    Order.objects.filter(table=table, bill=bill)
+                    .exclude(status__in=[OrderStatus.CLOSED, OrderStatus.CANCELLED])
+                    .prefetch_related("items", "history")
+                    .order_by("-opened_at", "-id")
+                    .first()
+                )
         return Response({
             "table": TableSerializer(table).data,
             "bill_id": bill.pk if bill else None,

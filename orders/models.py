@@ -87,6 +87,13 @@ class Bill(models.Model):
 
     branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="bills")
     table = models.ForeignKey(Table, on_delete=models.SET_NULL, null=True, blank=True, related_name="bills")
+    # Whose bill this is. Each phone number ordering at a table gets its own
+    # bill, so two parties sharing a table never see or pay each other's
+    # orders. Null for staff-opened (POS) table bills and for bills created
+    # before per-customer bills existed.
+    customer = models.ForeignKey(
+        Customer, on_delete=models.SET_NULL, null=True, blank=True, related_name="bills"
+    )
     status = models.CharField(max_length=16, choices=BillStatus.choices, default=BillStatus.OPEN)
     requested_method = models.CharField(max_length=8, choices=BillMethod.choices, blank=True)
     paid_method = models.CharField(max_length=8, choices=BillMethod.choices, blank=True)
@@ -106,14 +113,17 @@ class Bill(models.Model):
     class Meta:
         ordering = ["id"]
         constraints = [
-            # A table can only ever have one bill that isn't finished with.
-            # This is what makes get_or_create_open_bill() safe against two
-            # phones scanning the same QR at the same moment — the loser of
-            # the race hits this constraint rather than opening a second bill.
+            # One unfinished bill per (table, customer). This is what makes
+            # get_or_create_open_bill() safe against the same phone submitting
+            # twice at the same moment — the loser of the race hits this
+            # constraint rather than opening a second bill. NULLS NOT DISTINCT
+            # keeps it to one staff (customer-less) bill per table as well
+            # (PostgreSQL 15+; SQLite ignores the option).
             models.UniqueConstraint(
-                fields=["table"],
+                fields=["table", "customer"],
                 condition=~models.Q(status="closed"),
-                name="one_open_bill_per_table",
+                name="one_open_bill_per_table_customer",
+                nulls_distinct=False,
             ),
         ]
 

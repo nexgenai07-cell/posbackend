@@ -1,6 +1,7 @@
 from .models import Order, OrderSource, OrderStatus
 
 _TERMINAL_STATUSES = (OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED)
+_FINISHED_STATUSES = (OrderStatus.CLOSED, OrderStatus.CANCELLED)
 
 
 class BillLocked(Exception):
@@ -8,52 +9,82 @@ class BillLocked(Exception):
     new orders or items may be added to it. Surfaced as 409 error.billLocked."""
 
 
-def get_or_create_open_order(table, staff=None, customer=None, source=OrderSource.POS, *, reopen_requested=False):
-    """
-    One open (non-closed/cancelled) order per table at a time — shared by
-    OrderListCreateView.post (POS, staff-initiated) and the public QR
-    order-creation endpoint (no staff, source=qr). The caller must already
-    hold a select_for_update() lock on `table` inside a transaction, the same
-    way OrderListCreateView.post does, so two near-simultaneous requests for
-    the same table can't both create one.
-
-    Also gets-or-creates the table's live Bill and attaches the order to it.
-    A paid bill can reopen while its table is still occupied; a payment-requested
-    bill remains locked so its in-flight amount cannot change.
-    Every order at a table therefore belongs to exactly one bill, and the lock
-    is enforced in the one place both callers go through rather than being
-    re-checked at each endpoint.
-    """
-    # Imported here, not at module scope: billing.py imports from this module's
-    # siblings and would otherwise close a cycle.
-    from .billing import attach_order_to_bill, get_or_create_open_bill, reopen_for_additional_items
+def _open_bill_for(table, customer, staff, reopen_requested):
+    """The (table, customer) bill, with the paid/pay-requested rules applied."""
+    from .billing import get_or_create_open_bill, reopen_bill, reopen_for_additional_items
     from .models import BillStatus
 
-    bill, _ = get_or_create_open_bill(table)
+    bill, _ = get_or_create_open_bill(table, customer)
     if bill.status == BillStatus.PAID:
         reopen_for_additional_items(bill, actor=staff)
     elif bill.status == BillStatus.PAY_REQUESTED and reopen_requested:
         # A new round changes the amount, so invalidate the current request
         # before attaching any new items. Any in-flight online verification
         # will subsequently fail the amount/status checks.
-        from .billing import reopen_bill
         reopen_bill(bill, actor=staff, reason="additional_items")
     elif bill.is_locked and bill.status != BillStatus.PAY_REQUESTED:
         raise BillLocked(bill)
+    return bill
+
+
+def get_or_create_open_order(table, staff=None, customer=None, source=OrderSource.POS, *, reopen_requested=False):
+    """
+    The order new items go into — shared by OrderListCreateView.post (POS,
+    staff) and the public QR endpoint (customer). The caller must already hold
+    a select_for_update() lock on `table` inside a transaction.
+
+    Customer (QR) path: every phone number has its own bill at the table, and
+    one order on it. The same phone keeps adding to that same order — even
+    after paying, before the table is released (the order reopens and only
+    the new lines are owed). Orders on any other bill, including a previous
+    seating's leftovers, are never picked up.
+
+    Staff (POS) path: the table's latest live order, whoever it belongs to,
+    so the floor can add a round to it; otherwise a new staff order on the
+    table's customer-less bill.
+    """
+    from .billing import attach_order_to_bill
+    from .models import BillStatus
+    from .workflow import reopen_paid_order_for_items
+
+    if customer is not None:
+        bill = _open_bill_for(table, customer, staff, reopen_requested)
+        order = (
+            Order.objects.select_for_update()
+            .filter(table=table, bill=bill, customer=customer)
+            .exclude(status__in=_FINISHED_STATUSES)
+            .order_by("-opened_at", "-id")
+            .first()
+        )
+        if order:
+            reopen_paid_order_for_items(order, staff)
+            return order, False
+        if bill.status == BillStatus.PAY_REQUESTED:
+            raise BillLocked(bill)
+        order = Order.objects.create(
+            branch=table.branch, table=table, staff=staff, customer=customer, source=source, bill=bill,
+        )
+        return order, True
 
     order = (
         Order.objects.select_for_update()
         .filter(table=table)
         .exclude(status__in=_TERMINAL_STATUSES)
+        .exclude(bill__status=BillStatus.CLOSED)
         .order_by("-opened_at", "-id")
         .first()
     )
     if order:
-        attach_order_to_bill(order, bill)
+        if order.bill_id is None:
+            attach_order_to_bill(order, _open_bill_for(table, order.customer, staff, reopen_requested))
+        elif order.bill.status == BillStatus.PAID:
+            from .billing import reopen_for_additional_items
+            reopen_for_additional_items(order.bill, actor=staff)
         return order, False
+    bill = _open_bill_for(table, None, staff, reopen_requested)
     if bill.status == BillStatus.PAY_REQUESTED:
         raise BillLocked(bill)
     order = Order.objects.create(
-        branch=table.branch, table=table, staff=staff, customer=customer, source=source, bill=bill,
+        branch=table.branch, table=table, staff=staff, customer=None, source=source, bill=bill,
     )
     return order, True

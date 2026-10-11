@@ -51,6 +51,7 @@ from .workflow import (
     queue_order_for_cashier,
     recompute_order_status_from_items,
     record_order_event,
+    reopen_paid_order_for_items,
     transition_order,
 )
 
@@ -521,11 +522,15 @@ class OrderItemsView(APIView):
             if table_id:
                 Table.objects.select_for_update().get(pk=table_id, branch=request.user.branch)
             order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
+            if request.user.role == StaffRole.WAITER and order.assigned_waiter_id != request.user.pk:
+                return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
+            # A paid order whose table is not released yet takes more items in
+            # the same order: it reopens and only the new lines are owed.
+            if order.status == OrderStatus.PAID and order.bill_id and order.bill.status != "closed":
+                reopen_paid_order_for_items(order, request.user)
             guard = _closed_order_response(order)
             if guard:
                 return guard
-            if request.user.role == StaffRole.WAITER and order.assigned_waiter_id != request.user.pk:
-                return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
             # Adding a line to an existing order is as much "new food on this
             # bill" as opening a new order is. Reopen a payment request only
             # after assignment and branch checks have passed.
@@ -765,6 +770,11 @@ class OrderPaymentsView(APIView):
                 )
             _notify_order_staff(order, "order:payment", request.user.pk, {order.assigned_cashier_id} - {None}, tip=str(payment.tip or Decimal("0.00")))
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk, payment_id=payment.pk)
+            if order.bill_id:
+                # Money taken at the till for this order also counts on its
+                # table bill; once nothing is left owing, the bill is paid.
+                from .billing import settle_bill_if_covered
+                settle_bill_if_covered(order.bill_id, payment.method, actor=request.user)
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
 
