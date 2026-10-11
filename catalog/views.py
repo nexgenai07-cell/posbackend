@@ -7,7 +7,7 @@ from rest_framework.views import APIView
 from accounts.permissions import IsOwnerOrManager
 from branches.models import Branch
 from common.mixins import BranchScopedQuerysetMixin
-from inventory.services import check_product_stock, check_products_stock
+from inventory.services import check_product_stock, check_products_stock, orderable_units
 
 from .models import Category, Deal, Product, ProductVariant
 from .serializers import CategorySerializer, DealSerializer, ProductSerializer, ProductVariantSerializer
@@ -91,8 +91,10 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         page = self.paginate_queryset(queryset)
         products = list(page if page is not None else queryset)
         stock_status = check_products_stock(products)
+        units = orderable_units(products)
         for product in products:
             product._is_orderable = is_available_today(product) and stock_status.get(product.pk, (False, None))[0]
+            product._available_quantity = units.get(product.pk, 0) if product._is_orderable else 0
         serializer = self.get_serializer(products, many=True)
         return self.get_paginated_response(serializer.data) if page is not None else Response(serializer.data)
 

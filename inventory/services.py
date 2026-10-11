@@ -103,10 +103,53 @@ def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
     made. Omitted, it checks the base recipe, which is what the public menu
     wants: a product is listed if ANY portion of it can be made.
     """
+    quantity = Decimal(str(quantity))
+    items, per_product = _per_unit_requirements(products, lock=lock)
+    availability = {}
+    for product_id, requirement in per_product.items():
+        if isinstance(requirement, str):
+            availability[product_id] = (False, requirement)
+            continue
+        if any(items[item_id].current_stock <= 0
+               or items[item_id].current_stock < required * quantity * (multiplier or Decimal("1"))
+               for item_id, required in requirement.items()):
+            availability[product_id] = (False, "insufficient_stock")
+        else:
+            availability[product_id] = (True, None)
+    return availability
+
+
+def orderable_units(products):
+    """
+    How many whole units of each product current stock can make (base recipe),
+    by product id — 0 when out of stock or the recipe is missing/invalid.
+
+    Lets a POS disable "+" / "Add" at the limit instead of letting staff tap
+    and then refusing with error.productUnavailable. Same rules as
+    check_products_stock(); nothing is reserved.
+    """
+    items, per_product = _per_unit_requirements(products)
+    units = {}
+    for product_id, requirement in per_product.items():
+        if isinstance(requirement, str) or not requirement:
+            units[product_id] = 0
+            continue
+        units[product_id] = max(0, min(
+            int(items[item_id].current_stock // required) if items[item_id].current_stock > 0 else 0
+            for item_id, required in requirement.items()
+        ))
+    return units
+
+
+def _per_unit_requirements(products, *, lock=False):
+    """
+    (inventory items by id, {product id: {inventory item id: amount per unit}
+    or a reason string "missing_recipe" / "invalid_recipe"}) for one batch of
+    products — the shared recipe/stock reading behind both functions above.
+    """
     products = list(products)
     if not products:
-        return {}
-    quantity = Decimal(str(quantity))
+        return {}, {}
     product_by_id = {product.pk: product for product in products}
     recipe = list(
         RecipeItem.objects.filter(product_id__in=product_by_id)
@@ -122,11 +165,11 @@ def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
     if lock:
         inventory = inventory.select_for_update()
     items = {item.pk: item for item in inventory.order_by("pk")}
-    availability = {}
+    per_product = {}
     for product_id, product in product_by_id.items():
         lines = recipe_by_product.get(product_id, [])
         if not lines:
-            availability[product_id] = (False, "missing_recipe")
+            per_product[product_id] = "missing_recipe"
             continue
         required_by_item = defaultdict(Decimal)
         seen_ingredients = set()
@@ -143,15 +186,9 @@ def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
             if required is None or required <= 0:
                 invalid = True
                 break
-            required_by_item[stock_item.pk] += required * quantity * (multiplier or Decimal("1"))
-        if invalid:
-            availability[product_id] = (False, "invalid_recipe")
-        elif any(items[item_id].current_stock <= 0 or items[item_id].current_stock < required
-                 for item_id, required in required_by_item.items()):
-            availability[product_id] = (False, "insufficient_stock")
-        else:
-            availability[product_id] = (True, None)
-    return availability
+            required_by_item[stock_item.pk] += required
+        per_product[product_id] = "invalid_recipe" if invalid else required_by_item
+    return items, per_product
 
 
 def check_product_stock(product, quantity=1, *, lock=False, variant=None):

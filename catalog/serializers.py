@@ -175,6 +175,9 @@ class ProductSerializer(serializers.ModelSerializer):
     )
     deal = DealSerializer(read_only=True)
     is_orderable = serializers.SerializerMethodField()
+    # Whole units current stock can make (base recipe), so a POS can disable
+    # "+"/"Add" at the limit. Set by the list view; None elsewhere.
+    available_quantity = serializers.SerializerMethodField()
     variants = ProductVariantSerializer(many=True, read_only=True)
     # Live margin figures, recomputed from current InventoryItem.cost_per_unit
     # on every read. Never stored, so a new purchase moves these immediately.
@@ -185,7 +188,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             "id", "branch", "category", "name_en", "name_ar",
             "description_en", "description_ar", "price", "cost_price",
-            "image", "is_available", "is_orderable", "badge", "days", "deal",
+            "image", "is_available", "is_orderable", "available_quantity", "badge", "days", "deal",
             "variants", "costing",
             "created_at", "updated_at",
         ]
@@ -222,6 +225,9 @@ class ProductSerializer(serializers.ModelSerializer):
             if derived is not None:
                 validated_data["cost_price"] = derived
         return super().update(instance, validated_data)
+
+    def get_available_quantity(self, product):
+        return getattr(product, "_available_quantity", None)
 
     def get_is_orderable(self, product):
         if hasattr(product, "_is_orderable"):
