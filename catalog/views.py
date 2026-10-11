@@ -51,7 +51,13 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     owner/manager only. Queryset scoped to the requester's branch."""
 
     serializer_class = ProductSerializer
-    queryset = Product.objects.select_related("category").prefetch_related("deal__windows")
+    # Everything the serializer reads per product, loaded up front: branch
+    # (availability / deal timezone), variants, and recipe lines with their
+    # ingredient (live costing). Without these the list ran ~10 queries per
+    # product, which on a remote database made the POS menu take seconds.
+    queryset = Product.objects.select_related("category", "branch").prefetch_related(
+        "deal__windows", "variants", "recipe_items__inventory_item",
+    )
 
     def get_queryset(self):
         from django.db.models import Exists, OuterRef

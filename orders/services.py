@@ -67,7 +67,11 @@ def get_or_create_open_order(table, staff=None, customer=None, source=OrderSourc
         return order, True
 
     order = (
-        Order.objects.select_for_update()
+        # of=("self",): the bill filter below LEFT OUTER JOINs orders_bill
+        # (bill is nullable), and PostgreSQL rejects FOR UPDATE on the nullable
+        # side of an outer join — that was a 500 on POST /api/orders/. Lock
+        # only the order rows. SQLite ignores row locks, so tests can't see it.
+        Order.objects.select_for_update(of=("self",))
         .filter(table=table)
         .exclude(status__in=_TERMINAL_STATUSES)
         .exclude(bill__status=BillStatus.CLOSED)

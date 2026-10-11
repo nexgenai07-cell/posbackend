@@ -100,5 +100,6 @@ def costing(product, variant=None):
         "selling_price": price,
         "gross_profit": gross_profit,
         "food_cost_percent": food_cost_percent,
-        "has_recipe": product.recipe_items.exists(),
+        # .all() reuses prefetched recipe lines; .exists() always hit the DB.
+        "has_recipe": bool(product.recipe_items.all()),
     }
