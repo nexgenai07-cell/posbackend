@@ -95,11 +95,23 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             table = get_object_or_404(
                 Table.objects.select_for_update().filter(branch=request.user.branch), pk=pk
             )
-            has_open_order = Order.objects.filter(table=table).exclude(
-                status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED]
-            ).exists()
-            if has_open_order:
-                return Response({"error": "error.tableHasOpenOrder"}, status=status.HTTP_409_CONFLICT)
+            open_orders = list(
+                Order.objects.filter(table=table)
+                .exclude(status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED])
+                .order_by("opened_at")
+            )
+            if open_orders:
+                # Name the blockers: a leftover from an earlier day is hidden
+                # by the Orders page's default "today" filter, so staff
+                # couldn't otherwise find what to cancel.
+                return Response({
+                    "error": "error.tableHasOpenOrder",
+                    "order_numbers": ", ".join(order.order_number for order in open_orders),
+                    "open_orders": [
+                        {"id": order.pk, "order_number": order.order_number, "status": order.status, "opened_at": order.opened_at}
+                        for order in open_orders
+                    ],
+                }, status=status.HTTP_409_CONFLICT)
             table.close()
         return Response(TableSerializer(table).data)
 
