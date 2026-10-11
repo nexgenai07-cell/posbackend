@@ -76,7 +76,7 @@ class StockMovementReason(models.TextChoices):
 
 
 class StockMovement(BaseModel):
-    """Append-only ledger with before, delta, and after stock values."""
+    """Stock ledger with frozen quantities; dispatched voids may reclassify a sale as waste."""
 
     inventory_item = models.ForeignKey(InventoryItem, on_delete=models.CASCADE, related_name="stock_movements")
     previous_stock = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)

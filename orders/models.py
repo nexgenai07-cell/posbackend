@@ -161,8 +161,11 @@ class Order(BaseModel):
 
     @property
     def order_code(self):
-        """Stable, globally unique label suitable for receipts and KDS tickets."""
-        return f"ORD-{self.pk:08d}" if self.pk else ""
+        """Stable, signed and opaque label suitable for receipts and tickets."""
+        if not self.pk:
+            return ""
+        from .codes import make_order_code
+        return make_order_code(self.pk)
 
     def __str__(self):
         return f"Order #{self.pk} ({self.status})"

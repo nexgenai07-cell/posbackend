@@ -68,6 +68,99 @@ class OrderStockWorkflowTests(TestCase):
         self.assertEqual(self.salt.current_stock, Decimal("0.000"))
         self.assertEqual(StockMovement.objects.filter(order=self.order).count(), 2)
 
+    def test_waiter_confirm_with_no_pending_items_does_not_commit_confirmation(self):
+        from orders.models import OrderHistory
+
+        self.order.items.update(status=OrderItemStatus.VOIDED)
+        history_before = OrderHistory.objects.filter(order=self.order).count()
+        self.client.force_authenticate(user=self.waiter)
+
+        response = self.client.post(f"/api/orders/{self.order.pk}/waiter-confirm/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.AWAITING_WAITER)
+        self.assertIsNone(self.order.waiter_confirmed_at)
+        self.assertEqual(OrderHistory.objects.filter(order=self.order).count(), history_before)
+
+    def test_waiter_confirm_without_assigned_waiter_is_rejected_for_manager(self):
+        manager = Staff.objects.create(branch=self.branch, name="Manager", role=StaffRole.MANAGER, pin_hash="x")
+        self.order.assigned_waiter = None
+        self.order.save(update_fields=["assigned_waiter", "updated_at"])
+        self.client.force_authenticate(user=manager)
+        response = self.client.post(f"/api/orders/{self.order.pk}/waiter-confirm/", {}, format="json")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "error.orderWaiterNotAssigned")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.AWAITING_WAITER)
+
+    def test_normal_send_rechecks_parent_status_after_lock(self):
+        from unittest.mock import patch
+
+        self.order.status = OrderStatus.CONFIRMED
+        self.order.save(update_fields=["status", "updated_at"])
+        self.client.force_authenticate(user=self.waiter)
+
+        def another_request_transitions_before_lock():
+            Order.objects.filter(pk=self.order.pk).update(status=OrderStatus.SENT)
+            return Order.objects
+
+        with patch("orders.views.Order.objects.select_for_update", side_effect=another_request_transitions_before_lock):
+            response = self.client.post(f"/api/orders/{self.order.pk}/send-to-kitchen/", {}, format="json")
+
+        self.assertEqual(response.status_code, 409)
+        self.item.refresh_from_db()
+        self.cheese.refresh_from_db()
+        self.assertEqual(self.item.status, OrderItemStatus.PENDING)
+        self.assertEqual(self.cheese.current_stock, Decimal("6.000"))
+        self.assertFalse(StockMovement.objects.filter(order=self.order).exists())
+
+    def test_failed_additional_dispatch_rolls_back_and_retry_deducts_once(self):
+        from unittest.mock import patch
+        from orders.models import OrderHistory
+        from inventory.services import ProductStockUnavailable
+
+        self.order.status = OrderStatus.READY
+        self.order.assigned_waiter = self.waiter
+        self.order.save(update_fields=["status", "assigned_waiter", "updated_at"])
+        self.item.status = OrderItemStatus.READY
+        self.item.save(update_fields=["status", "updated_at"])
+        history_before = OrderHistory.objects.filter(order=self.order).count()
+        item_count_before = self.order.items.count()
+        movements_before = StockMovement.objects.filter(order=self.order).count()
+        self.client.force_authenticate(user=self.waiter)
+        published = []
+
+        # The publisher converts these callbacks into channel-layer sends only
+        # after commit. A rollback must discard every scheduled send.
+        with patch("realtime.publisher.async_to_sync", side_effect=lambda fn: lambda *args, **kwargs: published.append((fn, args))), \
+             patch("orders.views.deduct_stock_for_order_items", side_effect=ProductStockUnavailable("out")):
+            with self.captureOnCommitCallbacks(execute=True):
+                failed = self.client.post(f"/api/orders/{self.order.pk}/items/", {"product": self.product.pk}, format="json")
+        self.assertEqual(failed.status_code, 409)
+        self.assertEqual(published, [])
+        self.order.refresh_from_db()
+        self.second_item.refresh_from_db()
+        self.salt.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.READY)
+        self.assertEqual(self.second_item.status, OrderItemStatus.PENDING)
+        self.assertEqual(self.order.items.count(), item_count_before)
+        self.assertEqual(self.salt.current_stock, Decimal("0.000"))
+        self.assertEqual(StockMovement.objects.filter(order=self.order).count(), movements_before)
+        self.assertEqual(OrderHistory.objects.filter(order=self.order).count(), history_before)
+
+        InventoryItem.objects.filter(pk=self.salt.pk).update(current_stock=1)
+        self.salt.refresh_from_db()
+        with patch("realtime.publisher.async_to_sync", side_effect=lambda fn: lambda *args, **kwargs: published.append((fn, args))):
+            with self.captureOnCommitCallbacks(execute=True):
+                retried = self.client.post(f"/api/orders/{self.order.pk}/items/", {"product": self.product.pk}, format="json")
+        self.assertEqual(retried.status_code, 201)
+        new_item = OrderItem.objects.get(pk=retried.json()["id"])
+        self.assertEqual(new_item.status, OrderItemStatus.FIRED)
+        self.assertEqual(StockMovement.objects.filter(order=self.order).count(), movements_before + 1)
+        self.assertEqual(StockMovement.objects.filter(order=self.order).count(), movements_before + 1)
+        self.assertGreater(len(published), 0)
+
     def test_cashier_quantity_edit_cannot_bypass_stock_availability(self):
         self.order.status = OrderStatus.PENDING_CASHIER
         self.order.save(update_fields=["status", "updated_at"])
@@ -137,6 +230,9 @@ class OrderStockWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         sale_movements_before_void = StockMovement.objects.filter(order=self.order).count()
         self.assertEqual(sale_movements_before_void, 2)
+        quantity_snapshot = list(StockMovement.objects.filter(order=self.order).order_by("pk").values(
+            "inventory_item_id", "previous_stock", "quantity_delta", "resulting_stock", "unit_cost_snapshot",
+        ))
 
         kitchen = Staff.objects.create(branch=self.branch, name="Kitchen", role=StaffRole.KITCHEN, pin_hash="x")
         self.client.force_authenticate(user=kitchen)
@@ -149,6 +245,11 @@ class OrderStockWorkflowTests(TestCase):
         self.assertEqual(self.item.status, OrderItemStatus.VOIDED)
         self.assertEqual(self.cheese.current_stock, Decimal("0.000"))
         self.assertEqual(StockMovement.objects.filter(order=self.order).count(), sale_movements_before_void)
+        self.assertEqual(StockMovement.objects.filter(order_item=self.item, reason="waste").count(), 1)
+        self.assertEqual(StockMovement.objects.filter(order_item=self.item, reason="sale").count(), 0)
+        self.assertEqual(list(StockMovement.objects.filter(order=self.order).order_by("pk").values(
+            "inventory_item_id", "previous_stock", "quantity_delta", "resulting_stock", "unit_cost_snapshot",
+        )), quantity_snapshot)
         self.assertFalse(StockMovement.objects.filter(order=self.order, quantity_delta__gt=0).exists())
 
     def test_repeating_item_void_does_not_change_stock_or_history(self):

@@ -182,6 +182,7 @@ REST_FRAMEWORK = {
         # keys anonymous requests by IP.
         'menu': '60/min',
         'table-lookup': '60/min',
+        'public-order-track': '30/min',
         # Billing endpoints are AllowAny (authenticated by the table's
         # session token), so they get their own tighter scopes. 'bill-pay'
         # covers request-pay/cancel-pay-request — a customer taps those a

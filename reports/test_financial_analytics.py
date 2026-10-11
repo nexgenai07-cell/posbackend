@@ -9,7 +9,7 @@ from rest_framework.test import APIClient
 from accounts.models import Staff, StaffRole
 from branches.models import Branch
 from catalog.models import Category, Product
-from inventory.models import InventoryItem, RecipeItem, StockMovementReason
+from inventory.models import InventoryItem, RecipeItem, StockMovement, StockMovementReason
 from inventory.services import adjust_stock
 from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus, Payment, PaymentStatus
 from purchasing.models import Purchase, PurchaseItem, PurchaseStatus, Supplier
@@ -86,6 +86,24 @@ class FinancialAnalyticsTests(TestCase):
         self.assertEqual(Decimal(row["ingredient_cost"]), Decimal("25"))
         self.assertEqual(Decimal(row["gross_profit"]), Decimal("40"))
         self.assertEqual(Decimal(row["current_recipe_cost_per_unit"]), Decimal("25"))
+
+    def test_voided_sale_cost_moves_to_waste_without_double_counting_financial_cost(self):
+        order = self.completed_order()
+        item = order.items.get()
+        item.status = OrderItemStatus.VOIDED
+        item.save(update_fields=["status", "updated_at"])
+        movement = StockMovement.objects.get(order_item=item, reason=StockMovementReason.SALE)
+        movement.reason = StockMovementReason.WASTE
+        movement.save(update_fields=["reason"])
+
+        financial = self.client.get("/api/reports/financial-summary/?preset=today")
+        wastage = self.client.get("/api/reports/wastage/?preset=today")
+        self.assertEqual(financial.status_code, 200)
+        self.assertEqual(Decimal(financial.json()["ingredient_cost_consumed"]), Decimal("0"))
+        self.assertEqual(StockMovement.objects.filter(order_item=item, reason=StockMovementReason.SALE).count(), 0)
+        self.assertEqual(StockMovement.objects.filter(order_item=item, reason=StockMovementReason.WASTE).count(), 1)
+        self.assertEqual(wastage.status_code, 200)
+        self.assertEqual(Decimal(wastage.json()["results"][0]["quantity_wasted"]), Decimal("5"))
 
     def test_reports_are_branch_scoped_and_empty_ranges_return_zeroes(self):
         self.completed_order(other_branch=True)

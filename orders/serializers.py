@@ -17,13 +17,22 @@ class OrderHistorySerializer(serializers.ModelSerializer):
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
+    is_new = serializers.SerializerMethodField()
+    is_additional_batch = serializers.SerializerMethodField()
+
+    def get_is_new(self, item):
+        return bool(getattr(item, "_is_additional_batch", False) and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED))
+
+    def get_is_additional_batch(self, item):
+        return bool(getattr(item, "_is_additional_batch_any", False))
+
     class Meta:
         model = OrderItem
         fields = [
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "is_new",
         ]
         # Snapshot fields are write-once at creation (see AddOrderItemSerializer)
         # and never editable afterward — that's the whole point of a snapshot.
@@ -127,6 +136,20 @@ class OrderSerializer(serializers.ModelSerializer):
     history = OrderHistorySerializer(many=True, read_only=True)
     total = serializers.SerializerMethodField()
 
+    def to_representation(self, instance):
+        history = instance.history.all()
+        new_ids = {
+            int(item_id)
+            for entry in history
+            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
+            for item_id in (entry.details or {}).get("item_ids", [])
+            if str(item_id).isdigit()
+        }
+        items = instance.items.all()
+        for item in items:
+            item._is_additional_batch = item.pk in new_ids
+        return super().to_representation(instance)
+
     class Meta:
         model = Order
         fields = [
@@ -160,7 +183,21 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_items(self, order):
-        eligible = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY))
+        new_ids = {
+            int(item_id)
+            for entry in order.history.all()
+            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
+            for item_id in (entry.details or {}).get("item_ids", [])
+            if str(item_id).isdigit()
+        }
+        active_batch = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING))
+        additional_batch = order.items.filter(pk__in=new_ids, status__in=(
+            OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY,
+        ))
+        if additional_batch.exists():
+            eligible = additional_batch
+        else:
+            eligible = active_batch if active_batch.exists() else order.items.filter(status=OrderItemStatus.READY)
         return KitchenTicketItemSerializer(eligible, many=True).data
 
 
@@ -168,11 +205,16 @@ class PublicOrderItemSerializer(serializers.ModelSerializer):
     """Same fields as OrderItemSerializer minus `order`/`product` (internal
     FKs a customer's phone has no use for) — used by the public QR endpoints."""
 
+    is_new = serializers.SerializerMethodField()
+
+    def get_is_new(self, item):
+        return bool(getattr(item, "_is_additional_batch", False) and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED))
+
     class Meta:
         model = OrderItem
         fields = [
             "id", "name_en_snapshot", "name_ar_snapshot", "variant_name_en_snapshot", "variant_name_ar_snapshot", "price_snapshot",
-            "quantity", "status", "notes", "fired_at", "ready_at",
+            "quantity", "status", "notes", "fired_at", "ready_at", "is_new", "is_additional_batch",
         ]
         read_only_fields = fields
 
@@ -183,10 +225,24 @@ class PublicOrderSerializer(serializers.ModelSerializer):
 
     items = PublicOrderItemSerializer(many=True, read_only=True)
     total = serializers.SerializerMethodField()
+    bill_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+    def to_representation(self, instance):
+        new_ids = {
+            int(item_id)
+            for entry in instance.history.all()
+            if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
+            for item_id in (entry.details or {}).get("item_ids", [])
+            if str(item_id).isdigit()
+        }
+        for item in instance.items.all():
+            item._is_additional_batch_any = item.pk in new_ids
+            item._is_additional_batch = item.pk in new_ids and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED)
+        return super().to_representation(instance)
 
     class Meta:
         model = Order
-        fields = ["id", "order_code", "table", "source", "status", "items", "total", "opened_at", "closed_at"]
+        fields = ["id", "order_code", "table", "bill_id", "source", "status", "items", "total", "opened_at", "closed_at"]
         read_only_fields = fields
 
     def get_total(self, order):

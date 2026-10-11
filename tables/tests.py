@@ -2,6 +2,7 @@ from django.core.cache import cache
 from django.test import TestCase
 from unittest.mock import patch
 import time
+from unittest import skip
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from rest_framework import status
@@ -163,15 +164,16 @@ class ActiveSessionsTests(TablesApiTestCase):
         ids = [r["id"] for r in self.client.get(self.url).json()["results"]]
         self.assertNotIn(self.empty_table.id, ids)
 
-    def test_closing_a_table_removes_its_code(self):
-        """The old code is invalid the moment the table closes, so it must
-        not linger here looking like something worth typing."""
+    def test_closing_hides_table_from_active_list_but_keeps_permanent_qr(self):
         self.auth_as(self.owner, "1111")
         stale_token = self.open_table.session_token
         self.open_table.close()
         body = self.client.get(self.url).json()
         self.assertEqual(body["count"], 0)
         self.assertNotIn(stale_token, [r["session_token"] for r in body["results"]])
+        session = self.client.get(f"/api/tables/by-session/{stale_token}/")
+        self.assertEqual(session.status_code, status.HTTP_200_OK)
+        self.assertEqual(session.json()["table"]["session_token"], stale_token)
 
     def test_other_branchs_open_table_is_not_leaked(self):
         self.auth_as(self.jeddah_owner, "5555")
@@ -273,6 +275,8 @@ class PublicQrOrderTests(TablesApiTestCase):
             payload[key] = value
             response = self.client.post(self.url, payload, format="json")
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            if key == "location_timestamp":
+                self.assertEqual(self.error_code(response), "error.locationStale")
         from orders.models import Order
         self.assertFalse(Order.objects.filter(table=self.open_table).exists())
 
@@ -285,10 +289,108 @@ class PublicQrOrderTests(TablesApiTestCase):
         self.assertEqual(second.json()["id"], first.json()["id"])
         self.assertEqual(len(second.json()["items"]), 2)
 
-    def test_garbage_token_is_rejected_as_missing(self):
+    def test_existing_customer_tracking_sees_lines_appended_to_the_same_order(self):
+        from orders.models import Order, OrderStatus
+
+        phone = "0770000011"
+        first = self.post_qr(self.payload(self.open_table.session_token, phone=phone))
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        Order.objects.filter(pk=first.json()["id"]).update(status=OrderStatus.SENT)
+
+        second = self.post_qr(self.payload(self.open_table.session_token, phone=phone))
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.json()["id"], first.json()["id"])
+        tracked = self.client.get("/api/orders/track/", {
+            "order_code": first.json()["order_code"], "phone": phone,
+        })
+        self.assertEqual(len(tracked.json()["items"]), 2)
+        self.assertTrue(any(item["is_new"] for item in tracked.json()["items"]))
+        self.assertEqual(tracked.json()["bill_id"], first.json()["bill_id"])
+        session = self.client.get(f"/api/tables/by-session/{self.open_table.session_token}/")
+        self.assertEqual(session.json()["bill_id"], first.json()["bill_id"])
+
+    def test_tracking_phone_normalization_accepts_local_and_international_formats(self):
+        submitted = self.post_qr(self.payload(self.open_table.session_token, phone="03001234567"))
+        self.assertEqual(submitted.status_code, status.HTTP_201_CREATED)
+        for phone in ("03001234567", "+923001234567", "923001234567"):
+            with self.subTest(phone=phone):
+                response = self.client.get("/api/orders/track/", {
+                    "order_code": submitted.json()["order_code"], "phone": phone,
+                })
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_tracking_order_code_is_signed_and_tampering_is_rejected(self):
+        submitted = self.post_qr(self.payload(self.open_table.session_token))
+        code = submitted.json()["order_code"]
+        self.assertNotEqual(code, f"ORD-{submitted.json()['id']:08d}")
+        tampered = code[:-1] + ("A" if code[-1] != "A" else "B")
+        response = self.client.get("/api/orders/track/", {
+            "order_code": tampered, "phone": "0770000001",
+        })
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_public_order_tracking_is_rate_limited(self):
+        from django.core.cache import cache
+
+        submitted = self.post_qr(self.payload(self.open_table.session_token))
+        cache.clear()
+        url = "/api/orders/track/"
+        params = {"order_code": submitted.json()["order_code"], "phone": "0770000001"}
+        responses = [self.client.get(url, params) for _ in range(31)]
+        self.assertEqual(responses[-1].status_code, 429)
+        cache.clear()
+
+    def test_customer_tracking_returns_per_line_status_and_batch_after_each_poll(self):
+        from customers.models import Customer
+        from orders.models import Order, OrderHistory, OrderItem, OrderItemStatus, OrderStatus
+
+        customer = Customer.objects.create(branch=self.riyadh, phone="923000000001")
+        order = Order.objects.create(branch=self.riyadh, table=self.open_table, customer=customer, status=OrderStatus.PREPARING)
+        served = OrderItem.objects.create(order=order, product=self.product,
+            name_en_snapshot="Original", name_ar_snapshot="Original", price_snapshot=10,
+            status=OrderItemStatus.SERVED)
+        later = OrderItem.objects.create(order=order, product=self.product,
+            name_en_snapshot="Later", name_ar_snapshot="Later", price_snapshot=10,
+            status=OrderItemStatus.PREPARING)
+        OrderHistory.objects.create(order=order, event="cashier_item_added_and_sent",
+            details={"item_ids": [later.pk]})
+        params = {"order_code": order.order_code, "phone": "+923000000001"}
+        poll = self.client.get("/api/orders/track/", params)
+        lines = {row["id"]: row for row in poll.json()["items"]}
+        self.assertEqual(lines[served.pk]["status"], OrderItemStatus.SERVED)
+        self.assertTrue(lines[later.pk]["is_additional_batch"])
+        self.assertEqual(lines[later.pk]["status"], OrderItemStatus.PREPARING)
+        for next_status in (OrderItemStatus.READY, OrderItemStatus.SERVED):
+            OrderItem.objects.filter(pk=later.pk).update(status=next_status)
+            poll = self.client.get("/api/orders/track/", params)
+            lines = {row["id"]: row for row in poll.json()["items"]}
+            self.assertEqual(lines[later.pk]["status"], next_status)
+
+    def test_ready_cashier_add_is_sent_once_and_redundant_waiter_send_returns_no_pending(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(branch=self.riyadh, table=self.open_table,
+            assigned_waiter=self.waiter, status=OrderStatus.READY)
+        OrderItem.objects.create(order=order, product=self.product, name_en_snapshot="Ready",
+            name_ar_snapshot="Ready", price_snapshot=25, status=OrderItemStatus.READY)
+        self.client.force_authenticate(user=self.cashier)
+        added = self.client.post(f"/api/orders/{order.pk}/items/", {"product": self.product.pk}, format="json")
+        self.assertEqual(added.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(added.json()["status"], OrderItemStatus.FIRED)
+        self.client.force_authenticate(user=self.waiter)
+        resent = self.client.post(f"/api/orders/{order.pk}/send-to-kitchen/", {}, format="json")
+        self.assertEqual(resent.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resent.json()["error"], "error.noPendingItems")
+
+    def test_garbage_token_is_rejected_as_invalid(self):
         response = self.post_qr(self.payload("Table 3"))
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(self.error_code(response), "error.sessionTokenRequired")
+        self.assertEqual(self.error_code(response), "error.invalidSessionToken")
+
+    def test_unknown_well_formed_qr_token_is_rejected_with_clear_code(self):
+        response = self.post_qr(self.payload("A" * 32))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.error_code(response), "error.invalidSessionToken")
 
     def test_qr_still_works_after_close(self):
         token = self.open_table.session_token
@@ -319,7 +421,9 @@ class PublicQrOrderTests(TablesApiTestCase):
         self.post_qr(self.payload(self.open_table.session_token), key)
         changed = self.payload(self.open_table.session_token)
         changed["items"][0]["quantity"] = 2
-        self.assertEqual(self.post_qr(changed, key).status_code, status.HTTP_409_CONFLICT)
+        response = self.post_qr(changed, key)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.error_code(response), "error.idempotencyKeyConflict")
 
     def test_customer_submission_requires_idempotency_key(self):
         response = self.client.post(self.url, self.payload(self.open_table.session_token), format="json")
@@ -412,6 +516,78 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         self.assertEqual(self.client.get(f"/api/orders/{restricted.pk}/").status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(self.client.get(f"/api/orders/{restricted.pk}/history/").status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_unassigned_ready_order_can_be_recovered_by_assigning_a_waiter(self):
+        """A ready ticket without an assignee is visible to KDS but to no waiter's queue."""
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, status=OrderStatus.READY,
+        )
+        item = OrderItem.objects.create(
+            order=order, product=self.product, name_en_snapshot="Burger", name_ar_snapshot="Burger",
+            price_snapshot="25.00", quantity=1, status=OrderItemStatus.READY,
+        )
+
+        self.auth_as(self.kitchen, "6666")
+        tickets = self.client.get("/api/kds/tickets/").json()["results"]
+        self.assertTrue(any(row["id"] == order.pk for row in tickets))
+
+        self.auth_as(self.waiter, "4444")
+        self.assertNotIn(order.pk, [row["id"] for row in self.client.get("/api/orders/").json()["results"]])
+
+        self.auth_as(self.cashier, "3333")
+        assigned = self.client.post(
+            f"/api/orders/{order.pk}/assign-waiter/", {"waiter": self.waiter.pk}, format="json",
+        )
+        self.assertEqual(assigned.status_code, status.HTTP_200_OK)
+        self.assertEqual(assigned.json()["status"], OrderStatus.READY)
+        self.assertEqual(assigned.json()["items"][0]["id"], item.pk)
+
+    def test_cashier_unassigned_filter_includes_ready_order_and_kitchen_ticket(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(branch=self.riyadh, table=self.open_table, status=OrderStatus.READY)
+        OrderItem.objects.create(order=order, product=self.product, name_en_snapshot="Burger",
+            name_ar_snapshot="Burger", price_snapshot=25, status=OrderItemStatus.READY)
+        self.auth_as(self.cashier, "3333")
+        listing = self.client.get("/api/orders/?waiter=unassigned").json()["results"]
+        self.assertIn(order.pk, [row["id"] for row in listing])
+        self.auth_as(self.waiter, "4444")
+        self.assertNotIn(order.pk, [row["id"] for row in self.client.get("/api/orders/").json()["results"]])
+        self.auth_as(self.kitchen, "6666")
+        tickets = self.client.get("/api/kds/tickets/").json()["results"]
+        self.assertIn(order.pk, [row["id"] for row in tickets])
+
+    @skip("Needs PostgreSQL: SQLite does not enforce select_for_update row locks.")
+    def test_concurrent_cashier_waiter_customer_adds_serialize_under_order_lock(self):
+        """Run this concurrency integration case against PostgreSQL, not SQLite."""
+        self.fail("PostgreSQL concurrency test fixture is required to assert serialized row locks.")
+
+    def test_released_table_can_start_a_new_qr_order(self):
+        from decimal import Decimal
+        from orders.models import Bill, BillStatus, Order, OrderItem, OrderItemStatus, OrderStatus
+
+        bill = Bill.objects.create(branch=self.riyadh, table=self.open_table, status=BillStatus.PAID)
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, bill=bill, status=OrderStatus.PAID,
+        )
+        OrderItem.objects.create(
+            order=order, product=self.product, name_en_snapshot="Burger", name_ar_snapshot="Burger",
+            price_snapshot=Decimal("25.00"), quantity=1, status=OrderItemStatus.SERVED,
+        )
+        self.auth_as(self.cashier, "3333")
+        released = self.client.post(f"/api/bills/{bill.pk}/release-table/", format="json")
+        self.assertEqual(released.status_code, status.HTTP_200_OK)
+
+        self.client.credentials()
+        placed = self.post_qr({
+            "session_token": self.open_table.session_token,
+            "phone": "0770000099",
+            "items": [{"product": self.product.pk, "quantity": 1}],
+        })
+        self.assertEqual(placed.status_code, status.HTTP_201_CREATED)
+        self.assertNotEqual(placed.json()["id"], order.pk)
+
     def test_kitchen_ticket_response_excludes_cashier_payment_and_customer_data(self):
         from orders.models import Order, OrderItem, OrderItemStatus
 
@@ -428,25 +604,249 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         self.assertNotIn("price_snapshot", row["items"][0])
         self.assertEqual(self.client.get(f"/api/orders/{order.pk}/").status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_cashier_adds_to_ready_order_dispatches_only_new_batch(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, assigned_waiter=self.waiter, status=OrderStatus.READY,
+        )
+        old_item = OrderItem.objects.create(
+            order=order, product=self.product, name_en_snapshot="Ready burger", name_ar_snapshot="Ready burger",
+            price_snapshot="25.00", quantity=1, status=OrderItemStatus.READY,
+        )
+        self.client.force_authenticate(user=self.cashier)
+        layer = get_channel_layer()
+        waiter_channel = async_to_sync(layer.new_channel)()
+        kitchen_channel = async_to_sync(layer.new_channel)()
+        async_to_sync(layer.group_add)(f"staff_{self.waiter.pk}_events", waiter_channel)
+        async_to_sync(layer.group_add)(f"staff_{self.kitchen.pk}_events", kitchen_channel)
+        with self.captureOnCommitCallbacks(execute=True):
+            added = self.client.post(f"/api/orders/{order.pk}/items/", {"product": self.product.pk}, format="json")
+        self.assertEqual(added.status_code, status.HTTP_201_CREATED)
+        new_item_id = added.json()["id"]
+        order.refresh_from_db()
+        old_item.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.PREPARING)
+        self.assertEqual(order.assigned_waiter_id, self.waiter.pk)
+        self.assertEqual(old_item.status, OrderItemStatus.READY)
+        self.assertEqual(OrderItem.objects.get(pk=new_item_id).status, OrderItemStatus.FIRED)
+
+        self.client.force_authenticate(user=self.waiter)
+        queue = self.client.get("/api/orders/").json()["results"]
+        self.assertIn(order.pk, [row["id"] for row in queue])
+        order.refresh_from_db()
+        old_item.refresh_from_db()
+        new_item = OrderItem.objects.get(pk=new_item_id)
+        self.assertEqual(order.status, OrderStatus.PREPARING)
+        self.assertEqual(old_item.status, OrderItemStatus.READY)
+        self.assertEqual(new_item.status, OrderItemStatus.FIRED)
+        cashier_event = order.history.get(actor=self.cashier, event="cashier_item_added_and_sent")
+        self.assertEqual(cashier_event.details["actor_role"], StaffRole.CASHIER)
+        self.assertTrue(next(row for row in self.client.get(f"/api/orders/{order.pk}/").json()["items"] if row["id"] == new_item_id)["is_new"])
+        notice = async_to_sync(layer.receive)(waiter_channel)
+        self.assertEqual(notice["name"], "order:new_items")
+        self.assertEqual(notice["payload"]["items"][0]["name"], self.product.name_en)
+        kitchen_notice = async_to_sync(layer.receive)(kitchen_channel)
+        self.assertEqual(kitchen_notice["name"], "order:kitchen_new")
+        self.assertEqual(kitchen_notice["payload"]["items"][0]["quantity"], 1)
+
+        self.client.force_authenticate(user=self.kitchen)
+        ticket = next(row for row in self.client.get("/api/kds/tickets/").json()["results"] if row["id"] == order.pk)
+        self.assertEqual([row["id"] for row in ticket["items"]], [new_item_id])
+        self.client.patch(f"/api/orders/{order.pk}/items/{new_item_id}/status/", {"status": "preparing"}, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(f"/api/orders/{order.pk}/items/{new_item_id}/status/", {"status": "ready"}, format="json")
+        ready_notice = async_to_sync(layer.receive)(waiter_channel)
+        self.assertEqual(ready_notice["name"], "order:ready")
+        self.assertEqual(ready_notice["payload"]["items"][0]["id"], new_item_id)
+        self.client.force_authenticate(user=self.kitchen)
+        ready_ticket = next(row for row in self.client.get("/api/kds/tickets/").json()["results"] if row["id"] == order.pk)
+        self.assertEqual([line["id"] for line in ready_ticket["items"]], [new_item_id])
+        self.client.force_authenticate(user=self.waiter)
+        served = self.client.patch(f"/api/orders/{order.pk}/items/{new_item_id}/status/", {"status": "served"}, format="json")
+        self.assertEqual(served.status_code, status.HTTP_200_OK)
+        refreshed = self.client.get(f"/api/orders/{order.pk}/").json()
+        self.assertFalse(any(line["is_new"] for line in refreshed["items"]))
+
+    def test_cashier_adds_to_served_order_without_reopening_served_lines(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, assigned_waiter=self.waiter, status=OrderStatus.SERVED,
+        )
+        old_item = OrderItem.objects.create(
+            order=order, product=self.product, name_en_snapshot="Served burger", name_ar_snapshot="Served burger",
+            price_snapshot="25.00", quantity=1, status=OrderItemStatus.SERVED,
+        )
+        self.client.force_authenticate(user=self.cashier)
+        added = self.client.post(f"/api/orders/{order.pk}/items/", {"product": self.product.pk}, format="json")
+        self.assertEqual(added.status_code, status.HTTP_201_CREATED)
+        new_item_id = added.json()["id"]
+        order.refresh_from_db()
+        old_item.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.PREPARING)
+        self.assertEqual(old_item.status, OrderItemStatus.SERVED)
+        self.assertEqual(OrderItem.objects.get(pk=new_item_id).status, OrderItemStatus.FIRED)
+        self.client.force_authenticate(user=self.waiter)
+        waiter_ids = [row["id"] for row in self.client.get("/api/orders/").json()["results"]]
+        self.assertIn(order.pk, waiter_ids)
+        old_item.refresh_from_db()
+        self.assertEqual(old_item.status, OrderItemStatus.SERVED)
+        self.assertEqual(OrderItem.objects.get(pk=new_item_id).status, OrderItemStatus.FIRED)
+
+    def test_waiter_adds_to_ready_and_served_order_dispatch_immediately(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus, OrderHistory
+
+        layer = get_channel_layer()
+        cashier_channel = async_to_sync(layer.new_channel)()
+        async_to_sync(layer.group_add)(f"staff_{self.cashier.pk}_events", cashier_channel)
+        for parent_status, line_status in ((OrderStatus.READY, OrderItemStatus.READY), (OrderStatus.SERVED, OrderItemStatus.SERVED)):
+            order = Order.objects.create(branch=self.riyadh, table=self.open_table,
+                assigned_waiter=self.waiter, status=parent_status)
+            old_item = OrderItem.objects.create(order=order, product=self.product,
+                name_en_snapshot="Existing", name_ar_snapshot="Existing", price_snapshot="25.00",
+                status=line_status)
+            self.client.force_authenticate(user=self.waiter)
+            with self.captureOnCommitCallbacks(execute=True):
+                added = self.client.post(f"/api/orders/{order.pk}/items/", {"product": self.product.pk}, format="json")
+            self.assertEqual(added.status_code, status.HTTP_201_CREATED)
+            old_item.refresh_from_db()
+            self.assertEqual(old_item.status, line_status)
+            new_item = OrderItem.objects.get(pk=added.json()["id"])
+            self.assertEqual(new_item.status, OrderItemStatus.FIRED)
+            cashier_notice = async_to_sync(layer.receive)(cashier_channel)
+            self.assertEqual(cashier_notice["name"], "order:new_items")
+            self.assertEqual(cashier_notice["payload"]["items"][0]["quantity"], 1)
+        added_event = order.history.get(actor=self.waiter, event="waiter_item_added_and_sent")
+        self.assertEqual(added_event.details["actor_role"], StaffRole.WAITER)
+        self.assertEqual(added_event.details["item_ids"], [new_item.pk])
+
+    def test_waiter_cannot_add_to_another_waiters_order_or_another_branch(self):
+        from orders.models import Order, OrderStatus
+
+        other_waiter = make_staff(self.riyadh, "Layla", StaffRole.WAITER, "8888")
+        other_order = Order.objects.create(branch=self.riyadh, table=self.empty_table,
+            assigned_waiter=other_waiter, status=OrderStatus.READY)
+        foreign_order = Order.objects.create(branch=self.jeddah, table=self.other_branch_table,
+            assigned_waiter=self.waiter, status=OrderStatus.READY)
+        self.client.force_authenticate(user=self.waiter)
+        self.assertEqual(self.client.post(f"/api/orders/{other_order.pk}/items/", {"product": self.product.pk}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(f"/api/orders/{foreign_order.pk}/items/", {"product": self.product.pk}, format="json").status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_customer_addition_waits_for_cashier_review_then_dispatches_to_same_order(self):
+        from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+
+        order = Order.objects.create(branch=self.riyadh, table=self.open_table,
+            assigned_waiter=self.waiter, status=OrderStatus.READY)
+        old_item = OrderItem.objects.create(order=order, product=self.product,
+            name_en_snapshot="Already ready", name_ar_snapshot="Already ready",
+            price_snapshot="25.00", status=OrderItemStatus.READY)
+        layer = get_channel_layer()
+        cashier_channel = async_to_sync(layer.new_channel)()
+        waiter_channel = async_to_sync(layer.new_channel)()
+        async_to_sync(layer.group_add)(f"staff_{self.cashier.pk}_events", cashier_channel)
+        async_to_sync(layer.group_add)(f"staff_{self.waiter.pk}_events", waiter_channel)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            added = self.post_qr({
+                "session_token": self.open_table.session_token,
+                "phone": "0770000099",
+                "items": [{"product": self.product.pk, "quantity": 2}],
+            })
+        self.assertEqual(added.status_code, status.HTTP_200_OK)
+        self.assertEqual(added.json()["id"], order.pk)
+        order.refresh_from_db()
+        old_item.refresh_from_db()
+        new_item = OrderItem.objects.filter(order=order).exclude(pk=old_item.pk).get()
+        self.assertEqual(order.status, OrderStatus.READY)
+        self.assertEqual(order.assigned_waiter_id, self.waiter.pk)
+        self.assertEqual(old_item.status, OrderItemStatus.READY)
+        self.assertEqual(new_item.status, OrderItemStatus.PENDING)
+        self.assertTrue(next(line for line in added.json()["items"] if line["id"] == new_item.pk)["is_new"])
+        notice = async_to_sync(layer.receive)(cashier_channel)
+        self.assertEqual(notice["name"], "order:cashier_review")
+        self.assertEqual(notice["payload"]["items"], [{"id": new_item.pk, "name": self.product.name_en, "quantity": 2}])
+
+        self.client.force_authenticate(user=self.kitchen)
+        before_review = self.client.get("/api/kds/tickets/").json()["results"]
+        self.assertEqual([line["id"] for row in before_review if row["id"] == order.pk for line in row["items"]], [old_item.pk])
+
+        self.client.force_authenticate(user=self.cashier)
+        with self.captureOnCommitCallbacks(execute=True):
+            reviewed = self.client.post(f"/api/orders/{order.pk}/cashier-review/")
+        self.assertEqual(reviewed.status_code, status.HTTP_200_OK)
+        self.assertEqual(reviewed.json()["status"], OrderStatus.PREPARING)
+        self.assertEqual(next(line for line in reviewed.json()["items"] if line["id"] == new_item.pk)["status"], OrderItemStatus.FIRED)
+        waiter_notice = async_to_sync(layer.receive)(waiter_channel)
+        self.assertEqual(waiter_notice["name"], "order:new_items")
+        self.assertEqual(waiter_notice["payload"]["items"][0]["quantity"], 2)
+
+        self.client.force_authenticate(user=self.kitchen)
+        ticket = next(row for row in self.client.get("/api/kds/tickets/").json()["results"] if row["id"] == order.pk)
+        self.assertEqual([line["id"] for line in ticket["items"]], [new_item.pk])
+
+    def test_public_tracking_resolves_exact_order_only_with_customer_phone(self):
+        from customers.models import Customer
+        from orders.models import Order, OrderStatus
+
+        customer = Customer.objects.create(branch=self.riyadh, phone="0770000001")
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, customer=customer, status=OrderStatus.CANCELLED,
+        )
+        url = f"/api/orders/qr/{self.open_table.session_token}/{order.pk}/"
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.get(url, {"phone": "0770000099"}).status_code, status.HTTP_404_NOT_FOUND)
+        response = self.client.get(url, {"phone": customer.phone})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], OrderStatus.CANCELLED)
+        self.assertIn("bill_id", response.json())
+        other_order = Order.objects.create(branch=self.riyadh, table=self.empty_table, status=OrderStatus.CANCELLED)
+        self.assertEqual(self.client.get(
+            f"/api/orders/qr/{self.open_table.session_token}/{other_order.pk}/", {"phone": customer.phone},
+        ).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_assign_waiter_recovery_is_only_for_unassigned_ready_or_served_orders(self):
+        from orders.models import Order, OrderHistory, OrderStatus
+
+        other_waiter = make_staff(self.riyadh, "Layla", StaffRole.WAITER, "8888")
+        ready = Order.objects.create(branch=self.riyadh, table=self.open_table, status=OrderStatus.READY)
+        self.client.force_authenticate(user=self.cashier)
+        assigned = self.client.post(
+            f"/api/orders/{ready.pk}/assign-waiter/", {"waiter": self.waiter.pk}, format="json",
+        )
+        self.assertEqual(assigned.status_code, status.HTTP_200_OK)
+        ready.refresh_from_db()
+        self.assertEqual(ready.status, OrderStatus.READY)
+        self.assertEqual(ready.assigned_waiter_id, self.waiter.pk)
+        self.assertTrue(OrderHistory.objects.filter(order=ready, event="waiter_assigned").exists())
+
+        rejected = self.client.post(
+            f"/api/orders/{ready.pk}/assign-waiter/", {"waiter": other_waiter.pk}, format="json",
+        )
+        self.assertEqual(rejected.status_code, status.HTTP_409_CONFLICT)
+        ready.refresh_from_db()
+        self.assertEqual(ready.assigned_waiter_id, self.waiter.pk)
+
     def test_customer_order_requires_waiter_confirmation_and_payment_does_not_release_table(self):
         table_layer = get_channel_layer()
         table_channel = async_to_sync(table_layer.new_channel)()
         async_to_sync(table_layer.group_add)(f"table_{self.open_table.id}_events", table_channel)
 
-        placed = self.client.post(
-            "/api/orders/qr/",
-            {
-                "session_token": self.open_table.session_token,
-                "phone": "0770000033",
-                "latitude": 24.7136,
-                "longitude": 46.6753,
-                "accuracy_m": 0.2,
-                "location_timestamp": time.time(),
-                "items": [{"product": self.product.id, "quantity": 1}],
-            },
-            format="json",
-            HTTP_IDEMPOTENCY_KEY="workflow-customer-order",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            placed = self.client.post(
+                "/api/orders/qr/",
+                {
+                    "session_token": self.open_table.session_token,
+                    "phone": "0770000033",
+                    "latitude": 24.7136,
+                    "longitude": 46.6753,
+                    "accuracy_m": 0.2,
+                    "location_timestamp": time.time(),
+                    "items": [{"product": self.product.id, "quantity": 1}],
+                },
+                format="json",
+                HTTP_IDEMPOTENCY_KEY="workflow-customer-order",
+            )
         self.assertEqual(placed.status_code, status.HTTP_201_CREATED)
         order_id = placed.json()["id"]
         order_code = placed.json()["order_code"]
@@ -505,9 +905,10 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         for item_status, order_status in (("preparing", "preparing"), ("ready", "ready")):
             kitchen_update_channel = async_to_sync(table_layer.new_channel)()
             async_to_sync(table_layer.group_add)(f"table_{self.open_table.id}_events", kitchen_update_channel)
-            updated = self.client.patch(
-                f"/api/orders/{order_id}/items/{item_id}/status/", {"status": item_status}, format="json"
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                updated = self.client.patch(
+                    f"/api/orders/{order_id}/items/{item_id}/status/", {"status": item_status}, format="json"
+                )
             self.assertEqual(updated.status_code, status.HTTP_200_OK)
             self.assertEqual(updated.json()["status"], item_status)
             customer_update = async_to_sync(table_layer.receive)(kitchen_update_channel)
@@ -604,14 +1005,16 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         async_to_sync(channel_layer.group_add)(f"staff_{self.cashier.id}_events", cashier_channel)
 
         self.auth_as(self.kitchen, "6666")
-        for item_id in item_ids:
-            self.client.patch(f"/api/orders/{order_id}/items/{item_id}/status/", {"status": "preparing"}, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            for item_id in item_ids:
+                self.client.patch(f"/api/orders/{order_id}/items/{item_id}/status/", {"status": "preparing"}, format="json")
         # Status notifications are order-level and fire only when the overall
         # order transitions to preparing (the second item doesn't transition it).
         self.assertEqual(async_to_sync(channel_layer.receive)(waiter_channel)["name"], "order:preparing")
         self.assertEqual(async_to_sync(channel_layer.receive)(cashier_channel)["name"], "order:preparing")
 
-        self.client.patch(f"/api/orders/{order_id}/items/{item_ids[0]}/status/", {"status": "ready"}, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(f"/api/orders/{order_id}/items/{item_ids[0]}/status/", {"status": "ready"}, format="json")
         self.assertEqual(Order.objects.get(pk=order_id).status, "preparing")
         self.auth_as(self.waiter, "4444")
         early_serve = self.client.patch(
@@ -620,7 +1023,8 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         self.assertEqual(early_serve.status_code, status.HTTP_409_CONFLICT)
 
         self.auth_as(self.kitchen, "6666")
-        self.client.patch(f"/api/orders/{order_id}/items/{item_ids[1]}/status/", {"status": "ready"}, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(f"/api/orders/{order_id}/items/{item_ids[1]}/status/", {"status": "ready"}, format="json")
         self.assertEqual(Order.objects.get(pk=order_id).status, "ready")
         ready_event = async_to_sync(channel_layer.receive)(waiter_channel)
         self.assertEqual(ready_event["name"], "order:ready")

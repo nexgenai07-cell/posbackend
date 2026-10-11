@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 
 from accounts.models import Staff, StaffRole
@@ -186,7 +187,7 @@ def bill_event_payload(bill, **extra):
     }
 
 
-def notify_cashiers(bill, event_name, **extra):
+def notify_cashiers(bill, event_name, *, exclude_staff_id=None, **extra):
     """
     Fan out to every active cashier/owner/manager in the bill's branch, using
     the staff-targeted Channels groups that already exist.
@@ -197,9 +198,10 @@ def notify_cashiers(bill, event_name, **extra):
     screen is never sent a payment event.
     """
     payload = bill_event_payload(bill, event_id=uuid.uuid4().hex, **extra)
-    recipients = Staff.objects.filter(
-        branch_id=bill.branch_id, role__in=_CASHIER_ROLES, is_active=True
-    ).values_list("pk", flat=True)
+    recipients = Staff.objects.filter(branch_id=bill.branch_id, role__in=_CASHIER_ROLES, is_active=True)
+    if exclude_staff_id is not None:
+        recipients = recipients.exclude(pk=exclude_staff_id)
+    recipients = recipients.values_list("pk", flat=True)
     for staff_id in recipients:
         publish_staff_event(staff_id, event_name, payload)
     # Also to the table's own group, so the customer's phone can react without
@@ -306,7 +308,7 @@ def amount_outstanding(bill):
     return max(bill_total(bill) - amount_paid(bill), _ZERO)
 
 
-def reopen_bill(bill, actor=None):
+def reopen_bill(bill, actor=None, *, reason="customer_cancelled"):
     """
     pay_requested -> open. The unlock for a stuck bill: a customer taps Pay by
     mistake, or picks cash and then wants to add dessert. Never allowed once
@@ -317,6 +319,8 @@ def reopen_bill(bill, actor=None):
     if bill.status in (BillStatus.PAID, BillStatus.CLOSED):
         raise BillTransitionError("error.billAlreadyPaid")
 
+    previous_method = bill.requested_method
+    previous_total = bill_total(bill)
     bill.status = BillStatus.OPEN
     bill.requested_method = ""
     bill.pay_requested_at = None
@@ -326,9 +330,16 @@ def reopen_bill(bill, actor=None):
         bill.table.open()  # back to `occupied` — the table is still seated
 
     for order in billable_orders(bill):
-        record_order_event(order, actor, "bill_pay_cancelled", details={"bill_id": bill.pk})
+        record_order_event(order, actor, "bill_pay_cancelled", details={"bill_id": bill.pk, "reason": reason})
 
-    notify_cashiers(bill, "bill:updated")
+    notify_cashiers(
+        bill,
+        "bill:pay_cancelled",
+        cancelled_method=previous_method,
+        cancelled_total=str(previous_total),
+        reason=reason,
+        exclude_staff_id=getattr(actor, "pk", None),
+    )
     logger.info("Bill %s reopened by %s", bill.pk, getattr(actor, "pk", "customer"))
     return bill
 
@@ -460,9 +471,17 @@ def _record_moyasar_payment(bill, moyasar):
         }
     if metadata.get("bill_id") is not None:
         raw_snapshot["metadata"] = {"bill_id": metadata["bill_id"]}
+        if metadata.get("payment_request_at") is not None:
+            raw_snapshot["metadata"]["payment_request_at"] = metadata["payment_request_at"]
 
     review_reason = ""
-    if amount != expected:
+    if bill.status != BillStatus.PAY_REQUESTED:
+        review_reason = f"bill is {bill.status}; no active payment request"
+    elif not metadata.get("payment_request_at"):
+        review_reason = "payment metadata has no payment request timestamp"
+    elif parse_datetime(str(metadata["payment_request_at"])) != bill.pay_requested_at:
+        review_reason = "payment belongs to a previous request"
+    elif amount != expected:
         review_reason = f"amount {amount} != bill total {expected}"
     elif bill.status in (BillStatus.PAID, BillStatus.CLOSED):
         review_reason = f"bill already {bill.status}"

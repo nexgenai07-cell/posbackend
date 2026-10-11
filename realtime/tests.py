@@ -42,8 +42,8 @@ class TableSessionConsumerAuthTests(TestCase):
             with self.subTest(raw=raw):
                 self.assertIsNone(self.resolve(raw))
 
-    def test_a_closed_tables_old_token_resolves_to_none(self):
+    def test_a_closed_tables_permanent_token_still_resolves(self):
         stale_token = self.table.session_token
         self.table.close()
-        self.assertIsNone(self.resolve(stale_token))
+        self.assertEqual(self.resolve(stale_token), self.table.id)
 

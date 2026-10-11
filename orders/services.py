@@ -8,7 +8,7 @@ class BillLocked(Exception):
     new orders or items may be added to it. Surfaced as 409 error.billLocked."""
 
 
-def get_or_create_open_order(table, staff=None, customer=None, source=OrderSource.POS, *, force_new=False):
+def get_or_create_open_order(table, staff=None, customer=None, source=OrderSource.POS, *, reopen_requested=False):
     """
     One open (non-closed/cancelled) order per table at a time — shared by
     OrderListCreateView.post (POS, staff-initiated) and the public QR
@@ -32,13 +32,27 @@ def get_or_create_open_order(table, staff=None, customer=None, source=OrderSourc
     bill, _ = get_or_create_open_bill(table)
     if bill.status == BillStatus.PAID:
         reopen_for_additional_items(bill, actor=staff)
-    elif bill.is_locked:
+    elif bill.status == BillStatus.PAY_REQUESTED and reopen_requested:
+        # A new round changes the amount, so invalidate the current request
+        # before attaching any new items. Any in-flight online verification
+        # will subsequently fail the amount/status checks.
+        from .billing import reopen_bill
+        reopen_bill(bill, actor=staff, reason="additional_items")
+    elif bill.is_locked and bill.status != BillStatus.PAY_REQUESTED:
         raise BillLocked(bill)
 
-    order = None if force_new else Order.objects.select_for_update().filter(table=table).exclude(status__in=_TERMINAL_STATUSES).order_by("-opened_at", "-id").first()
+    order = (
+        Order.objects.select_for_update()
+        .filter(table=table)
+        .exclude(status__in=_TERMINAL_STATUSES)
+        .order_by("-opened_at", "-id")
+        .first()
+    )
     if order:
         attach_order_to_bill(order, bill)
         return order, False
+    if bill.status == BillStatus.PAY_REQUESTED:
+        raise BillLocked(bill)
     order = Order.objects.create(
         branch=table.branch, table=table, staff=staff, customer=customer, source=source, bill=bill,
     )

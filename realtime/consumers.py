@@ -30,6 +30,28 @@ class BranchEventsConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps({"name": event["name"], "payload": event["payload"]}))
 
 
+class PublicMenuEventsConsumer(AsyncWebsocketConsumer):
+    """Read-only menu change notifications for public customer websites."""
+
+    async def connect(self):
+        query_string = self.scope.get("query_string", b"").decode()
+        raw_branch_id = parse_qs(query_string).get("branch", [""])[0]
+        if not raw_branch_id.isdigit():
+            await self.close(code=4001)
+            return
+
+        self.group_name = f"menu_{int(raw_branch_id)}_events"
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        if hasattr(self, "group_name"):
+            await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def broadcast_event(self, event):
+        await self.send(text_data=json.dumps({"name": event["name"], "payload": event["payload"]}))
+
+
 @database_sync_to_async
 def _get_table_id_for_session(raw_token):
     from tables.models import Table

@@ -41,7 +41,7 @@ logger = logging.getLogger("orders.billing")
 
 def _bill_queryset():
     return Bill.objects.select_related("table", "branch").prefetch_related(
-        "orders__items", "moyasar_payments"
+        "orders__items", "orders__history", "moyasar_payments"
     )
 
 
@@ -125,6 +125,9 @@ class BillRequestPayView(APIView):
             ).first()
             if bill is None:
                 return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
+            expected_bill_id = serializer.validated_data.get("bill_id")
+            if expected_bill_id is not None and expected_bill_id != bill.pk:
+                return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
             try:
                 billing.request_payment(bill, method)
             except billing.BillTransitionError as exc:
@@ -134,13 +137,13 @@ class BillRequestPayView(APIView):
         if method == billing.BillMethod.ONLINE:
             extra = {
                 "publishable_key": moyasar.publishable_key(),
-                "callback_url": _callback_url(table),
+                "callback_url": _callback_url(table, bill),
                 "description": f"{bill.bill_code} — {table.label_en}",
             }
         return _bill_response(bill, **extra)
 
 
-def _callback_url(table):
+def _callback_url(table, bill):
     """
     Where Moyasar sends the customer back to. The table's session token rides
     along as `t=` so the callback page knows which table to return to —
@@ -150,7 +153,7 @@ def _callback_url(table):
     """
     from django.conf import settings
     base = settings.CUSTOMER_WEB_BASE_URL.rstrip("/")
-    return f"{base}/pay/callback?t={table.session_token}"
+    return f"{base}/pay/callback?t={table.session_token}&bill_id={bill.pk}"
 
 
 class BillCancelPayView(APIView):
@@ -177,8 +180,11 @@ class BillCancelPayView(APIView):
             ).first()
             if bill is None:
                 return Response({"error": "error.billNotFound"}, status=status.HTTP_404_NOT_FOUND)
+            expected_bill_id = serializer.validated_data.get("bill_id")
+            if expected_bill_id is not None and expected_bill_id != bill.pk:
+                return Response({"error": "error.billSessionEnded"}, status=status.HTTP_409_CONFLICT)
             try:
-                billing.reopen_bill(bill)
+                billing.reopen_bill(bill, reason="customer_cancelled")
             except billing.BillTransitionError as exc:
                 return _transition_error(exc)
         return _bill_response(bill)
@@ -191,11 +197,12 @@ class BillVerifyOnlineView(APIView):
     Called by the callback page through burger_web's BFF. The ?status= on the
     redirect is never read — only the id is, and only to look the payment up.
 
-    A bill is marked paid ONLY IF all four hold:
+    A bill is marked paid ONLY IF all five hold:
       1. Moyasar's own API reports status == "paid"
       2. amount == the bill total in halalas, recomputed under a row lock
       3. metadata.bill_id == that bill's id
-      4. the bill belongs to the table the session_token resolves to
+      4. metadata.payment_request_at matches the active request generation
+      5. the bill belongs to the table the session_token resolves to
     """
 
     permission_classes = [AllowAny]
@@ -406,7 +413,7 @@ class BillReopenView(APIView):
                 Bill.objects.select_for_update().filter(branch=request.user.branch), pk=pk
             )
             try:
-                billing.reopen_bill(bill, actor=request.user)
+                billing.reopen_bill(bill, actor=request.user, reason="staff_reopened")
             except billing.BillTransitionError as exc:
                 return _transition_error(exc)
         return _bill_response(bill)

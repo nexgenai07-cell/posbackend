@@ -117,9 +117,8 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         This exists so staff can retrieve the code a customer's phone needs
         without opening Django admin or a shell: to reprint a QR label whose
         original is lost, or to read out the code for restaurant-mobile's
-        manual-entry fallback when a scan won't take. Only open tables appear:
-        Table.close() nulls session_token, so a closed table's old code is
-        gone from here too, which is the point (it's invalid anyway).
+        manual-entry fallback when a scan won't take. Only open tables appear;
+        closing a table hides it here but preserves its permanent QR token.
         """
         tables = list(self.get_queryset().exclude(status=TableStatus.EMPTY).order_by("id"))
         return Response({"count": len(tables), "results": TableSerializer(tables, many=True).data})
@@ -163,7 +162,10 @@ class TableBySessionView(APIView):
             .order_by("-opened_at", "-id")
             .first()
         )
+        from orders.models import Bill, BillStatus
+        bill = Bill.objects.filter(table=table).exclude(status=BillStatus.CLOSED).first()
         return Response({
             "table": TableSerializer(table).data,
+            "bill_id": bill.pk if bill else None,
             "open_order": PublicOrderSerializer(order).data if order else None,
         })

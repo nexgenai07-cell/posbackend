@@ -74,6 +74,7 @@ class BillSerializer(serializers.ModelSerializer):
     # table was released — the guest then pays the difference, not the total.
     amount_paid = serializers.SerializerMethodField()
     amount_outstanding = serializers.SerializerMethodField()
+    payment_request_cancelled_by_add = serializers.SerializerMethodField()
 
     class Meta:
         model = Bill
@@ -82,6 +83,7 @@ class BillSerializer(serializers.ModelSerializer):
             "requested_method", "paid_method", "total", "total_halalas", "currency",
             "total_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
             "amount_paid", "amount_outstanding",
+            "payment_request_cancelled_by_add",
             "orders", "pay_requested_at", "paid_at", "closed_at", "created_at", "updated_at",
         ]
         read_only_fields = fields
@@ -114,6 +116,22 @@ class BillSerializer(serializers.ModelSerializer):
     def get_amount_outstanding(self, bill):
         return str(amount_outstanding(bill))
 
+    def get_payment_request_cancelled_by_add(self, bill):
+        history = [
+            entry
+            for order in bill.orders.all()
+            for entry in order.history.all()
+            if entry.event in ("bill_pay_requested", "bill_pay_cancelled")
+            and (entry.details or {}).get("bill_id") == bill.pk
+        ]
+        if not history:
+            return False
+        latest = max(history, key=lambda entry: (entry.created_at, entry.pk))
+        return (
+            latest.event == "bill_pay_cancelled"
+            and (latest.details or {}).get("reason") == "additional_items"
+        )
+
     def get_needs_review(self, bill):
         return any(payment.needs_review for payment in bill.moyasar_payments.all())
 
@@ -133,6 +151,7 @@ class MoyasarPaymentSerializer(serializers.ModelSerializer):
 
 class RequestPaySerializer(serializers.Serializer):
     session_token = serializers.CharField(error_messages={"required": "error.sessionTokenRequired"})
+    bill_id = serializers.IntegerField(required=False)
     method = serializers.ChoiceField(
         choices=[BillMethod.CASH, BillMethod.ONLINE],
         error_messages={"required": "error.paymentMethodRequired", "invalid_choice": "error.paymentMethodInvalid"},
@@ -141,6 +160,7 @@ class RequestPaySerializer(serializers.Serializer):
 
 class CancelPaySerializer(serializers.Serializer):
     session_token = serializers.CharField(error_messages={"required": "error.sessionTokenRequired"})
+    bill_id = serializers.IntegerField(required=False)
 
 
 class VerifyOnlineSerializer(serializers.Serializer):

@@ -2,7 +2,7 @@ from django.db.models.signals import post_delete, post_save
 from django.db import transaction
 from django.dispatch import receiver
 
-from catalog.models import Deal, Product
+from catalog.models import Category, Deal, Product
 from inventory.models import InventoryItem
 from orders.models import Order, OrderItem, Payment
 from tables.models import Table
@@ -50,6 +50,14 @@ def on_payment_change(sender, instance, **kwargs):
 @receiver(post_save, sender=Product)
 @receiver(post_delete, sender=Product)
 def on_product_change(sender, instance, **kwargs):
+    publish_event(instance.branch_id, "product:updated", instance.pk)
+
+
+@receiver(post_save, sender=Category)
+@receiver(post_delete, sender=Category)
+def on_category_change(sender, instance, **kwargs):
+    # Reuse the menu event so the admin and public website both refresh their
+    # category/product lists after a category is created, edited, or removed.
     publish_event(instance.branch_id, "product:updated", instance.pk)
 
 

@@ -24,6 +24,7 @@ from common.geofence import validate_branch_location
 from customers.models import Customer
 from customers.services import find_or_create_customer
 from inventory.services import ProductStockUnavailable, check_product_stock, deduct_stock_for_order_items
+from inventory.models import StockMovement, StockMovementReason
 from tables.models import Table
 from tables.services import parse_qr_payload
 
@@ -41,10 +42,12 @@ from .serializers import (
     RecordPaymentSerializer,
 )
 from .services import BillLocked, get_or_create_open_order
+from .codes import resolve_order_code
 from .workflow import (
     InvalidOrderTransition,
     TERMINAL_ORDER_STATUSES,
     queue_order_for_cashier,
+    recompute_order_status_from_items,
     record_order_event,
     transition_order,
 )
@@ -74,8 +77,8 @@ def _locked_bill_for_order(order, actor=None):
 
     Two different situations, deliberately treated differently:
 
-      pay_requested  the customer is mid-payment and the amount must not move
-                     under them -> blocked, a cashier reopens first.
+      pay_requested  a new line cancels the old request before the amount can
+                     change, and notifies the cashier queue.
 
       paid           the money is in, but the table has not been released and
                      the guest has ordered a coffee. Staff may add: the bill
@@ -84,13 +87,16 @@ def _locked_bill_for_order(order, actor=None):
 
     `closed` means the table is already released, so that is blocked too.
     """
-    from .billing import reopen_for_additional_items
+    from .billing import reopen_bill, reopen_for_additional_items
     from .models import BillStatus
 
     if order.bill_id is None:
         return None
     bill = order.bill
     if bill.status == BillStatus.OPEN:
+        return None
+    if bill.status == BillStatus.PAY_REQUESTED:
+        reopen_bill(bill, actor=actor, reason="additional_items")
         return None
     if bill.status == BillStatus.PAID:
         reopen_for_additional_items(bill, actor=actor)
@@ -178,7 +184,10 @@ def _order_event_payload(order, actor_id=None, staff_id=None, **extra):
 
 def _notify_role_staff(order, event_name, roles, actor_id=None, **extra):
     event_id = uuid.uuid4().hex
-    recipients = Staff.objects.filter(branch_id=order.branch_id, role__in=roles, is_active=True).values_list("pk", flat=True)
+    recipients = Staff.objects.filter(branch_id=order.branch_id, role__in=roles, is_active=True)
+    if actor_id is not None:
+        recipients = recipients.exclude(pk=actor_id)
+    recipients = recipients.values_list("pk", flat=True)
     for staff_id in recipients:
         publish_staff_event(staff_id, event_name, _order_event_payload(order, actor_id, staff_id, event_id=event_id, **extra))
 
@@ -190,29 +199,26 @@ def _notify_order_staff(order, event_name, actor_id=None, staff_ids=None, **extr
         publish_staff_event(staff_id, event_name, _order_event_payload(order, actor_id, staff_id, event_id=event_id, **extra))
 
 
+def _item_notice(item):
+    name = item.name_en_snapshot
+    if item.variant_name_en_snapshot:
+        name = f"{name} ({item.variant_name_en_snapshot})"
+    return {"id": item.pk, "name": name, "quantity": item.quantity}
+
+
+def _additional_batch_ready_items(order):
+    batch_ids = {
+        int(item_id)
+        for entry in order.history.all()
+        if entry.event in ("customer_items_added", "customer_items_reviewed_and_sent", "cashier_item_added_and_sent", "waiter_item_added_and_sent")
+        for item_id in (entry.details or {}).get("item_ids", [])
+        if str(item_id).isdigit()
+    }
+    return list(order.items.filter(pk__in=batch_ids, status=OrderItemStatus.READY)) if batch_ids else []
+
+
 def _sync_order_kitchen_status(order, actor):
-    order_items = list(order.items.all())
-    if any(item.status == OrderItemStatus.PENDING for item in order_items):
-        return
-    kitchen_items = [item for item in order_items if item.status in {
-        OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY, OrderItemStatus.SERVED
-    }]
-    if not kitchen_items:
-        return
-    if all(item.status == OrderItemStatus.SERVED for item in kitchen_items):
-        next_status = OrderStatus.SERVED
-    elif all(item.status in (OrderItemStatus.READY, OrderItemStatus.SERVED) for item in kitchen_items):
-        next_status = OrderStatus.READY
-    elif any(item.status == OrderItemStatus.PREPARING for item in kitchen_items):
-        next_status = OrderStatus.PREPARING
-    else:
-        next_status = OrderStatus.SENT
-    previous = order.status
-    if next_status == previous:
-        return
-    if _transition_or_conflict(order, next_status, actor, "kitchen_status_changed"):
-        return
-    return
+    recompute_order_status_from_items(order, actor, event="kitchen_status_changed")
 
 
 class OrderListCreateView(ListModelMixin, GenericAPIView):
@@ -258,20 +264,22 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
 
         waiter_param = self.request.query_params.get("waiter")
         if waiter_param:
-            qs = qs.filter(assigned_waiter_id=waiter_param)
+            qs = qs.filter(assigned_waiter__isnull=True) if waiter_param.lower() == "unassigned" else qs.filter(assigned_waiter_id=waiter_param)
         cashier_param = self.request.query_params.get("cashier")
         if cashier_param:
             qs = qs.filter(assigned_cashier_id=cashier_param)
         search = self.request.query_params.get("search", "").strip()
         if search:
-            order_number = search.upper()
-            if order_number.startswith("ORD-"):
-                order_number = order_number[4:]
-            order_number = order_number.lstrip("0")
-            if order_number.isdigit():
-                qs = qs.filter(pk=int(order_number))
+            order_number = search
+            if order_number[:4].upper() == "ORD-":
+                order_id = resolve_order_code(order_number)
+                if order_id:
+                    qs = qs.filter(pk=order_id)
+                else:
+                    qs = qs.none()
             else:
-                qs = qs.none()
+                order_number = order_number.lstrip("0")
+                qs = qs.filter(pk=int(order_number)) if order_number.isdigit() else qs.none()
 
         date_from = self.request.query_params.get("from")
         date_to = self.request.query_params.get("to")
@@ -358,16 +366,45 @@ class CashierReviewView(APIView):
     permission_classes = [IsCashierStaff]
 
     def post(self, request, pk):
-        with transaction.atomic():
-            order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
-            if order.status != OrderStatus.PENDING_CASHIER:
-                return Response({"error": "error.orderNotAwaitingCashier"}, status=status.HTTP_409_CONFLICT)
-            if not order.items.exclude(status=OrderItemStatus.VOIDED).exists():
-                return Response({"error": "error.orderHasNoItems"}, status=status.HTTP_409_CONFLICT)
-            conflict = _transition_or_conflict(order, OrderStatus.AWAITING_WAITER, request.user,
-                "cashier_reviewed", extra_fields={"assigned_cashier": request.user})
-            if conflict:
-                return conflict
+        try:
+            with transaction.atomic():
+                order = get_object_or_404(
+                    Order.objects.select_for_update()
+                    .filter(branch=request.user.branch)
+                    .prefetch_related("items"),
+                    pk=pk,
+                )
+                if order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED):
+                    pending_items = list(order.items.filter(status=OrderItemStatus.PENDING).select_related("product"))
+                    if not pending_items:
+                        return Response({"error": "error.orderNotAwaitingCashier"}, status=status.HTTP_409_CONFLICT)
+                    deduct_stock_for_order_items(pending_items)
+                    now = timezone.now()
+                    OrderItem.objects.filter(pk__in=[item.pk for item in pending_items]).update(
+                        status=OrderItemStatus.FIRED, fired_at=now,
+                    )
+                    item_details = [_item_notice(item) for item in pending_items]
+                    record_order_event(order, request.user, "customer_items_reviewed_and_sent", details={
+                        "item_ids": [item.pk for item in pending_items],
+                        "items": item_details,
+                        "actor_role": request.user.role,
+                    })
+                    order._prefetched_objects_cache.pop("items", None)
+                    recompute_order_status_from_items(order, request.user, event="additional_items_started")
+                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=item_details)
+                    _notify_order_staff(order, "order:new_items", request.user.pk,
+                                        {order.assigned_waiter_id} - {None}, items=item_details)
+                else:
+                    if order.status != OrderStatus.PENDING_CASHIER:
+                        return Response({"error": "error.orderNotAwaitingCashier"}, status=status.HTTP_409_CONFLICT)
+                    if not order.items.exclude(status=OrderItemStatus.VOIDED).exists():
+                        return Response({"error": "error.orderHasNoItems"}, status=status.HTTP_409_CONFLICT)
+                    conflict = _transition_or_conflict(order, OrderStatus.AWAITING_WAITER, request.user,
+                        "cashier_reviewed", extra_fields={"assigned_cashier": request.user})
+                    if conflict:
+                        return conflict
+        except ProductStockUnavailable:
+            return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
 
 
@@ -380,7 +417,10 @@ class AssignWaiterView(APIView):
             return Response({"error": "error.waiterRequired"}, status=status.HTTP_400_BAD_REQUEST)
         with transaction.atomic():
             order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
-            if order.status != OrderStatus.AWAITING_WAITER:
+            recover_ready_order = order.status in (OrderStatus.READY, OrderStatus.SERVED)
+            if recover_ready_order and order.assigned_waiter_id is not None:
+                return Response({"error": "error.orderAlreadyAssigned"}, status=status.HTTP_409_CONFLICT)
+            if order.status != OrderStatus.AWAITING_WAITER and not recover_ready_order:
                 return Response({"error": "error.orderNotAwaitingWaiter"}, status=status.HTTP_409_CONFLICT)
             waiter = get_object_or_404(Staff, pk=waiter_id, branch=request.user.branch,
                 role=StaffRole.WAITER, is_active=True)
@@ -397,6 +437,7 @@ class WaiterConfirmView(APIView):
     permission_classes = [IsWaiterStaff]
 
     def post(self, request, pk):
+        dispatch_error = None
         try:
             with transaction.atomic():
                 order = get_object_or_404(
@@ -404,6 +445,8 @@ class WaiterConfirmView(APIView):
                 )
                 if order.status != OrderStatus.AWAITING_WAITER:
                     return Response({"error": "error.orderNotAwaitingWaiter"}, status=status.HTTP_409_CONFLICT)
+                if order.assigned_waiter_id is None:
+                    return Response({"error": "error.orderWaiterNotAssigned"}, status=status.HTTP_409_CONFLICT)
                 is_manager = request.user.role in (StaffRole.OWNER, StaffRole.MANAGER)
                 if not is_manager and order.assigned_waiter_id != request.user.pk:
                     return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
@@ -418,12 +461,15 @@ class WaiterConfirmView(APIView):
                     return conflict
                 dispatch_error = _dispatch_confirmed_order(order, request.user)
                 if dispatch_error:
-                    return dispatch_error
-                _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
-                _notify_order_staff(order, "order:confirmed", request.user.pk, {order.assigned_cashier_id} - {None})
-                _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                    transaction.set_rollback(True)
+                else:
+                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
+                    _notify_order_staff(order, "order:confirmed", request.user.pk, {order.assigned_cashier_id} - {None})
+                    _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         except ProductStockUnavailable:
             return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
+        if dispatch_error:
+            return dispatch_error
         return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
 
 
@@ -484,28 +530,56 @@ class OrderItemsView(APIView):
             guard = _closed_order_response(order)
             if guard:
                 return guard
-            # Adding a line to an existing order is as much "new food on this
-            # bill" as opening a new order is, so it is blocked the same way.
-            if _locked_bill_for_order(order, actor=request.user):
-                return _bill_locked_response()
             if request.user.role == StaffRole.WAITER and order.assigned_waiter_id != request.user.pk:
                 return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
+            # Adding a line to an existing order is as much "new food on this
+            # bill" as opening a new order is. Reopen a payment request only
+            # after assignment and branch checks have passed.
+            if _locked_bill_for_order(order, actor=request.user):
+                return _bill_locked_response()
             serializer = AddOrderItemSerializer(data=request.data, context={"order": order})
             serializer.is_valid(raise_exception=True)
             item = serializer.save()
             if order.table_id:
                 order.table.open()
-            details = {"item_id": item.pk, "product_id": item.product_id, "quantity": item.quantity}
+            details = {"item_id": item.pk, "item_ids": [item.pk], "product_id": item.product_id, "quantity": item.quantity,
+                       "items": [_item_notice(item)],
+                       "actor_role": request.user.role}
             if request.user.role == StaffRole.WAITER:
                 if order.status == OrderStatus.OPEN:
                     queue_order_for_cashier(order, request.user, "waiter_order_created", details=details)
+                elif order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED):
+                    try:
+                        deduct_stock_for_order_items([item])
+                    except ProductStockUnavailable:
+                        transaction.set_rollback(True)
+                        return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
+                    item.status = OrderItemStatus.FIRED
+                    item.fired_at = timezone.now()
+                    item.save(update_fields=["status", "fired_at", "updated_at"])
+                    record_order_event(order, request.user, "waiter_item_added_and_sent", details=details)
+                    recompute_order_status_from_items(order, request.user, event="additional_items_started")
+                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=details["items"])
+                    _notify_role_staff(order, "order:new_items", {StaffRole.CASHIER}, request.user.pk, items=details["items"])
+                    _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk, items=details["items"])
                 else:
                     record_order_event(order, request.user, "waiter_item_added", details=details)
                     _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item.pk)
                     _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
             elif order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED):
-                record_order_event(order, request.user, "cashier_item_added", details=details)
-                _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_waiter_id} - {None}, change_id=item.pk)
+                try:
+                    deduct_stock_for_order_items([item])
+                except ProductStockUnavailable:
+                    transaction.set_rollback(True)
+                    return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
+                item.status = OrderItemStatus.FIRED
+                item.fired_at = timezone.now()
+                item.save(update_fields=["status", "fired_at", "updated_at"])
+                record_order_event(order, request.user, "cashier_item_added_and_sent", details=details)
+                recompute_order_status_from_items(order, request.user, event="additional_items_added")
+                _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=details["items"])
+                _notify_order_staff(order, "order:new_items", request.user.pk, {order.assigned_waiter_id} - {None}, items=details["items"])
+                _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk, items=details["items"])
             else:
                 queue_order_for_cashier(order, request.user, "item_added", details=details)
         return Response(OrderItemSerializer(item).data, status=status.HTTP_201_CREATED)
@@ -617,14 +691,16 @@ class SendToKitchenView(APIView):
                     OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED,
                 ):
                     return Response({"error": "error.orderTransitionInvalid"}, status=status.HTTP_409_CONFLICT)
+                if not is_additional_batch and order.status != OrderStatus.CONFIRMED:
+                    return Response({"error": "error.orderTransitionInvalid"}, status=status.HTTP_409_CONFLICT)
                 dispatch_error = _dispatch_confirmed_order(
                     order, request.user, move_order_to_sent=not is_additional_batch,
                 )
                 if dispatch_error:
                     return dispatch_error
-                if is_additional_batch and order.status in (OrderStatus.READY, OrderStatus.SERVED):
-                    transition_order(order, OrderStatus.PREPARING, request.user, "additional_items_started")
                 if is_additional_batch:
+                    getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
+                    recompute_order_status_from_items(order, request.user, event="additional_items_started")
                     _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
                     _notify_order_staff(order, "order:changed", request.user.pk)
         except ProductStockUnavailable:
@@ -776,6 +852,11 @@ class OrderItemStatusView(APIView):
 
         previous_order_status = order.status
         previous_item_status = item.status
+        reclassified_waste = 0
+        if new_status == OrderItemStatus.VOIDED:
+            sale_movements = StockMovement.objects.filter(order_item=item, reason=StockMovementReason.SALE)
+            reclassified_waste = sale_movements.count()
+            sale_movements.update(reason=StockMovementReason.WASTE)
         item.status = new_status
         update_fields = ["status", "updated_at"]
         if new_status == OrderItemStatus.READY and item.ready_at is None:
@@ -786,7 +867,8 @@ class OrderItemStatusView(APIView):
             order,
             request.user,
             "kitchen_item_status_changed",
-            details={"item_id": item.pk, "from": previous_item_status, "to": new_status},
+            details={"item_id": item.pk, "from": previous_item_status, "to": new_status,
+                     **({"reclassified_sale_movements_as_waste": reclassified_waste} if new_status == OrderItemStatus.VOIDED else {})},
         )
         getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
         _sync_order_kitchen_status(order, request.user)
@@ -796,7 +878,9 @@ class OrderItemStatusView(APIView):
             _notify_order_staff(order, "order:preparing", request.user.pk)
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         elif new_status == OrderItemStatus.READY and previous_order_status != OrderStatus.READY and order.status == OrderStatus.READY:
-            _notify_order_staff(order, "order:ready", request.user.pk, {order.assigned_waiter_id} - {None})
+            ready_items = _additional_batch_ready_items(order)
+            _notify_order_staff(order, "order:ready", request.user.pk, {order.assigned_waiter_id} - {None},
+                                items=[_item_notice(ready) for ready in ready_items])
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         return Response(OrderItemSerializer(item).data)
 
@@ -857,7 +941,9 @@ class PublicOrderCreateView(APIView):
         # exactly what it scanned or had typed in, unnormalised.
         raw_token = request.data.get("session_token")
         token = parse_qr_payload(raw_token)
-        phone = str(request.data.get("phone", "")).strip()
+        from customers.services import normalize_phone
+        submitted_phone = str(request.data.get("phone", "")).strip()
+        phone = normalize_phone(submitted_phone)
         items_data = request.data.get("items")
         if raw_token and not token:
             return Response({"error": "error.invalidSessionToken"}, status=status.HTTP_400_BAD_REQUEST)
@@ -866,7 +952,9 @@ class PublicOrderCreateView(APIView):
         branch = None
         table = None
         if token:
-            table = get_object_or_404(Table, session_token=token)
+            table = Table.objects.filter(session_token=token).first()
+            if table is None:
+                return Response({"error": "error.invalidSessionToken"}, status=status.HTTP_404_NOT_FOUND)
             branch = table.branch
         else:
             from branches.models import Branch
@@ -897,7 +985,14 @@ class PublicOrderCreateView(APIView):
             }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
             previous = CustomerOrderSubmission.objects.select_for_update().filter(idempotency_key=idempotency_key).first()
             if previous:
-                if previous.request_hash != request_hash:
+                legacy_hash = hashlib.sha256(json.dumps({
+                    "branch": branch.pk,
+                    "table": table.pk if table else None,
+                    "phone": submitted_phone,
+                    "name": str(request.data.get("name", "")),
+                    "items": items_data,
+                }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+                if previous.request_hash not in (request_hash, legacy_hash):
                     return Response({"error": "error.idempotencyKeyConflict"}, status=status.HTTP_409_CONFLICT)
                 order = previous.order
                 return Response(PublicOrderSerializer(order).data, status=status.HTTP_200_OK)
@@ -905,11 +1000,10 @@ class PublicOrderCreateView(APIView):
             customer, _ = find_or_create_customer(branch, phone, request.data.get("name", ""))
             try:
                 if table:
-                    # Each customer checkout is a distinct kitchen ticket. This
-                    # lets guests add another round while an earlier ticket is
-                    # preparing without rewriting or re-queuing that ticket.
+                    # Keep one order per active table session so later rounds
+                    # remain visible on the same waiter ticket and customer tracker.
                     order, created = get_or_create_open_order(
-                        table, customer=customer, source=OrderSource.QR, force_new=True,
+                        table, customer=customer, source=OrderSource.QR, reopen_requested=True,
                     )
                 else:
                     order = Order.objects.create(branch=branch, customer=customer, source=OrderSource.WEB)
@@ -937,18 +1031,24 @@ class PublicOrderCreateView(APIView):
                 item_serializer.is_valid(raise_exception=True)
                 added_items.append(item_serializer.save())
 
-            queue_order_for_cashier(
-                order,
-                None,
-                "customer_order_placed",
-                details={"item_ids": [item.pk for item in added_items]},
-            )
+            details = {
+                "item_ids": [item.pk for item in added_items],
+                "items": [_item_notice(item) for item in added_items],
+                "actor_role": "customer",
+            }
+            dispatched_order = order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED)
+            if dispatched_order:
+                # Keep parent state and assignment intact while the cashier
+                # reviews the new pending batch.
+                record_order_event(order, None, "customer_items_added", details=details)
+            else:
+                queue_order_for_cashier(order, None, "customer_order_placed", details=details)
             CustomerOrderSubmission.objects.create(
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 order=order,
             )
-            _notify_role_staff(order, "order:cashier_review", {StaffRole.CASHIER}, None)
+            _notify_role_staff(order, "order:cashier_review", {StaffRole.CASHIER}, None, items=details["items"])
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, None)
 
             customer.last_order_at = timezone.now()
@@ -961,18 +1061,43 @@ class PublicOrderCreateView(APIView):
 class PublicOrderTrackView(APIView):
     """Public status lookup requiring both the non-sequential order code and phone."""
     permission_classes = [AllowAny]
+    throttle_scope = "public-order-track"
 
     def get(self, request):
         code = str(request.query_params.get("order_code", "")).strip()
         phone = str(request.query_params.get("phone", "")).strip()
-        try:
-            order_id = int(code.removeprefix("ORD-"))
-        except ValueError:
-            order_id = 0
-        order = Order.objects.filter(pk=order_id, customer__phone=phone).prefetch_related("items").first()
-        if order and order.order_code != code:
+        from customers.services import normalize_phone
+        order_id = resolve_order_code(code)
+        if not order_id:
+            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
+        order = Order.objects.filter(pk=order_id).select_related("customer").prefetch_related("items", "history").first()
+        if not phone or not order or not order.customer_id or normalize_phone(order.customer.phone) != normalize_phone(phone):
+            order = None
+        legacy_code = f"ORD-{order_id:08d}" if order else ""
+        if order and order.order_code != code and code.upper() != legacy_code:
             order = None
         if not order:
+            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(PublicOrderSerializer(order).data)
+
+
+class PublicOrderBySessionView(APIView):
+    """Resolve one exact table order with the order code and customer's phone."""
+    permission_classes = [AllowAny]
+
+    def get(self, request, token, order_id):
+        token = parse_qr_payload(token)
+        from customers.services import normalize_phone
+        phone = normalize_phone(request.query_params.get("phone", ""))
+        if not token or not phone:
+            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
+        table = Table.objects.filter(session_token=token).first()
+        if table is None:
+            return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
+        order = Order.objects.filter(pk=order_id, table=table).select_related("customer").prefetch_related("items", "history").first()
+        if order and (not order.customer_id or normalize_phone(order.customer.phone) != phone):
+            order = None
+        if order is None:
             return Response({"error": "error.orderNotFound"}, status=status.HTTP_404_NOT_FOUND)
         return Response(PublicOrderSerializer(order).data)
 

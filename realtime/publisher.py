@@ -1,5 +1,13 @@
 from asgiref.sync import async_to_sync
+from django.db import transaction
 from channels.layers import get_channel_layer
+
+
+def _send_on_commit(channel_layer, group, event):
+    transaction.on_commit(
+        lambda: async_to_sync(channel_layer.group_send)(group, event),
+        robust=True,
+    )
 
 
 def publish_event(branch_id, name, entity_id, table_id=None):
@@ -19,12 +27,17 @@ def publish_event(branch_id, name, entity_id, table_id=None):
     if channel_layer is None:
         return
     if branch_id is not None:
-        async_to_sync(channel_layer.group_send)(
+        _send_on_commit(channel_layer,
             f"branch_{branch_id}_events",
             {"type": "broadcast_event", "name": name, "payload": {"id": entity_id}},
         )
+        if name == "product:updated":
+            _send_on_commit(channel_layer,
+                f"menu_{branch_id}_events",
+                {"type": "broadcast_event", "name": "menu:updated", "payload": {"id": entity_id}},
+            )
     if table_id is not None:
-        async_to_sync(channel_layer.group_send)(
+        _send_on_commit(channel_layer,
             f"table_{table_id}_events",
             {"type": "broadcast_event", "name": name, "payload": {"id": entity_id}},
         )
@@ -35,7 +48,7 @@ def publish_staff_event(staff_id, name, payload):
     channel_layer = get_channel_layer()
     if channel_layer is None or staff_id is None:
         return
-    async_to_sync(channel_layer.group_send)(
+    _send_on_commit(channel_layer,
         f"staff_{staff_id}_events",
         {"type": "broadcast_event", "name": name, "payload": payload},
     )

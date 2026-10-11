@@ -1,4 +1,4 @@
-from .models import OrderHistory, OrderStatus
+from .models import OrderHistory, OrderItemStatus, OrderStatus
 
 
 TERMINAL_ORDER_STATUSES = {OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED}
@@ -72,3 +72,35 @@ def queue_order_for_cashier(order, actor, event, *, details=None):
         details=details,
         extra_fields=fields,
     )
+
+
+def recompute_order_status_from_items(order, actor, *, event="kitchen_status_changed"):
+    """Keep the parent status aligned with every non-voided line, including new batches."""
+    items = [item for item in order.items.all() if item.status != OrderItemStatus.VOIDED]
+    if not items:
+        return
+
+    statuses = [item.status for item in items]
+    if OrderItemStatus.PENDING in statuses:
+        # A fresh line on an already-ready/served order means work has resumed.
+        if order.status in (OrderStatus.READY, OrderStatus.SERVED):
+            transition_order(order, OrderStatus.PREPARING, actor, event)
+        return
+
+    if all(value == OrderItemStatus.SERVED for value in statuses):
+        next_status = OrderStatus.SERVED
+    elif all(value in (OrderItemStatus.READY, OrderItemStatus.SERVED) for value in statuses):
+        next_status = OrderStatus.READY
+    elif OrderItemStatus.PREPARING in statuses or any(
+        value in (OrderItemStatus.READY, OrderItemStatus.SERVED) for value in statuses
+    ):
+        # A new fired/preparing line mixed with an older ready/served line is
+        # an active batch, even though the older line keeps its own status.
+        next_status = OrderStatus.PREPARING
+    elif OrderItemStatus.FIRED in statuses:
+        next_status = OrderStatus.SENT
+    else:
+        return
+
+    if order.status != next_status:
+        transition_order(order, next_status, actor, event)

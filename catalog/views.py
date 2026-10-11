@@ -175,6 +175,14 @@ class PublicMenuView(APIView):
                 and is_available_today(product)
                 and stock_status.get(product.pk, (False, None))[0]
             )
+            has_recipe = product.recipe_items.exists()
+
+            # This endpoint is the customer-facing menu: hidden, unscheduled,
+            # out-of-stock, or unconfigured products should not be sent to
+            # customer clients at all. Staff endpoints still return these
+            # products so the admin can manage them.
+            if not is_orderable or not has_recipe:
+                continue
 
             # current_price() is the single source of truth for deal pricing —
             # also used by AddOrderItemSerializer, so what an order actually
@@ -195,6 +203,7 @@ class PublicMenuView(APIView):
                 "badge": "Deal" if on_deal else product.badge,
                 "is_available": product.is_available,
                 "is_orderable": is_orderable,
+                "has_recipe": has_recipe,
                 # Active variants only — an inactive size must not be
                 # orderable. Each carries its own deal-resolved price via the
                 # same current_price(), so the menu and the order snapshot

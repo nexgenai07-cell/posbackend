@@ -9,6 +9,7 @@ anything.
 """
 
 from decimal import Decimal
+import time
 from unittest import mock
 
 from django.test import TestCase, override_settings
@@ -34,7 +35,7 @@ from orders.models import (
 from tables.models import Table, TableStatus
 
 # A GPS fix sitting exactly on the test branch, for the geofenced QR endpoint.
-AT_THE_RESTAURANT = {"latitude": 24.774265, "longitude": 46.738586, "accuracy_m": 5}
+AT_THE_RESTAURANT = {"latitude": 24.774265, "longitude": 46.738586, "accuracy_m": 5, "location_timestamp": time.time()}
 
 SECRET = "sk_test_dummy"
 PUBLISHABLE = "pk_test_dummy"
@@ -55,14 +56,16 @@ billing_settings = override_settings(
 )
 
 
-def moyasar_payload(bill_id, amount, status="paid", payment_id="pay_1"):
+def moyasar_payload(bill_id, amount, status="paid", payment_id="pay_1", request_at=None):
     """A trimmed version of the real GET /v1/payments/{id} response."""
+    bill = Bill.objects.filter(pk=bill_id).first()
+    request_at = request_at or (bill.pay_requested_at.isoformat() if bill and bill.pay_requested_at else None)
     return {
         "id": payment_id,
         "status": status,
         "amount": amount,
         "currency": "SAR",
-        "metadata": {"bill_id": str(bill_id)},
+        "metadata": {"bill_id": str(bill_id), "payment_request_at": request_at},
         "source": {"type": "creditcard", "company": "mada"},
     }
 
@@ -70,6 +73,9 @@ def moyasar_payload(bill_id, amount, status="paid", payment_id="pay_1"):
 @billing_settings
 class BillingTestBase(TestCase):
     def setUp(self):
+        # The module-level location payload may outlive the QR endpoint's
+        # freshness window during a long full-suite run.
+        AT_THE_RESTAURANT["location_timestamp"] = time.time()
         self.client = APIClient()
         # PublicOrderCreateView geofences every QR order, and a branch with no
         # coordinates is rejected outright (error.locationNotConfigured). Give
@@ -151,6 +157,13 @@ class BillTotalTests(BillingTestBase):
         self._item(self.order, quantity=10, status=OrderItemStatus.VOIDED)
         self.assertEqual(bill_total(self.bill), Decimal("51.00"))
 
+    def test_customer_bill_response_total_excludes_voided_items(self):
+        self._item(self.order, quantity=10, status=OrderItemStatus.VOIDED)
+        response = self.client.get(f"/api/bills/by-session/{self.table.session_token}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total"], "51.00")
+        self.assertEqual(response.data["id"], self.bill.pk)
+
     def test_total_spans_multiple_orders(self):
         second = self._order(self.bill, OrderStatus.SERVED)
         self._item(second, quantity=1, price=Decimal("10.05"))
@@ -186,7 +199,7 @@ class RequestPayTests(BillingTestBase):
         self.assertEqual(response.data["publishable_key"], PUBLISHABLE)
         self.assertEqual(
             response.data["callback_url"],
-            f"https://web.example.test/pay/callback?t={self.table.session_token}",
+            f"https://web.example.test/pay/callback?t={self.table.session_token}&bill_id={self.bill.pk}",
         )
 
     def test_secret_key_never_appears_in_a_response(self):
@@ -259,7 +272,7 @@ class RequestPayTests(BillingTestBase):
 
 
 class BillLockTests(BillingTestBase):
-    """Requirement 1: once pay_requested, nothing new goes on the bill."""
+    """A new order round cancels a stale payment request before changing the total."""
 
     def request_cash(self):
         self.client.post(
@@ -267,45 +280,61 @@ class BillLockTests(BillingTestBase):
             {"session_token": self.table.session_token, "method": "cash"}, format="json",
         )
 
-    def test_customer_cannot_place_a_new_qr_order(self):
+    def test_customer_addition_reopens_cash_request_and_appends_to_active_order(self):
+        self.request_cash()
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        layer = get_channel_layer()
+        cashier_channel = async_to_sync(layer.new_channel)()
+        async_to_sync(layer.group_add)(f"staff_{self.cashier.pk}_events", cashier_channel)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post("/api/orders/qr/", {
+                "session_token": self.table.session_token,
+                "phone": "0500000000",
+                "request_id": "abc-123",
+                "items": [{"product": self.product.pk, "quantity": 1}],
+                **AT_THE_RESTAURANT,
+            }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["id"], self.order.pk)
+        cancellation = async_to_sync(layer.receive)(cashier_channel)
+        self.assertEqual(cancellation["name"], "bill:pay_cancelled")
+        self.assertEqual(cancellation["payload"]["cancelled_total"], "51.00")
+        self.refresh()
+        self.assertEqual(self.bill.status, BillStatus.OPEN)
+        self.assertEqual(self.order.items.count(), 2)
+        current = self.client.get(f"/api/bills/by-session/{self.table.session_token}/")
+        self.assertTrue(current.data["payment_request_cancelled_by_add"])
+
+    def test_customer_addition_clears_needs_bill_table_state(self):
         self.request_cash()
         response = self.client.post("/api/orders/qr/", {
-            "session_token": self.table.session_token,
-            "phone": "0500000000",
-            "request_id": "abc-123",
-            "items": [{"product": self.product.pk, "quantity": 1}],
-            **AT_THE_RESTAURANT,
-        }, format="json")
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.data["error"], "error.billLocked")
-
-    def test_refusing_a_qr_order_leaves_the_table_on_needs_bill(self):
-        """A `return` inside transaction.atomic() commits, so the refused
-        request must not have flipped the table back to `occupied` first."""
-        self.request_cash()
-        self.client.post("/api/orders/qr/", {
             "session_token": self.table.session_token, "phone": "0500000000",
             "request_id": "abc-124", "items": [{"product": self.product.pk, "quantity": 1}],
             **AT_THE_RESTAURANT,
         }, format="json")
         self.refresh()
-        self.assertEqual(self.table.status, TableStatus.NEEDS_BILL)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.table.status, TableStatus.OCCUPIED)
 
-    def test_pos_cannot_open_a_new_order_on_the_table(self):
+    def test_opening_pos_order_does_not_cancel_request_before_an_item_is_added(self):
         self.request_cash()
         response = self.as_staff(self.cashier).post(
             "/api/orders/", {"table": self.table.pk}, format="json"
         )
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.data["error"], "error.billLocked")
+        self.assertEqual(response.status_code, 200)
+        self.refresh()
+        self.assertEqual(self.bill.status, BillStatus.PAY_REQUESTED)
 
-    def test_staff_cannot_add_an_item_to_an_existing_order(self):
+    def test_staff_adds_after_cash_request_and_dispatches_without_old_amount_lock(self):
         self.request_cash()
         response = self.as_staff(self.cashier).post(
             f"/api/orders/{self.order.pk}/items/", {"product": self.product.pk, "quantity": 1}, format="json"
         )
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.data["error"], "error.billLocked")
+        self.assertEqual(response.status_code, 201)
+        self.refresh()
+        self.assertEqual(self.bill.status, BillStatus.OPEN)
+        self.assertEqual(response.data["status"], OrderItemStatus.FIRED)
 
     def test_ordering_works_again_after_the_bill_is_reopened(self):
         self.request_cash()
@@ -314,6 +343,22 @@ class BillLockTests(BillingTestBase):
             f"/api/orders/{self.order.pk}/items/", {"product": self.product.pk, "quantity": 1}, format="json"
         )
         self.assertEqual(response.status_code, 201)
+
+    def test_stale_bill_page_cannot_request_or_cancel_a_different_bill(self):
+        wrong_request = self.client.post("/api/bills/request-pay/", {
+            "session_token": self.table.session_token, "bill_id": self.bill.pk + 1, "method": "cash",
+        }, format="json")
+        self.assertEqual(wrong_request.status_code, 409)
+        self.assertEqual(wrong_request.data["error"], "error.billSessionEnded")
+        self.assertEqual(Bill.objects.get(pk=self.bill.pk).status, BillStatus.OPEN)
+
+        self.request_cash()
+        wrong_cancel = self.client.post("/api/bills/cancel-pay-request/", {
+            "session_token": self.table.session_token, "bill_id": self.bill.pk + 1,
+        }, format="json")
+        self.assertEqual(wrong_cancel.status_code, 409)
+        self.assertEqual(wrong_cancel.data["error"], "error.billSessionEnded")
+        self.assertEqual(Bill.objects.get(pk=self.bill.pk).status, BillStatus.PAY_REQUESTED)
 
 
 @mock.patch("orders.moyasar.fetch_payment")
@@ -343,6 +388,43 @@ class VerifyOnlineTests(BillingTestBase):
         self.assertEqual(self.order.status, OrderStatus.PAID)
         self.assertEqual(self.order.payment_status, PaymentStatus.PAID)
         self.assertEqual(Payment.objects.filter(order=self.order).count(), 1)
+
+    def test_old_online_payment_cannot_settle_and_new_request_uses_updated_total(self, fetch):
+        old_request_at = Bill.objects.get(pk=self.bill.pk).pay_requested_at.isoformat()
+        added = self.as_staff(self.cashier).post(
+            f"/api/orders/{self.order.pk}/items/", {"product": self.product.pk, "quantity": 1}, format="json",
+        )
+        self.assertEqual(added.status_code, 201)
+        self.refresh()
+        self.assertEqual(self.bill.status, BillStatus.OPEN)
+
+        OrderItem.objects.filter(order=self.order).update(status=OrderItemStatus.SERVED)
+        Order.objects.filter(pk=self.order.pk).update(status=OrderStatus.SERVED)
+        fresh_request = self.client.post(
+            "/api/bills/request-pay/", {"session_token": self.table.session_token, "method": "online"}, format="json",
+        )
+        self.assertEqual(fresh_request.status_code, 200)
+        self.assertEqual(fresh_request.data["total"], "76.50")
+
+        # Even if the stale hosted form returns an amount matching the new bill,
+        # its request timestamp belongs to the canceled payment attempt.
+        fetch.return_value = moyasar_payload(self.bill.pk, 7650, payment_id="old-pay", request_at=old_request_at)
+        stale = self.verify("old-pay")
+        self.assertEqual(stale.status_code, 200)
+        self.assertEqual(stale.data["result"], "needs_review")
+        self.refresh()
+        self.assertEqual(self.bill.status, BillStatus.PAY_REQUESTED)
+        self.assertFalse(Payment.objects.exists())
+        stale_record = MoyasarPayment.objects.get(payment_id="old-pay")
+        self.assertTrue(stale_record.needs_review)
+        self.assertIn("previous request", stale_record.review_reason)
+
+        fetch.return_value = moyasar_payload(self.bill.pk, 7650, payment_id="fresh-pay")
+        settled = self.verify("fresh-pay")
+        self.assertEqual(settled.status_code, 200)
+        self.assertEqual(settled.data["result"], "settled")
+        self.refresh()
+        self.assertEqual(self.bill.total_at_payment, Decimal("76.50"))
 
     def test_query_status_is_never_trusted(self, fetch):
         """The redirect says paid; the API says failed. The API wins."""
@@ -556,6 +638,24 @@ class CashierActionTests(BillingTestBase):
         self.assertEqual(response.data["result"], "already_processed")
         self.assertEqual(Payment.objects.count(), 1)
 
+    def test_requesting_cash_twice_then_settling_writes_one_payment(self):
+        first = self.client.post(
+            "/api/bills/request-pay/", {"session_token": self.table.session_token, "method": "cash"}, format="json",
+        )
+        second = self.client.post(
+            "/api/bills/request-pay/", {"session_token": self.table.session_token, "method": "cash"}, format="json",
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(Payment.objects.exists())
+
+        url = f"/api/bills/{self.bill.pk}/mark-paid/"
+        settled = self.as_staff(self.cashier).post(url, {"method": "cash"}, format="json")
+        repeated = self.as_staff(self.cashier).post(url, {"method": "cash"}, format="json")
+        self.assertEqual(settled.data["result"], "settled")
+        self.assertEqual(repeated.data["result"], "already_processed")
+        self.assertEqual(Payment.objects.filter(order=self.order).count(), 1)
+
     def test_waiter_cannot_settle(self):
         self.request_cash()
         response = self.as_staff(self.waiter).post(
@@ -668,6 +768,7 @@ class BillBySessionTests(BillingTestBase):
         self.assertEqual(response.data["total"], "51.00")
         self.assertEqual(response.data["total_halalas"], 5100)
         self.assertEqual(response.data["currency"], "SAR")
+        self.assertEqual(response.data["id"], self.bill.pk)
         self.assertTrue(response.data["ready_to_pay"])
 
     def test_unserved_orders_block_the_pay_button(self):
@@ -713,3 +814,23 @@ class OpenBillLifecycleTests(BillingTestBase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Bill.objects.filter(table=self.table).count(), 2)
         self.assertEqual(Bill.objects.filter(table=self.table, status=BillStatus.OPEN).count(), 1)
+
+    def test_old_bill_lookup_after_release_never_returns_a_new_bill_as_the_old_one(self):
+        old_bill_id = self.bill.pk
+        self.client.post(
+            "/api/bills/request-pay/",
+            {"session_token": self.table.session_token, "method": "cash"}, format="json",
+        )
+        self.as_staff(self.cashier).post(f"/api/bills/{old_bill_id}/mark-paid/", {"method": "cash"}, format="json")
+        self.as_staff(self.cashier).post(f"/api/bills/{old_bill_id}/release-table/", format="json")
+        self.client.force_authenticate(user=None)
+
+        created = self.client.post("/api/orders/qr/", {
+            "session_token": self.table.session_token, "phone": "0500000002",
+            "request_id": "r10", "items": [{"product": self.product.pk, "quantity": 1}],
+            **AT_THE_RESTAURANT,
+        }, format="json")
+        self.assertEqual(created.status_code, 201)
+        current = self.client.get(f"/api/bills/by-session/{self.table.session_token}/")
+        self.assertNotEqual(current.data["id"], old_bill_id)
+        self.assertEqual(created.data["bill_id"], current.data["id"])
