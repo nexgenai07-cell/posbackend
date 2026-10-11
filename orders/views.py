@@ -391,10 +391,22 @@ class CashierReviewView(APIView):
                         return Response({"error": "error.orderNotAwaitingCashier"}, status=status.HTTP_409_CONFLICT)
                     if not order.items.exclude(status=OrderItemStatus.VOIDED).exists():
                         return Response({"error": "error.orderHasNoItems"}, status=status.HTTP_409_CONFLICT)
+                    # Optional `waiter`: review and assign in one step, so the
+                    # cashier is not asked to "review" and then "assign".
+                    extra = {"assigned_cashier": request.user}
+                    waiter = None
+                    waiter_id = request.data.get("waiter")
+                    if waiter_id:
+                        waiter = get_object_or_404(Staff, pk=waiter_id, branch=request.user.branch,
+                                                   role=StaffRole.WAITER, is_active=True)
+                        extra["assigned_waiter"] = waiter
                     conflict = _transition_or_conflict(order, OrderStatus.AWAITING_WAITER, request.user,
-                        "cashier_reviewed", extra_fields={"assigned_cashier": request.user})
+                        "cashier_reviewed", extra_fields=extra,
+                        details={"waiter": waiter.pk} if waiter else None)
                     if conflict:
                         return conflict
+                    if waiter:
+                        _notify_order_staff(order, "order:assigned", request.user.pk, {waiter.pk})
         except ProductStockUnavailable:
             return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
@@ -619,13 +631,22 @@ class OrderItemDetailView(APIView):
             if quantity <= 0:
                 details = {"item_id": item.pk, "product_id": item.product_id, **before}
                 item.delete()
+                emptied = not order.items.exclude(status=OrderItemStatus.VOIDED).exists()
                 if request.user.role == StaffRole.WAITER:
                     record_order_event(order, request.user, "waiter_item_removed", details=details)
-                    _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item_id)
-                    _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                    if emptied:
+                        # Nothing left for the waiter to confirm: hand the order
+                        # back to the cashier (this also unassigns the waiter,
+                        # so it leaves their list), who cancels it or adds items.
+                        queue_order_for_cashier(order, request.user, "order_emptied", details=details)
+                    else:
+                        _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item_id)
+                        _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
                 else:
                     record_order_event(order, request.user, "item_removed", details=details)
                     queue_order_for_cashier(order, request.user, "order_revised")
+                if emptied:
+                    _notify_role_staff(order, "order:empty", {StaffRole.CASHIER, StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
                 return Response(status=status.HTTP_204_NO_CONTENT)
             available, _reason = check_product_stock(item.product, quantity)
             if not is_available_today(item.product):

@@ -140,6 +140,11 @@ class ProductDealView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+# The public menu reports how many of an item can still be added, capped so it
+# never discloses real stock levels — enough for the page to stop "+" in time.
+PUBLIC_QUANTITY_CAP = 20
+
+
 class PublicMenuView(APIView):
     """
     Public (AllowAny) — today's available menu for a branch, with active deal
@@ -175,6 +180,7 @@ class PublicMenuView(APIView):
         )
         products = list(products)
         stock_status = check_products_stock(products)
+        units = orderable_units(products)
 
         by_category = {}
         for product in products:
@@ -183,7 +189,8 @@ class PublicMenuView(APIView):
                 and is_available_today(product)
                 and stock_status.get(product.pk, (False, None))[0]
             )
-            has_recipe = product.recipe_items.exists()
+            # .all() reuses the prefetched recipe; .exists() queried per product.
+            has_recipe = bool(product.recipe_items.all())
 
             # This endpoint is the customer-facing menu: hidden, unscheduled,
             # out-of-stock, or unconfigured products should not be sent to
@@ -211,6 +218,10 @@ class PublicMenuView(APIView):
                 "badge": "Deal" if on_deal else product.badge,
                 "is_available": product.is_available,
                 "is_orderable": is_orderable,
+                # How many the customer can still add, so the menu and cart
+                # disable "+" at the limit. Capped: this endpoint is public,
+                # and the exact stock level is not a customer's business.
+                "available_quantity": min(units.get(product.pk, 0), PUBLIC_QUANTITY_CAP),
                 "has_recipe": has_recipe,
                 # Active variants only — an inactive size must not be
                 # orderable. Each carries its own deal-resolved price via the
@@ -228,6 +239,10 @@ class PublicMenuView(APIView):
                         "original_price": str(variant.price) if current_price(product, variant) != variant.price else None,
                         "on_deal": current_price(product, variant) != variant.price,
                         "is_orderable": is_orderable and check_product_stock(product, 1, variant=variant)[0],
+                        "available_quantity": min(
+                            orderable_units([product], multiplier=variant.recipe_multiplier).get(product.pk, 0),
+                            PUBLIC_QUANTITY_CAP,
+                        ) if is_orderable else 0,
                     }
                     for variant in product.variants.all()
                     if variant.is_active

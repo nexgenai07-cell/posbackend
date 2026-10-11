@@ -119,23 +119,25 @@ def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
     return availability
 
 
-def orderable_units(products):
+def orderable_units(products, *, multiplier=None):
     """
-    How many whole units of each product current stock can make (base recipe),
-    by product id — 0 when out of stock or the recipe is missing/invalid.
+    How many whole units of each product current stock can make, by product
+    id — 0 when out of stock or the recipe is missing/invalid. `multiplier`
+    scales the recipe for one variant (variant_multiplier(variant)).
 
-    Lets a POS disable "+" / "Add" at the limit instead of letting staff tap
-    and then refusing with error.productUnavailable. Same rules as
-    check_products_stock(); nothing is reserved.
+    Lets a POS / the customer menu disable "+" / "Add" at the limit instead of
+    tapping and then being refused with error.productUnavailable. Same rules
+    as check_products_stock(); nothing is reserved.
     """
+    scale = Decimal(str(multiplier)) if multiplier else Decimal("1")
     items, per_product = _per_unit_requirements(products)
     units = {}
     for product_id, requirement in per_product.items():
-        if isinstance(requirement, str) or not requirement:
+        if isinstance(requirement, str) or not requirement or scale <= 0:
             units[product_id] = 0
             continue
         units[product_id] = max(0, min(
-            int(items[item_id].current_stock // required) if items[item_id].current_stock > 0 else 0
+            int(items[item_id].current_stock // (required * scale)) if items[item_id].current_stock > 0 else 0
             for item_id, required in requirement.items()
         ))
     return units

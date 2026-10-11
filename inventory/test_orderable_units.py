@@ -40,3 +40,19 @@ class OrderableUnitsTests(TestCase):
         rows = {row["id"]: row for row in client.get("/api/products/").json()["results"]}
         self.assertEqual((rows[self.burger.pk]["is_orderable"], rows[self.burger.pk]["available_quantity"]), (True, 6))
         self.assertEqual((rows[self.no_recipe.pk]["is_orderable"], rows[self.no_recipe.pk]["available_quantity"]), (False, 0))
+
+
+    def test_public_menu_reports_capped_quantity_per_product_and_variant(self):
+        from catalog.models import ProductVariant
+
+        ProductVariant.objects.create(product=self.burger, name_en="Double", name_ar="Double", price=18,
+                                      recipe_multiplier=Decimal("2.000"))
+        rows = APIClient().get("/api/menu/", {"branch": self.branch.pk}).json()
+        burger = next(item for category in rows["categories"] for item in category["products"] if item["id"] == self.burger.pk)
+        self.assertEqual(burger["available_quantity"], 6)             # min(7 buns, 6 beef)
+        self.assertEqual(burger["variants"][0]["available_quantity"], 3)  # double recipe -> 1000g / 300g
+        InventoryItem.objects.filter(pk=self.bun.pk).update(current_stock=500)
+        InventoryItem.objects.filter(pk=self.beef.pk).update(current_stock=Decimal("100.000"))
+        rows = APIClient().get("/api/menu/", {"branch": self.branch.pk}).json()
+        burger = next(item for category in rows["categories"] for item in category["products"] if item["id"] == self.burger.pk)
+        self.assertEqual(burger["available_quantity"], 20)  # capped on the public endpoint

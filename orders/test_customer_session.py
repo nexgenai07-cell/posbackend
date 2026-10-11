@@ -465,3 +465,34 @@ class ConsistencyTests(CustomerSessionTestCase):
         self.assertEqual(entry.details["message"], "Line voided after dispatch, stock moved to waste")
         self.assertEqual(entry.details["waste_movements"], 1)
         self.assertEqual(StockMovement.objects.get(order_item_id=fries_id).reason, "waste")
+
+
+# ===================================================================== review
+class ReviewAndEmptyOrderTests(CustomerSessionTestCase):
+    def test_cashier_review_can_assign_the_waiter_in_one_step(self):
+        order_id = self.qr(self.new_table()).json()["id"]
+        response = self.cashier_client.post(f"/api/orders/{order_id}/cashier-review/", {"waiter": self.waiter.pk}, format="json")
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(pk=order_id)
+        self.assertEqual((order.status, order.assigned_waiter_id), ("awaiting_waiter", self.waiter.pk))
+        # The waiter can confirm straight away — no separate assign call.
+        self.assertEqual(self.waiter_client.post(f"/api/orders/{order_id}/waiter-confirm/").status_code, 200)
+
+    def test_waiter_removing_the_last_item_returns_the_order_to_the_cashier(self):
+        from unittest.mock import patch
+
+        body = self.qr(self.new_table()).json()
+        order_id, item_id = body["id"], body["items"][0]["id"]
+        self.cashier_client.post(f"/api/orders/{order_id}/cashier-review/", {"waiter": self.waiter.pk}, format="json")
+        sent = []
+        with patch("orders.views.publish_staff_event", side_effect=lambda staff_id, name, payload: sent.append((staff_id, name))):
+            response = self.waiter_client.patch(f"/api/orders/{order_id}/items/{item_id}/", {"quantity": 0}, format="json")
+        self.assertEqual(response.status_code, 204)
+        order = Order.objects.get(pk=order_id)
+        self.assertEqual((order.status, order.assigned_waiter_id), ("pending_cashier", None))
+        self.assertNotIn(order_id, [row["id"] for row in self.waiter_client.get("/api/orders/").json()["results"]])
+        notified = {staff_id for staff_id, name in sent if name == "order:empty"}
+        self.assertEqual(notified, {self.cashier.pk, self.manager.pk})
+        # Reviewing an empty order is refused with a clear code.
+        empty = self.cashier_client.post(f"/api/orders/{order_id}/cashier-review/")
+        self.assertEqual((empty.status_code, empty.json()["error"]), (409, "error.orderHasNoItems"))
