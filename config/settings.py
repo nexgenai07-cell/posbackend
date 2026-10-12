@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     'purchasing',
     'customers',
     'reports',
+    'reviews',
     'realtime',
 ]
 
@@ -205,6 +206,9 @@ REST_FRAMEWORK = {
         # verification, which costs us an outbound Moyasar API call per hit.
         'bill-pay': '20/min',
         'bill-verify': '30/min',
+        # POST /api/reviews/qr/ — one review per bill, so a guest submits once;
+        # the headroom covers a typo'd phone or a shared restaurant wifi IP.
+        'review': '10/min',
     },
 }
 
