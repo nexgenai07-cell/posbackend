@@ -125,11 +125,24 @@ DATABASES = {
 # Neon on every request (~0.5-1s each). Daphne serves over ASGI, where
 # CONN_MAX_AGE persistent connections aren't reused, so this uses psycopg 3's
 # pool. CONN_MAX_AGE must stay 0 with a pool.
+#
+# Neon closes idle connections (and suspends the whole compute when idle), so
+# a pooled connection can be dead by the time a request borrows it — which
+# surfaced as "SSL connection has been closed unexpectedly" on the first
+# request after a quiet spell. Hence:
+# - check: ping each connection as it is handed out; a dead one is discarded
+#   and replaced instead of failing the request;
+# - max_idle / max_lifetime: retire connections before Neon cuts them.
 if DATABASES['default']['ENGINE'] == 'django.db.backends.postgresql':
+    from psycopg_pool import ConnectionPool
+
     DATABASES['default'].setdefault('OPTIONS', {})['pool'] = {
         'min_size': env.int('DB_POOL_MIN_SIZE', default=2),
         'max_size': env.int('DB_POOL_MAX_SIZE', default=10),
         'timeout': 10,
+        'check': ConnectionPool.check_connection,
+        'max_idle': env.int('DB_POOL_MAX_IDLE', default=120),
+        'max_lifetime': env.int('DB_POOL_MAX_LIFETIME', default=1800),
     }
     DATABASES['default']['CONN_MAX_AGE'] = 0
     # Neon's "-pooler" host is PgBouncer in transaction mode, which can't hold
