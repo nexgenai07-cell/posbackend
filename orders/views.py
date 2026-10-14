@@ -113,6 +113,29 @@ def _order_queryset():
     ).prefetch_related("items", "payments", "history")
 
 
+def _filter_opened_between(qs, request):
+    """Apply ?from=YYYY-MM-DD&to=YYYY-MM-DD (inclusive, in the branch's own
+    timezone) to opened_at. A malformed date matches nothing rather than
+    silently returning everything."""
+    date_from = request.query_params.get("from")
+    date_to = request.query_params.get("to")
+    if not (date_from or date_to):
+        return qs
+    try:
+        branch_tz = ZoneInfo(request.user.branch.timezone)
+        start_day = parse_date(date_from) if date_from else None
+        end_day = parse_date(date_to) if date_to else None
+        if (date_from and start_day is None) or (date_to and end_day is None):
+            return qs.none()
+        if start_day:
+            qs = qs.filter(opened_at__gte=datetime.combine(start_day, time.min, tzinfo=branch_tz))
+        if end_day:
+            qs = qs.filter(opened_at__lt=datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=branch_tz))
+    except (ZoneInfoNotFoundError, ValueError):
+        return qs.none()
+    return qs
+
+
 def _get_table_or_404(pk, branch):
     return get_object_or_404(Table, pk=pk, branch=branch)
 
@@ -273,23 +296,7 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
             order_id = resolve_order_code(search)
             qs = qs.filter(pk=order_id) if order_id else qs.none()
 
-        date_from = self.request.query_params.get("from")
-        date_to = self.request.query_params.get("to")
-        if date_from or date_to:
-            try:
-                branch_tz = ZoneInfo(self.request.user.branch.timezone)
-                start_day = parse_date(date_from) if date_from else None
-                end_day = parse_date(date_to) if date_to else None
-                if (date_from and start_day is None) or (date_to and end_day is None):
-                    return qs.none()
-                if start_day:
-                    qs = qs.filter(opened_at__gte=datetime.combine(start_day, time.min, tzinfo=branch_tz))
-                if end_day:
-                    qs = qs.filter(opened_at__lt=datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=branch_tz))
-            except (ZoneInfoNotFoundError, ValueError):
-                return qs.none()
-
-        return qs.order_by("-opened_at")
+        return _filter_opened_between(qs, self.request).order_by("-opened_at")
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -821,14 +828,49 @@ class CloseOrderView(APIView):
 class KitchenTicketsView(ListAPIView):
     """Orders with at least one item still needing kitchen attention. Order-
     level status (open/sent/closed/...) stays POS's concern — this doesn't
-    touch it, only item-level status via OrderItemStatusView below."""
+    touch it, only item-level status via OrderItemStatusView below.
+
+    ?scope=history switches to the kitchen log: every order that had anything
+    fired to the kitchen, newest first, with all of its fired lines whatever
+    became of them. Either scope narrows by ?from= / ?to= (opened date),
+    ?table=<id>, ?type=dine_in|takeaway|qr|web and ?search=<order number>."""
 
     serializer_class = KitchenTicketOrderSerializer
     permission_classes = [IsKitchenStaff]
 
+    def _scope(self):
+        return "history" if self.request.query_params.get("scope") == "history" else "live"
+
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), "scope": self._scope()}
+
     def get_queryset(self):
-        active = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
-        return _order_queryset().filter(branch=self.request.user.branch, items__status__in=active).distinct()
+        qs = Order.objects.select_related("table", "assigned_waiter", "assigned_cashier").prefetch_related(
+            "history", "items__variant", "items__product__recipe_items__inventory_item",
+        ).filter(branch=self.request.user.branch)
+        if self._scope() == "history":
+            qs = qs.filter(items__fired_at__isnull=False).distinct().order_by("-opened_at")
+        else:
+            active = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
+            qs = qs.filter(items__status__in=active).distinct()
+
+        params = self.request.query_params
+        if params.get("table"):
+            qs = qs.filter(table_id=params["table"])
+        order_type = params.get("type")
+        if order_type == "dine_in":
+            qs = qs.filter(source=OrderSource.POS, table__isnull=False)
+        elif order_type == "takeaway":
+            qs = qs.filter(source=OrderSource.POS, table__isnull=True)
+        elif order_type in (OrderSource.QR, OrderSource.WEB):
+            qs = qs.filter(source=order_type)
+        elif order_type:
+            return qs.none()
+        search = params.get("search", "").strip()
+        if search:
+            order_id = resolve_order_code(search)
+            qs = qs.filter(pk=order_id) if order_id else qs.none()
+        return _filter_opened_between(qs, self.request)
 
 
 _KDS_ITEM_TRANSITIONS = {

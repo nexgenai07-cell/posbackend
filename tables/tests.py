@@ -1154,3 +1154,83 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
         kitchen_ids = set(Staff.objects.filter(branch=self.riyadh, role=StaffRole.KITCHEN).values_list("id", flat=True))
         self.assertIn(kitchen_events[0].args[0], kitchen_ids)
 
+
+
+class KitchenTicketDetailTests(TablesApiTestCase):
+    """What a KDS ticket carries: where it came from, the portion ordered,
+    the recipe scaled for that portion, and a date-filtered kitchen log."""
+
+    def setUp(self):
+        super().setUp()
+        self.waiter = make_staff(self.riyadh, "Sara", StaffRole.WAITER, "4444")
+        self.kitchen = make_staff(self.riyadh, "Ali", StaffRole.KITCHEN, "6666")
+
+    def _fired_order(self, item_status="fired", **order_fields):
+        from django.utils import timezone
+        from catalog.models import ProductVariant
+        from orders.models import Order, OrderItem
+
+        variant = ProductVariant.objects.create(
+            product=self.product, name_en="Double", name_ar="دبل", price="40.00", recipe_multiplier="2.000",
+        )
+        order = Order.objects.create(
+            branch=self.riyadh, table=self.open_table, assigned_waiter=self.waiter, **order_fields,
+        )
+        item = OrderItem.objects.create(
+            order=order, product=self.product, variant=variant,
+            name_en_snapshot="Smash Burger", name_ar_snapshot="سماش برغر",
+            variant_name_en_snapshot="Double", variant_name_ar_snapshot="دبل",
+            price_snapshot="40.00", quantity=3, status=item_status, notes="No onion",
+            fired_at=timezone.now(),
+        )
+        return order, item
+
+    def test_live_ticket_carries_table_waiter_variant_and_scaled_recipe(self):
+        order, item = self._fired_order()
+        self.auth_as(self.kitchen, "6666")
+        ticket = next(row for row in self.client.get("/api/kds/tickets/").json()["results"] if row["id"] == order.pk)
+
+        self.assertEqual(ticket["table_label_en"], "Table 3")
+        self.assertEqual(ticket["assigned_waiter_name"], "Sara")
+        self.assertEqual(ticket["source"], "pos")
+        line = ticket["items"][0]
+        self.assertEqual(line["variant_name_en_snapshot"], "Double")
+        self.assertEqual(line["notes"], "No onion")
+        self.assertEqual(line["recipe_multiplier"], "2.000")
+        # 1 patty per recipe x 2 (Double) x 3 ordered = 6, with the inputs shown.
+        self.assertEqual(line["recipe"], [{
+            "inventory_item": line["recipe"][0]["inventory_item"], "name": "Burger patty", "unit": "unit",
+            "per_portion": "1.000", "total": "6.000",
+        }])
+
+    def test_history_scope_lists_finished_orders_filtered_by_date(self):
+        from datetime import datetime, timezone as datetime_timezone
+        from orders.models import Order
+
+        order, _ = self._fired_order(item_status="served")
+        Order.objects.filter(pk=order.pk).update(opened_at=datetime(2026, 10, 2, 22, 30, tzinfo=datetime_timezone.utc))
+        self.auth_as(self.kitchen, "6666")
+
+        live = self.client.get("/api/kds/tickets/").json()["results"]
+        self.assertNotIn(order.pk, [row["id"] for row in live])
+        # 22:30 UTC on the 2nd is the 3rd in Riyadh.
+        in_range = self.client.get("/api/kds/tickets/?scope=history&from=2026-10-03&to=2026-10-03").json()["results"]
+        out_of_range = self.client.get("/api/kds/tickets/?scope=history&from=2026-10-02&to=2026-10-02").json()["results"]
+        ticket = next(row for row in in_range if row["id"] == order.pk)
+        self.assertEqual(ticket["items"][0]["status"], "served")
+        self.assertNotIn(order.pk, [row["id"] for row in out_of_range])
+
+    def test_filters_narrow_by_table_type_and_order_number(self):
+        order, _ = self._fired_order()
+        self.auth_as(self.kitchen, "6666")
+
+        def ids(query):
+            return [row["id"] for row in self.client.get(f"/api/kds/tickets/?{query}").json()["results"]]
+
+        self.assertIn(order.pk, ids(f"table={self.open_table.pk}"))
+        self.assertNotIn(order.pk, ids(f"table={self.empty_table.pk}"))
+        self.assertIn(order.pk, ids("type=dine_in"))
+        self.assertNotIn(order.pk, ids("type=takeaway"))
+        self.assertNotIn(order.pk, ids("type=qr"))
+        self.assertIn(order.pk, ids(f"search={order.pk}"))
+        self.assertEqual(ids("type=bogus"), [])

@@ -5,7 +5,7 @@ from rest_framework import serializers
 from catalog.models import Product, ProductVariant
 from catalog.services import current_price, is_available_today
 from common.exceptions import ConflictCode
-from inventory.services import check_product_stock
+from inventory.services import check_product_stock, variant_multiplier
 
 from .models import Order, OrderHistory, OrderItem, OrderItemStatus, Payment
 
@@ -183,30 +183,77 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class KitchenTicketItemSerializer(serializers.ModelSerializer):
+    """One line as the cook needs it: the portion ordered and what goes into it.
+
+    `recipe` lists the product's CURRENT recipe in recipe units (g, ml, pcs —
+    what the cook measures in), with the arithmetic spelled out rather than
+    pre-multiplied: per_portion x recipe_multiplier x quantity = total. The
+    multiplier is the variant's (1 KG = 2 x Half KG); 1 for unvarianted lines.
+    """
+
+    recipe_multiplier = serializers.SerializerMethodField()
+    recipe = serializers.SerializerMethodField()
+
     class Meta:
         model = OrderItem
-        fields = ["id", "name_en_snapshot", "name_ar_snapshot", "quantity", "status", "notes", "fired_at", "ready_at"]
+        fields = [
+            "id", "product", "name_en_snapshot", "name_ar_snapshot",
+            "variant_name_en_snapshot", "variant_name_ar_snapshot",
+            "quantity", "status", "notes", "fired_at", "ready_at",
+            "recipe_multiplier", "recipe",
+        ]
         read_only_fields = fields
+
+    def get_recipe_multiplier(self, item):
+        return str(variant_multiplier(item.variant))
+
+    def get_recipe(self, item):
+        multiplier = variant_multiplier(item.variant)
+        return [
+            {
+                "inventory_item": line.inventory_item_id,
+                "name": line.inventory_item.name,
+                "unit": line.unit,
+                "per_portion": str(line.quantity),
+                "total": str((line.quantity * multiplier * item.quantity).quantize(Decimal("0.001"))),
+            }
+            for line in item.product.recipe_items.all()
+        ]
 
 
 class KitchenTicketOrderSerializer(serializers.ModelSerializer):
     items = serializers.SerializerMethodField()
+    table_label_en = serializers.CharField(source="table.label_en", default=None, read_only=True)
+    table_label_ar = serializers.CharField(source="table.label_ar", default=None, read_only=True)
+    assigned_waiter_name = serializers.CharField(source="assigned_waiter.name", default=None, read_only=True)
+    assigned_cashier_name = serializers.CharField(source="assigned_cashier.name", default=None, read_only=True)
 
     class Meta:
         model = Order
-        fields = ["id", "order_number", "order_code", "table", "assigned_waiter", "status", "items", "opened_at"]
+        fields = [
+            "id", "order_number", "order_code", "source", "table", "table_label_en", "table_label_ar",
+            "assigned_waiter", "assigned_waiter_name", "assigned_cashier", "assigned_cashier_name",
+            "status", "items", "opened_at", "waiter_confirmed_at", "closed_at",
+        ]
         read_only_fields = fields
 
     def get_items(self, order):
+        # Filtered in Python over the prefetched lines so the recipe/variant
+        # prefetch in KitchenTicketsView is actually used (a .filter() here
+        # would re-query every order).
+        lines = sorted(order.items.all(), key=lambda item: item.pk)
+        if self.context.get("scope") == "history":
+            # The kitchen log: everything that was ever fired, in any outcome.
+            eligible = [item for item in lines if item.fired_at is not None]
+            return KitchenTicketItemSerializer(eligible, many=True).data
         new_ids = additional_batch_item_ids(order)
-        active_batch = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING))
-        additional_batch = order.items.filter(pk__in=new_ids, status__in=(
-            OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY,
-        ))
-        if additional_batch.exists():
+        cooking = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING)
+        active_batch = [item for item in lines if item.status in cooking]
+        additional_batch = [item for item in lines if item.pk in new_ids and item.status in (*cooking, OrderItemStatus.READY)]
+        if additional_batch:
             eligible = additional_batch
         else:
-            eligible = active_batch if active_batch.exists() else order.items.filter(status=OrderItemStatus.READY)
+            eligible = active_batch or [item for item in lines if item.status == OrderItemStatus.READY]
         return KitchenTicketItemSerializer(eligible, many=True).data
 
 
