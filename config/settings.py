@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'customers',
     'reports',
     'reviews',
+    'imports',
     'realtime',
 ]
 

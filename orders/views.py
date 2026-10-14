@@ -845,7 +845,7 @@ class KitchenTicketsView(ListAPIView):
         return {**super().get_serializer_context(), "scope": self._scope()}
 
     def get_queryset(self):
-        qs = Order.objects.select_related("table", "assigned_waiter", "assigned_cashier").prefetch_related(
+        qs = Order.objects.select_related("table", "assigned_waiter").prefetch_related(
             "history", "items__variant", "items__product__recipe_items__inventory_item",
         ).filter(branch=self.request.user.branch)
         if self._scope() == "history":

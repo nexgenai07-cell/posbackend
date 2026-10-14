@@ -226,13 +226,12 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
     table_label_en = serializers.CharField(source="table.label_en", default=None, read_only=True)
     table_label_ar = serializers.CharField(source="table.label_ar", default=None, read_only=True)
     assigned_waiter_name = serializers.CharField(source="assigned_waiter.name", default=None, read_only=True)
-    assigned_cashier_name = serializers.CharField(source="assigned_cashier.name", default=None, read_only=True)
 
     class Meta:
         model = Order
         fields = [
             "id", "order_number", "order_code", "source", "table", "table_label_en", "table_label_ar",
-            "assigned_waiter", "assigned_waiter_name", "assigned_cashier", "assigned_cashier_name",
+            "assigned_waiter", "assigned_waiter_name",
             "status", "items", "opened_at", "waiter_confirmed_at", "closed_at",
         ]
         read_only_fields = fields
