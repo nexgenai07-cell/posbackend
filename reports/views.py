@@ -599,6 +599,145 @@ class IngredientCostView(BaseReportView):
         return Response({"from": from_date, "to": to_date, "results": results})
 
 
+def _pct(part, whole):
+    return (part / whole * 100) if part is not None and whole else None
+
+
+class DailySalesView(BaseReportView):
+    """
+    Day-by-day owner report: for every day in range, revenue, orders, what was
+    sold (product + size), what it cost, and which ingredients left stock.
+
+    Uses the same rules as the financial summary so the numbers agree:
+    - an order belongs to the branch-local day it was PAID (sales_orders);
+    - revenue is the payments taken (after discounts, without tips);
+    - cost is HISTORICAL — each SALE stock movement's own unit_cost_snapshot,
+      never today's ingredient price.
+
+    `cost_complete` is False when any sold item has no priced stock movement
+    (no recipe, or sold before cost snapshots existed). The known cost is
+    still returned so the owner sees a figure; the flag says it is partial.
+    """
+
+    def get(self, request):
+        branch, from_date, to_date, _start, _end, orders, items, payments, movements = _financial_context(request)
+        tz = branch_zone(branch)
+        order_day = {order.pk: order.sold_at.astimezone(tz).date().isoformat() for order in orders}
+
+        def new_day():
+            return {
+                "revenue": Decimal("0"), "orders": set(), "items_sold": 0,
+                "products": {}, "ingredients": {}, "cost": Decimal("0"), "cost_complete": True,
+            }
+
+        days = defaultdict(new_day)
+
+        for payment in payments:
+            day = days[order_day[payment.order_id]]
+            day["revenue"] += payment.amount
+            day["orders"].add(payment.order_id)
+
+        # Cost of each order item from its own SALE movements.
+        item_cost = defaultdict(lambda: Decimal("0"))
+        item_priced = defaultdict(lambda: True)
+        item_has_movement = set()
+        for movement in movements:
+            day = days[order_day[movement.order_id]]
+            ingredient = day["ingredients"].setdefault(movement.inventory_item_id, {
+                "inventory_item_id": movement.inventory_item_id,
+                "name": movement.inventory_item.name,
+                "unit": movement.inventory_item.unit,
+                "quantity": Decimal("0"),
+                "cost": Decimal("0"),
+                "cost_complete": True,
+            })
+            quantity = abs(movement.quantity_delta)
+            ingredient["quantity"] += quantity
+            if movement.unit_cost_snapshot is None:
+                ingredient["cost_complete"] = False
+            else:
+                ingredient["cost"] += quantity * movement.unit_cost_snapshot
+            if movement.order_item_id is None:
+                # A sale movement not tied to an item still costs money that day.
+                if movement.unit_cost_snapshot is None:
+                    day["cost_complete"] = False
+                else:
+                    day["cost"] += quantity * movement.unit_cost_snapshot
+                continue
+            item_has_movement.add(movement.order_item_id)
+            if movement.unit_cost_snapshot is None:
+                item_priced[movement.order_item_id] = False
+            else:
+                item_cost[movement.order_item_id] += quantity * movement.unit_cost_snapshot
+
+        for item in items:
+            day = days[order_day[item.order_id]]
+            day["items_sold"] += item.quantity
+            key = (item.product_id, item.variant_name_en_snapshot)
+            row = day["products"].setdefault(key, {
+                "product_id": item.product_id,
+                "name_en": item.name_en_snapshot,
+                "name_ar": item.name_ar_snapshot,
+                "variant_name_en": item.variant_name_en_snapshot,
+                "variant_name_ar": item.variant_name_ar_snapshot,
+                "quantity": 0,
+                "revenue": Decimal("0"),
+                "cost": Decimal("0"),
+                "cost_complete": True,
+            })
+            row["quantity"] += item.quantity
+            row["revenue"] += item.price_snapshot * item.quantity
+            row["cost"] += item_cost[item.pk]
+            day["cost"] += item_cost[item.pk]
+            if item.pk not in item_has_movement or not item_priced[item.pk]:
+                row["cost_complete"] = False
+                day["cost_complete"] = False
+
+        results = []
+        totals = {"revenue": Decimal("0"), "orders": 0, "items_sold": 0, "cost": Decimal("0"), "cost_complete": True}
+        for day_key in sorted(days, reverse=True):
+            values = days[day_key]
+            products = sorted(values["products"].values(), key=lambda row: row["revenue"], reverse=True)
+            for row in products:
+                row["profit"] = row["revenue"] - row["cost"]
+            ingredients = sorted(values["ingredients"].values(), key=lambda row: row["cost"], reverse=True)
+            profit = values["revenue"] - values["cost"]
+            results.append({
+                "day": day_key,
+                "revenue": values["revenue"],
+                "orders": len(values["orders"]),
+                "items_sold": values["items_sold"],
+                "ingredient_cost": values["cost"],
+                "gross_profit": profit,
+                "gross_margin_pct": _pct(profit, values["revenue"]),
+                "cost_complete": values["cost_complete"],
+                "products": products,
+                "ingredients": ingredients,
+            })
+            totals["revenue"] += values["revenue"]
+            totals["orders"] += len(values["orders"])
+            totals["items_sold"] += values["items_sold"]
+            totals["cost"] += values["cost"]
+            totals["cost_complete"] = totals["cost_complete"] and values["cost_complete"]
+
+        total_profit = totals["revenue"] - totals["cost"]
+        return Response({
+            "from": from_date,
+            "to": to_date,
+            "currency": branch.currency,
+            "totals": {
+                "revenue": totals["revenue"],
+                "orders": totals["orders"],
+                "items_sold": totals["items_sold"],
+                "ingredient_cost": totals["cost"],
+                "gross_profit": total_profit,
+                "gross_margin_pct": _pct(total_profit, totals["revenue"]),
+                "cost_complete": totals["cost_complete"],
+            },
+            "days": results,
+        })
+
+
 class StaffAttendanceView(BaseReportView):
     """
     One row per staff member: on shift now, last clock-in/out, and hours

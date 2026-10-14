@@ -127,3 +127,77 @@ class FinancialAnalyticsTests(TestCase):
         self.assertIsNone(response.json()["ingredient_cost_consumed"])
         self.assertIsNone(response.json()["gross_profit"])
         self.assertFalse(response.json()["historical_cost_complete"])
+
+
+class DailySalesReportTests(TestCase):
+    """Day-by-day report: same revenue/cost rules as the financial summary, split per day."""
+
+    # Same fixtures as above, without re-running that class's tests.
+    setUp = FinancialAnalyticsTests.setUp
+    completed_order = FinancialAnalyticsTests.completed_order
+
+    def test_splits_revenue_cost_products_and_ingredients_by_day(self):
+        self.completed_order()
+        older = self.completed_order(days_ago=2)
+        # Reports date an order by when it was paid, so move the payment back too.
+        Payment.objects.filter(order=older).update(paid_at=timezone.now() - timedelta(days=2))
+        response = self.client.get("/api/reports/daily-sales/?days=7")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(Decimal(data["totals"]["revenue"]), Decimal("130"))
+        self.assertEqual(data["totals"]["orders"], 2)
+        self.assertEqual(Decimal(data["totals"]["ingredient_cost"]), Decimal("50"))
+        self.assertEqual(Decimal(data["totals"]["gross_profit"]), Decimal("80"))
+        self.assertTrue(data["totals"]["cost_complete"])
+
+        self.assertEqual(len(data["days"]), 2)
+        newest = data["days"][0]
+        self.assertGreater(newest["day"], data["days"][1]["day"])
+        self.assertEqual(Decimal(newest["revenue"]), Decimal("65"))
+        self.assertEqual(newest["orders"], 1)
+        self.assertEqual(newest["items_sold"], 1)
+        self.assertEqual(Decimal(newest["ingredient_cost"]), Decimal("25"))
+        self.assertEqual(Decimal(newest["gross_profit"]), Decimal("40"))
+
+        product = newest["products"][0]
+        self.assertEqual(product["name_en"], "Meal")
+        self.assertEqual(product["quantity"], 1)
+        self.assertEqual(Decimal(product["revenue"]), Decimal("65"))
+        self.assertEqual(Decimal(product["cost"]), Decimal("25"))
+        self.assertTrue(product["cost_complete"])
+
+        ingredient = newest["ingredients"][0]
+        self.assertEqual(ingredient["name"], "Ingredient A")
+        self.assertEqual(Decimal(ingredient["quantity"]), Decimal("5"))
+        self.assertEqual(Decimal(ingredient["cost"]), Decimal("25"))
+
+    def test_sizes_of_the_same_product_are_separate_rows(self):
+        order = self.completed_order()
+        OrderItem.objects.create(
+            order=order, product=self.product, name_en_snapshot="Meal", name_ar_snapshot="Meal",
+            variant_name_en_snapshot="Large", variant_name_ar_snapshot="L",
+            price_snapshot=90, quantity=2, status=OrderItemStatus.SERVED,
+        )
+        response = self.client.get("/api/reports/daily-sales/?preset=today")
+        self.assertEqual(response.status_code, 200)
+        products = response.json()["days"][0]["products"]
+        by_size = {row["variant_name_en"]: row for row in products}
+        self.assertEqual(set(by_size), {"", "Large"})
+        self.assertEqual(by_size["Large"]["quantity"], 2)
+        self.assertEqual(Decimal(by_size["Large"]["revenue"]), Decimal("180"))
+        # The Large line has no stock movement, so its cost is flagged partial.
+        self.assertFalse(by_size["Large"]["cost_complete"])
+        self.assertTrue(by_size[""]["cost_complete"])
+        self.assertFalse(response.json()["totals"]["cost_complete"])
+
+    def test_is_branch_scoped_and_owner_or_manager_only(self):
+        self.completed_order(other_branch=True)
+        response = self.client.get("/api/reports/daily-sales/?preset=today")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["days"], [])
+        self.assertEqual(Decimal(response.json()["totals"]["revenue"]), Decimal("0"))
+
+        cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, pin_hash="x")
+        self.client.force_authenticate(user=cashier)
+        self.assertEqual(self.client.get("/api/reports/daily-sales/?preset=today").status_code, 403)
