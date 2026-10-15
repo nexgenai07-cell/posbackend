@@ -1,33 +1,46 @@
 """
-Bulk import of stock, menu and recipes from the admin's Excel template.
+Bulk import of the whole restaurant — stock, menu and recipes — from ONE
+Excel workbook with a sheet for each, filled in that order.
 
-Every importer works in two passes over the same uploaded file:
+One file instead of three is what lets a layman get it right: a recipe can
+use an ingredient or a dish typed into the earlier sheets of the same file,
+so there is no "import stock first, then come back" order to remember.
 
-  plan()  reads each row, validates it against the database and records what
-          WOULD happen — create / update (with every old -> new value) /
-          unchanged / delete / error — without writing anything. This is the
-          preview the admin reviews.
-  apply() performs exactly that plan inside one transaction. The view only
-          calls it when plan() found no errors, so an import either lands
-          completely or not at all.
+Every sheet works in two passes over the uploaded file:
+
+  plan()  reads each row, validates it against the database AND the earlier
+          sheets of the file, and records what WOULD happen — create /
+          update (with every old -> new value) / unchanged / delete / error —
+          without writing anything. This is the preview the admin reviews.
+  apply() performs exactly that plan. The view runs every sheet's apply()
+          inside one transaction and only when no sheet found an error, so
+          an import either lands completely or not at all.
 
 Matching is by name (case-insensitive), the same rule the manual forms use to
-reject duplicates. Rows left out of the file are never deleted — except a
-recipe, which is replaced as a whole for each product the file lists, and
-each removed ingredient line is shown in the preview as a delete.
+reject duplicates. A name that is NOT found but is close to an existing one
+("Chiken") is never silently created as a second item: a recipe gets an
+error naming the likely match, and a new stock item or dish gets a visible
+note. Rows left out of the file are never deleted — except a recipe, which is
+replaced as a whole for each dish the file lists, and each removed
+ingredient line is shown in the preview as a delete.
 """
 
+import difflib
 from dataclasses import dataclass, field
 from decimal import Decimal
+
+from openpyxl.utils import get_column_letter, quote_sheetname
 
 from catalog.models import Category, Product, ProductVariant
 from inventory.models import InventoryItem, RecipeItem, StockMovementReason
 from inventory.services import adjust_stock, units_compatible
 from purchasing.models import Supplier
 
-from .workbook import Column, decimal, show, text, yes_no
+from .workbook import MAX_ROWS, Column, SheetSpec, decimal, sheet_column_range, show, text, yes_no
 
 UNITS = ["kg", "g", "l", "ml", "pcs", "dozen"]
+STOCK_SHEET, MENU_SHEET, RECIPE_SHEET = "1 Stock", "2 Menu", "3 Recipes"
+ACTIONS = ("create", "update", "unchanged", "delete", "error")
 
 
 @dataclass
@@ -42,8 +55,13 @@ class RowResult:
     def change(self, key, old, new):
         self.changes.append({"field": key, "old": show(old), "new": show(new)})
 
-    def error(self, code, **params):
-        self.errors.append({"code": code, "params": params})
+    def error(self, code, field=None, **params):
+        # `field` is the column the problem is in, so the marked-up file can
+        # colour that exact cell; None means the row as a whole.
+        self.errors.append({"code": code, "field": field, "params": params})
+
+    def note(self, code, **params):
+        self.notes.append({"code": code, "params": params})
 
     def as_dict(self):
         action = "error" if self.errors else self.action
@@ -59,25 +77,58 @@ def _key(value):
 
 def _limit(result, value, column, max_length):
     if len(value) > max_length:
-        result.error("tooLong", column=column.header, max=max_length)
+        result.error("tooLong", column.key, column=column.header, max=max_length)
 
 
-class Importer:
-    kind = ""
-    sheet_title = ""
-    columns: list[Column] = []
-    instructions: list[str] = []
+def _similar(name, known):
+    """The existing name `name` is most likely a typo of, or None.
+    `known` maps casefolded key -> name as the admin wrote it."""
+    match = difflib.get_close_matches(_key(name), list(known), n=1, cutoff=0.8)
+    return known[match[0]] if match else None
+
+
+class Batch:
+    """What the sheets of one upload learn about each other while planning
+    (a stock item the Stock sheet adds, a dish the Menu sheet adds) and the
+    rows they create while applying."""
 
     def __init__(self, branch):
         self.branch = branch
+        # key -> (name, unit) for every stock item the Stock sheet adds.
+        self.new_items = {}
+        # item pk -> unit, for existing items whose unit the Stock sheet changes.
+        self.new_units = {}
+        # [(result, item, unit)] unit changes, checked against recipes last.
+        self.unit_changes = []
+        # key -> name for every dish the Menu sheet adds.
+        self.new_products = {}
+        # key -> (name, unit) for ingredients only a recipe row mentions.
+        self.auto_items = {}
+        # pks of existing dishes whose whole recipe the file sets.
+        self.recipe_products = set()
+        self.created_items = {}
+        self.created_products = {}
+
+
+class SheetImporter:
+    key = ""
+    sheet_title = ""
+    # The column a row-level problem is marked on in the error file.
+    name_field = ""
+    columns: list[Column] = []
+    rules: list[str] = []
+
+    def __init__(self, batch):
+        self.batch = batch
+        self.branch = batch.branch
 
     def col(self, key):
         return next(column for column in self.columns if column.key == key)
 
-    def template_rows(self):
-        raise NotImplementedError
+    def spec(self):
+        return SheetSpec(self.sheet_title, self.columns, self.template_rows(), self.rules)
 
-    def lists(self):
+    def template_rows(self):
         raise NotImplementedError
 
     def plan(self, rows):
@@ -87,27 +138,24 @@ class Importer:
         raise NotImplementedError
 
 
-COMMON_STEPS = [
-    "1. Change the rows on the first sheet, or add new rows under them. Keep the header row as it is.",
-    "2. Save the file, then upload it on the same admin page.",
-    "3. You will see every change before anything is saved. Nothing is saved until you press Confirm.",
-]
-
-
 # ── Stock ────────────────────────────────────────────────────────────────────
 
-class StockImporter(Importer):
-    kind = "stock"
-    sheet_title = "Stock"
+class StockImporter(SheetImporter):
+    key = "stock"
+    sheet_title = STOCK_SHEET
+    name_field = "name"
     columns = [
-        Column("name", "Name", "The ingredient or item. A name that already exists updates that item; a new name adds it.", required=True, width=28, example="Chicken"),
-        Column("unit", "Unit", "How you count it: kg, g, l, ml, pcs or dozen.", required=True, width=10, example="kg", choices="Units"),
-        Column("current_stock", "Current stock", "How much you have right now, in the unit above. Leave empty to keep the current amount. A change is saved as a stock adjustment.", example="25"),
-        Column("par_level", "Par level", "Warn me when stock falls to this amount. Leave empty to keep the current level.", example="5"),
-        Column("cost_per_unit", "Cost per unit", "What you pay for ONE unit (one kg, one piece...). Leave empty to keep the current cost.", width=16, example="650"),
-        Column("supplier", "Supplier", "Optional. A supplier name that does not exist yet is added to Suppliers.", width=26, example="Al Noor Poultry", choices="Suppliers"),
+        Column("name", "Name", "The ingredient or item you keep in stock. A name that already exists updates that item; a new name adds it.", required=True, width=28, example="Chicken"),
+        Column("unit", "Unit", "How you count it. Pick from the list: kg, g, l, ml, pcs or dozen.", required=True, width=10, example="kg", choices="Units", strict=True),
+        Column("current_stock", "Current stock", "How much you have right now, in the unit above. Leave empty to keep the current amount. A change is saved as a stock adjustment.", example="25", number="zero"),
+        Column("par_level", "Par level", "Warn me when stock falls to this amount. Leave empty to keep the current level.", example="5", number="zero"),
+        Column("cost_per_unit", "Cost per unit", "What you pay for ONE unit (one kg, one piece...). Number only, no Rs. Leave empty to keep the current cost.", width=16, example="650", number="zero"),
+        Column("supplier", "Supplier", "Optional. Pick from the list, or type a new supplier name to add it.", width=26, example="Al Noor Poultry", choices="Suppliers"),
     ]
-    instructions = ["Stock import", *COMMON_STEPS, "Removing a row from this file does NOT delete the item from the system."]
+    rules = [
+        "One row per stock item. Recipes (sheet 3) can only use items listed here.",
+        "Removing a row from this sheet does NOT delete the item from the system.",
+    ]
 
     def _items(self):
         return InventoryItem.objects.filter(branch=self.branch).select_related("supplier").order_by("name")
@@ -119,11 +167,9 @@ class StockImporter(Importer):
             "supplier": item.supplier.name_en if item.supplier else "",
         } for item in self._items()]
 
-    def lists(self):
-        return {"Units": UNITS, "Suppliers": sorted(s.name_en for s in Supplier.objects.all() if s.name_en)}
-
     def plan(self, rows):
-        existing = {item.name.strip().casefold(): item for item in self._items().prefetch_related("recipe_items__product")}
+        existing = {item.name.strip().casefold(): item for item in self._items()}
+        known = {key: item.name for key, item in existing.items()}
         suppliers = {}
         for supplier in Supplier.objects.all():
             for name in (supplier.name_en, supplier.name_ar):
@@ -139,27 +185,28 @@ class StockImporter(Importer):
             result = RowResult(row.number, name)
             results.append(result)
             if not name:
-                result.error("required", column=self.col("name").header)
+                result.error("required", "name", column=self.col("name").header)
             _limit(result, name, self.col("name"), 255)
             if name and _key(name) in seen:
-                result.error("duplicateInFile", firstRow=seen[_key(name)])
+                result.error("duplicateInFile", "name", firstRow=seen[_key(name)])
             elif name:
                 seen[_key(name)] = row.number
             unit = text(values.get("unit"))
             if not unit:
-                result.error("required", column=self.col("unit").header)
+                result.error("required", "unit", column=self.col("unit").header)
             _limit(result, unit, self.col("unit"), 32)
-            stock, problem = decimal(values.get("current_stock"), self.col("current_stock"))
-            if problem:
-                result.errors.append(problem)
-            par, problem = decimal(values.get("par_level"), self.col("par_level"))
-            if problem:
-                result.errors.append(problem)
-            cost, problem = decimal(values.get("cost_per_unit"), self.col("cost_per_unit"))
-            if problem:
-                result.errors.append(problem)
+            numbers = {}
+            for key in ("current_stock", "par_level", "cost_per_unit"):
+                numbers[key], problem = decimal(values.get(key), self.col(key))
+                if problem:
+                    result.errors.append(problem)
             supplier_name = text(values.get("supplier"))
             _limit(result, supplier_name, self.col("supplier"), 255)
+            item = existing.get(_key(name)) if name else None
+            if name and unit and item is None:
+                # Known to the Recipes sheet even if this row has an error, so
+                # a recipe using it is not wrongly reported as unknown too.
+                self.batch.new_items.setdefault(_key(name), (name, unit))
             if result.errors:
                 continue
 
@@ -168,9 +215,12 @@ class StockImporter(Importer):
                 supplier = suppliers.get(_key(supplier_name))
                 if supplier is None:
                     self._new_suppliers.setdefault(_key(supplier_name), supplier_name)
-                    result.notes.append({"code": "newSupplier", "params": {"name": supplier_name}})
-            item = existing.get(_key(name))
+                    result.note("newSupplier", name=supplier_name)
+            stock, par, cost = numbers["current_stock"], numbers["par_level"], numbers["cost_per_unit"]
             if item is None:
+                similar = _similar(name, known)
+                if similar:
+                    result.note("similarExists", name=name, existing=similar)
                 result.action = "create"
                 result.change("unit", "", unit)
                 for key, value in (("current_stock", stock), ("par_level", par), ("cost_per_unit", cost)):
@@ -183,12 +233,10 @@ class StockImporter(Importer):
 
             fields = {}
             if unit != item.unit:
-                broken = sorted({line.product.name_en or line.product.name_ar for line in item.recipe_items.all() if not units_compatible(line.unit, unit)})
-                if broken:
-                    result.error("unitBreaksRecipes", unit=unit, products=", ".join(broken))
-                    continue
                 fields["unit"] = unit
                 result.change("unit", item.unit, unit)
+                self.batch.new_units[item.pk] = unit
+                self.batch.unit_changes.append((result, item, unit))
             for key, value in (("par_level", par), ("cost_per_unit", cost)):
                 if value is not None and value != getattr(item, key):
                     fields[key] = value
@@ -205,6 +253,15 @@ class StockImporter(Importer):
                 result.action = "update"
                 self._ops.append(("update", item, fields, delta))
         return results
+
+    def check_unit_changes(self):
+        """A unit change must not break a recipe the file leaves as it is.
+        Recipes the file sets were already checked against the new unit."""
+        for result, item, unit in self.batch.unit_changes:
+            lines = RecipeItem.objects.filter(inventory_item=item).exclude(product_id__in=self.batch.recipe_products).select_related("product")
+            broken = sorted({line.product.name_en or line.product.name_ar for line in lines if not units_compatible(line.unit, unit)})
+            if broken:
+                result.error("unitBreaksRecipes", "unit", unit=unit, products=", ".join(broken))
 
     def _supplier(self, supplier, name, created):
         if supplier is not None:
@@ -223,6 +280,7 @@ class StockImporter(Importer):
                     branch=self.branch, name=name, unit=unit, current_stock=0, par_level=par, cost_per_unit=cost,
                     supplier=self._supplier(supplier, supplier_name, created) if supplier_name else None,
                 )
+                self.batch.created_items[_key(name)] = item
                 if stock:
                     adjust_stock(item.pk, stock, StockMovementReason.ADJUSTMENT)
             else:
@@ -245,26 +303,27 @@ class StockImporter(Importer):
 PRODUCT_FIELDS = ("category", "name_en", "name_ar", "description_en", "description_ar", "price", "available")
 
 
-class ProductImporter(Importer):
-    kind = "products"
-    sheet_title = "Menu"
+class ProductImporter(SheetImporter):
+    key = "products"
+    sheet_title = MENU_SHEET
+    name_field = "name_en"
     columns = [
-        Column("category", "Category", "Menu section, e.g. Burgers. A category that does not exist yet is added.", required=True, width=20, example="Karahi", choices="Categories"),
+        Column("category", "Category", "Menu section, e.g. Burgers. Pick from the list, or type a new name to add a new category.", required=True, width=20, example="Karahi", choices="Categories"),
         Column("name_en", "Name (English)", "Dish name in English. English or Arabic name is required.", width=28, example="Chicken Karahi"),
         Column("name_ar", "Name (Arabic)", "Dish name in Arabic (optional if the English name is filled).", width=24, example="كراهي دجاج"),
         Column("description_en", "Description (English)", "Optional.", width=32),
         Column("description_ar", "Description (Arabic)", "Optional.", width=32),
-        Column("price", "Price", "Menu price. Required for a new dish. For a dish with sizes, the price of the regular size.", width=10, example="1400"),
-        Column("available", "Available", "Yes or No. Leave empty to keep it as it is (new dishes are available).", width=11, example="Yes", choices="YesNo"),
+        Column("price", "Price", "Menu price, number only. Required for a new dish. For a dish with sizes, the price of the regular size.", width=10, example="1400", number="zero"),
+        Column("available", "Available", "Yes or No. Leave empty to keep it as it is (new dishes are available).", width=11, example="Yes", choices="YesNo", strict=True),
         Column("size_en", "Size (English)", "Only for dishes sold in sizes: one row per size, repeating the dish name. e.g. Half KG / 1 KG.", width=16, example="1 KG"),
         Column("size_ar", "Size (Arabic)", "Optional Arabic size name.", width=14),
-        Column("size_price", "Size price", "Price of this size. Required for a new size.", width=11, example="2600"),
-        Column("recipe_multiplier", "Recipe multiplier", "How many times the dish's recipe this size uses: Half KG = 1, 1 KG = 2. Empty = 1 for a new size.", width=17, example="2"),
+        Column("size_price", "Size price", "Price of this size, number only. Required for a new size.", width=11, example="2600", number="zero"),
+        Column("recipe_multiplier", "Recipe multiplier", "How many times the dish's recipe this size uses: Half KG = 1, 1 KG = 2. Empty = 1 for a new size.", width=17, example="2", number="positive"),
     ]
-    instructions = [
-        "Menu import", *COMMON_STEPS,
-        "A dish with sizes takes one row per size. Repeat the dish's name, category and price on each of its rows.",
-        "Removing a row from this file does NOT delete the dish or size from the system.",
+    rules = [
+        "One row per dish. A dish with sizes takes one row per size: repeat the dish's name, category and price on each of its rows.",
+        "Recipes (sheet 3) can only use dishes listed here.",
+        "Removing a row from this sheet does NOT delete the dish or size from the system.",
     ]
 
     def _products(self):
@@ -286,10 +345,6 @@ class ProductImporter(Importer):
                 rows.append({**base, "size_en": variant.name_en, "size_ar": variant.name_ar,
                              "size_price": variant.price, "recipe_multiplier": variant.recipe_multiplier})
         return rows
-
-    def lists(self):
-        categories = Category.objects.filter(branch=self.branch)
-        return {"Categories": [c.name_en or c.name_ar for c in categories], "YesNo": ["Yes", "No"]}
 
     def _read(self, row, result):
         values = row.values
@@ -314,11 +369,13 @@ class ProductImporter(Importer):
             for name in (product.name_en, product.name_ar):
                 if name:
                     by_name.setdefault(name.strip().casefold(), product)
+        known_products = {key: product.name_en or product.name_ar for key, product in by_name.items()}
         categories = {}
         for category in Category.objects.filter(branch=self.branch):
             for name in (category.name_en, category.name_ar):
                 if name:
                     categories.setdefault(name.strip().casefold(), category)
+        known_categories = {key: category.name_en or category.name_ar for key, category in categories.items()}
 
         groups = {}
         results = []
@@ -329,12 +386,12 @@ class ProductImporter(Importer):
             results.append(result)
             parsed = self._read(row, result)
             if not parsed["name_en"] and not parsed["name_ar"]:
-                result.error("nameRequired")
+                result.error("nameRequired", "name_en")
             if not parsed["category"]:
-                result.error("required", column=self.col("category").header)
+                result.error("required", "category", column=self.col("category").header)
             has_size_values = parsed["size_price"] is not None or parsed["recipe_multiplier"] is not None
             if has_size_values and not (parsed["size_en"] or parsed["size_ar"]):
-                result.error("sizeNameRequired")
+                result.error("sizeNameRequired", "size_en")
             if not (parsed["name_en"] or parsed["name_ar"]):
                 continue
             key = _key(parsed["name_en"] or parsed["name_ar"])
@@ -345,39 +402,49 @@ class ProductImporter(Importer):
                 for field_key in PRODUCT_FIELDS:
                     mine, theirs = parsed[field_key], group["values"][field_key]
                     if mine not in (None, "") and theirs not in (None, "") and (_key(mine) if isinstance(mine, str) else mine) != (_key(theirs) if isinstance(theirs, str) else theirs):
-                        result.error("conflictingValue", column=self.col(field_key).header, firstRow=group["first"])
+                        result.error("conflictingValue", field_key, column=self.col(field_key).header, firstRow=group["first"])
                     elif mine not in (None, "") and theirs in (None, ""):
                         group["values"][field_key] = mine
             size_name = parsed["size_en"] or parsed["size_ar"]
             if size_name:
                 if _key(size_name) in group["sizes"]:
-                    result.error("duplicateInFile", firstRow=group["sizes"][_key(size_name)])
+                    result.error("duplicateInFile", "size_en", firstRow=group["sizes"][_key(size_name)])
                 else:
                     group["sizes"][_key(size_name)] = row.number
             elif any(not entry[1]["size_en"] and not entry[1]["size_ar"] for entry in group["rows"]):
-                result.error("duplicateInFile", firstRow=group["first"])
+                result.error("duplicateInFile", "name_en", firstRow=group["first"])
             group["rows"].append((result, parsed))
 
         self._ops = []
         self._new_categories = {}
         for group in groups.values():
-            if any(result.errors for result, _ in group["rows"]):
-                continue
             values = group["values"]
             first_result = group["rows"][0][0]
             product = by_name.get(_key(values["name_en"])) if values["name_en"] else None
             product = product or (by_name.get(_key(values["name_ar"])) if values["name_ar"] else None)
+            if product is None:
+                # Known to the Recipes sheet even if a row here has an error.
+                for name in (values["name_en"], values["name_ar"]):
+                    if name:
+                        self.batch.new_products.setdefault(_key(name), name)
+            if any(result.errors for result, _ in group["rows"]):
+                continue
 
-            category = categories.get(_key(values["category"]))
-            if category is None:
+            if values["category"] and _key(values["category"]) not in categories:
                 self._new_categories.setdefault(_key(values["category"]), values["category"])
-                first_result.notes.append({"code": "newCategory", "params": {"name": values["category"]}})
+                similar = _similar(values["category"], known_categories)
+                if similar:
+                    first_result.note("similarExists", name=values["category"], existing=similar)
+                first_result.note("newCategory", name=values["category"])
 
             product_fields = {}
             if product is None:
                 if values["price"] is None:
-                    first_result.error("priceRequired")
+                    first_result.error("priceRequired", "price")
                     continue
+                similar = _similar(values["name_en"] or values["name_ar"], known_products)
+                if similar:
+                    first_result.note("similarExists", name=values["name_en"] or values["name_ar"], existing=similar)
                 first_result.action = "create"
                 for field_key in ("category", "name_en", "name_ar", "description_en", "description_ar", "price"):
                     if values[field_key] not in (None, ""):
@@ -416,7 +483,7 @@ class ProductImporter(Importer):
                 variant = variant or (variants.get(_key(parsed["size_ar"])) if parsed["size_ar"] else None)
                 if variant is None:
                     if parsed["size_price"] is None:
-                        result.error("sizePriceRequired")
+                        result.error("sizePriceRequired", "size_price")
                         continue
                     multiplier = parsed["recipe_multiplier"] or Decimal("1")
                     result.action = "create"
@@ -468,6 +535,9 @@ class ProductImporter(Importer):
                     price=values["price"], cost_price=Decimal("0"),
                     is_available=True if values["available"] is None else values["available"],
                 )
+                for name in (values["name_en"], values["name_ar"]):
+                    if name:
+                        self.batch.created_products[_key(name)] = product
             elif product_fields:
                 if "category" in product_fields:
                     product_fields["category"] = category_for(product_fields["category"])
@@ -492,19 +562,19 @@ class ProductImporter(Importer):
 
 # ── Recipes ──────────────────────────────────────────────────────────────────
 
-class RecipeImporter(Importer):
-    kind = "recipes"
-    sheet_title = "Recipes"
+class RecipeImporter(SheetImporter):
+    key = "recipes"
+    sheet_title = RECIPE_SHEET
+    name_field = "product"
     columns = [
-        Column("product", "Dish", "Dish name exactly as on the menu.", required=True, width=28, example="Chicken Karahi", choices="Dishes"),
-        Column("ingredient", "Ingredient", "Stock item name exactly as on the Stock page.", required=True, width=26, example="Chicken", choices="Ingredients"),
-        Column("quantity", "Quantity", "How much ONE portion of the dish uses. Sizes scale this by their recipe multiplier.", required=True, width=11, example="500"),
-        Column("unit", "Unit", "Unit of the quantity: kg, g, l, ml, pcs or dozen. Must fit the stock item's unit (g works for an item counted in kg).", required=True, width=10, example="g", choices="Units"),
+        Column("product", "Dish", "Pick the dish from the list. The list is the dishes on sheet 2 Menu, including new ones you add there.", required=True, width=28, example="Chicken Karahi", choices="Dishes", strict=True),
+        Column("ingredient", "Ingredient", "Pick the stock item from the list. The list is the items on sheet 1 Stock, including new ones you add there.", required=True, width=26, example="Chicken", choices="Ingredients", strict=True),
+        Column("quantity", "Quantity", "How much ONE portion of the dish uses, number only. Sizes scale this by their recipe multiplier.", required=True, width=11, example="500", number="positive"),
+        Column("unit", "Unit", "Unit of the quantity: kg, g, l, ml, pcs or dozen. Must fit the stock item's unit (g works for an item counted in kg).", required=True, width=10, example="g", choices="Units", strict=True),
     ]
-    instructions = [
-        "Recipe import", *COMMON_STEPS,
-        "One row per ingredient. A dish listed here gets exactly the ingredients listed for it: an ingredient you remove from a dish's rows is removed from its recipe.",
-        "Dishes not listed in this file keep their recipes as they are.",
+    rules = [
+        "One row per ingredient of a dish. A dish listed here gets exactly the ingredients listed for it: an ingredient you remove from a dish's rows is removed from its recipe.",
+        "Dishes not listed on this sheet keep their recipes as they are.",
     ]
 
     def _lines(self):
@@ -516,10 +586,30 @@ class RecipeImporter(Importer):
             "quantity": line.quantity, "unit": line.unit,
         } for line in self._lines()]
 
-    def lists(self):
-        products = Product.objects.filter(branch=self.branch).order_by("name_en")
-        items = InventoryItem.objects.filter(branch=self.branch).order_by("name")
-        return {"Dishes": [p.name_en or p.name_ar for p in products], "Ingredients": [i.name for i in items], "Units": UNITS}
+    def _ingredient(self, name, unit, result, items):
+        """(reference, stock unit) for an ingredient name, or (None, None) with
+        the reason on `result`. A reference is an InventoryItem, or the key of
+        an item this file adds."""
+        key = _key(name)
+        item = items.get(key)
+        if item is not None:
+            return item, self.batch.new_units.get(item.pk, item.unit)
+        if key in self.batch.new_items:
+            return key, self.batch.new_items[key][1]
+        if key in self.batch.auto_items:
+            return key, self.batch.auto_items[key][1]
+        known = {k: i.name for k, i in items.items()}
+        known.update({k: value[0] for k, value in (*self.batch.new_items.items(), *self.batch.auto_items.items())})
+        similar = _similar(name, known)
+        if similar:
+            # Never add "Chiken" next to "Chicken": that would split stock in two.
+            result.error("ingredientSimilar", "ingredient", name=name, existing=similar)
+            return None, None
+        if not unit:
+            return None, None
+        self.batch.auto_items[key] = (name, unit)
+        result.note("newIngredient", name=name, unit=unit)
+        return key, unit
 
     def plan(self, rows):
         products = {}
@@ -537,57 +627,75 @@ class RecipeImporter(Importer):
             result = RowResult(row.number, f"{product_name} · {ingredient_name}")
             results.append(result)
             if not product_name:
-                result.error("required", column=self.col("product").header)
+                result.error("required", "product", column=self.col("product").header)
             if not ingredient_name:
-                result.error("required", column=self.col("ingredient").header)
+                result.error("required", "ingredient", column=self.col("ingredient").header)
             quantity, problem = decimal(values.get("quantity"), self.col("quantity"), allow_zero=False)
             if problem:
                 result.errors.append(problem)
             elif quantity is None:
-                result.error("required", column=self.col("quantity").header)
+                result.error("required", "quantity", column=self.col("quantity").header)
             unit = text(values.get("unit"))
             if not unit:
-                result.error("required", column=self.col("unit").header)
+                result.error("required", "unit", column=self.col("unit").header)
             _limit(result, unit, self.col("unit"), 32)
-            product = products.get(_key(product_name)) if product_name else None
-            if product_name and product is None:
-                result.error("dishNotFound", name=product_name)
-            item = items.get(_key(ingredient_name)) if ingredient_name else None
-            if ingredient_name and item is None:
-                result.error("ingredientNotFound", name=ingredient_name)
-            if item is not None and unit and not units_compatible(unit, item.unit):
-                result.error("unitIncompatible", unit=unit, stockUnit=item.unit, ingredient=item.name)
+
+            product = None
+            if product_name:
+                product = products.get(_key(product_name))
+                if product is None and _key(product_name) in self.batch.new_products:
+                    product = _key(product_name)
+                if product is None:
+                    known = {key: p.name_en or p.name_ar for key, p in products.items()}
+                    known.update(self.batch.new_products)
+                    similar = _similar(product_name, known)
+                    if similar:
+                        result.error("dishSimilar", "product", name=product_name, existing=similar)
+                    else:
+                        result.error("dishNotFound", "product", name=product_name)
+
+            item, stock_unit = (None, None)
+            if ingredient_name:
+                item, stock_unit = self._ingredient(ingredient_name, unit, result, items)
+            if item is not None and unit and not units_compatible(unit, stock_unit):
+                result.error("unitIncompatible", "unit", unit=unit, stockUnit=stock_unit, ingredient=ingredient_name)
             if product is None:
                 continue
-            group = groups.setdefault(product.pk, {"product": product, "lines": {}, "rows": []})
+            group_key = product.pk if isinstance(product, Product) else product
+            group = groups.setdefault(group_key, {"product": product, "lines": {}, "rows": []})
             if item is not None:
-                if item.pk in group["lines"]:
-                    result.error("duplicateInFile", firstRow=group["lines"][item.pk])
+                item_key = item.pk if isinstance(item, InventoryItem) else item
+                if item_key in group["lines"]:
+                    result.error("duplicateInFile", "ingredient", firstRow=group["lines"][item_key])
                 else:
-                    group["lines"][item.pk] = row.number
+                    group["lines"][item_key] = row.number
             group["rows"].append((result, item, quantity, unit))
 
         self._ops = []
         for group in groups.values():
             product = group["product"]
-            old = {line.inventory_item_id: line for line in product.recipe_items.all()}
+            existing = isinstance(product, Product)
+            if existing:
+                self.batch.recipe_products.add(product.pk)
+            old = {line.inventory_item_id: line for line in product.recipe_items.all()} if existing else {}
             new_lines = []
             for result, item, quantity, unit in group["rows"]:
                 if result.errors:
                     continue
-                current = old.get(item.pk)
+                current = old.get(item.pk) if isinstance(item, InventoryItem) else None
                 if current is None:
                     result.action = "create"
                     result.change("quantity", "", f"{show(quantity)} {unit}")
                 elif current.quantity != quantity or current.unit.casefold() != unit.casefold():
                     result.action = "update"
                     result.change("quantity", f"{show(current.quantity)} {current.unit}", f"{show(quantity)} {unit}")
-                new_lines.append(RecipeItem(product=product, inventory_item=item, quantity=quantity, unit=unit))
-            for item_id, line in old.items():
-                if item_id not in group["lines"]:
-                    removed = RowResult(None, f"{product.name_en or product.name_ar} · {line.inventory_item.name}", action="delete")
-                    removed.change("quantity", f"{show(line.quantity)} {line.unit}", "")
-                    results.append(removed)
+                new_lines.append((item, quantity, unit))
+            if existing:
+                for item_id, line in old.items():
+                    if item_id not in group["lines"]:
+                        removed = RowResult(None, f"{product.name_en or product.name_ar} · {line.inventory_item.name}", action="delete")
+                        removed.change("quantity", f"{show(line.quantity)} {line.unit}", "")
+                        results.append(removed)
             changed = any(result.action != "unchanged" for result, *_ in group["rows"]) or set(old) - set(group["lines"])
             if changed:
                 self._ops.append((product, new_lines))
@@ -596,14 +704,141 @@ class RecipeImporter(Importer):
     def apply(self):
         from inventory.views import _sync_product_cost_price
 
+        for key, (name, unit) in self.batch.auto_items.items():
+            self.batch.created_items[key] = InventoryItem.objects.create(
+                branch=self.branch, name=name, unit=unit, current_stock=0, par_level=0, cost_per_unit=0,
+            )
         for product, lines in self._ops:
+            if not isinstance(product, Product):
+                product = self.batch.created_products[product]
             # Same replace-all as PUT /products/<id>/recipe/, and the derived
             # cost price is refreshed the same way.
             RecipeItem.objects.filter(product=product).delete()
-            RecipeItem.objects.bulk_create(lines)
+            RecipeItem.objects.bulk_create([
+                RecipeItem(
+                    product=product, quantity=quantity, unit=unit,
+                    inventory_item=item if isinstance(item, InventoryItem) else self.batch.created_items[item],
+                ) for item, quantity, unit in lines
+            ])
             # Re-read: plan() prefetched the OLD recipe onto this instance, and
             # costing it would price the lines that were just replaced.
             _sync_product_cost_price(Product.objects.get(pk=product.pk))
 
 
-IMPORTERS = {importer.kind: importer for importer in (StockImporter, ProductImporter, RecipeImporter)}
+SHEETS = (StockImporter, ProductImporter, RecipeImporter)
+
+START_LINES = [
+    "How to fill this file",
+    "",
+    "1. Fill the sheets in order: 1 Stock, then 2 Menu, then 3 Recipes.",
+    "   Each sheet already contains everything you have now. Change rows, or add new rows under them.",
+    "   A recipe picks its dish from sheet 2 and its ingredients from sheet 1, so add new items there first.",
+    "2. Orange headings must be filled; grey ones are optional. Click any cell to see what to write in it.",
+    "   Use the dropdown lists where a column has one. Write numbers only (1400, not Rs. 1400).",
+    "3. Do not rename the sheets or change the heading rows.",
+    "4. Save the file and upload it on the admin page. You will see every change before anything is saved.",
+    "   If something is wrong you can download this file back with the wrong cells marked in red.",
+]
+
+
+class RestaurantImport:
+    """The whole workbook: every sheet planned in order against one Batch."""
+
+    def __init__(self, branch):
+        self.branch = branch
+        self.batch = Batch(branch)
+        self.sheets = [sheet_class(self.batch) for sheet_class in SHEETS]
+
+    def stock_sheet(self):
+        return self.sheets[0]
+
+    def lists(self):
+        units = list(UNITS)
+        for unit in InventoryItem.objects.filter(branch=self.branch).values_list("unit", flat=True).distinct():
+            if unit and _key(unit) not in (_key(u) for u in units):
+                units.append(unit)
+        letter = {column.key: get_column_letter(index) for index, column in enumerate(ProductImporter.columns, start=1)}
+        menu = quote_sheetname(MENU_SHEET)
+        # A dish is listed by its English name, or its Arabic one when it has
+        # no English name — the names the Recipes sheet matches. Formulas, so
+        # a dish typed into the Menu sheet shows up in the dropdown at once.
+        dishes = [
+            f'=IF({menu}!{letter["name_en"]}{row}<>"",{menu}!{letter["name_en"]}{row},{menu}!{letter["name_ar"]}{row})'
+            for row in range(2, MAX_ROWS + 2)
+        ]
+        return {
+            "Units": units,
+            "YesNo": ["Yes", "No"],
+            "Suppliers": sorted(s.name_en for s in Supplier.objects.all() if s.name_en),
+            "Categories": [c.name_en or c.name_ar for c in Category.objects.filter(branch=self.branch).order_by("sort_order", "id")],
+            "Dishes": dishes,
+            "Ingredients": sheet_column_range(STOCK_SHEET, 1),
+        }
+
+    def specs(self):
+        return [sheet.spec() for sheet in self.sheets]
+
+    def plan(self, parsed):
+        """{sheet key: [RowResult]} for {sheet key: ParsedSheet}."""
+        results = {sheet.key: sheet.plan(parsed[sheet.key].rows) for sheet in self.sheets}
+        self.stock_sheet().check_unit_changes()
+        return results
+
+    def apply(self):
+        for sheet in self.sheets:
+            sheet.apply()
+
+    def checklist(self):
+        products = Product.objects.filter(branch=self.branch)
+        return {
+            "stock_items": InventoryItem.objects.filter(branch=self.branch).count(),
+            "dishes": products.count(),
+            "dishes_without_recipe": products.filter(recipe_items__isnull=True).count(),
+        }
+
+    def guide(self):
+        """Everything the admin page shows to explain the file, built from
+        the same Column definitions the upload is validated against."""
+        return {
+            "sheets": [{
+                "key": sheet.key, "title": sheet.sheet_title, "rules": sheet.rules,
+                "columns": [{
+                    "key": column.key, "header": column.header, "help": column.help,
+                    "example": column.example, "required": column.required,
+                } for column in sheet.columns],
+            } for sheet in self.sheets],
+            "checklist": self.checklist(),
+            "prompt": self.ai_prompt(),
+        }
+
+    def ai_prompt(self):
+        """Text the admin pastes into any AI chat, with their own list or a
+        menu photo, to get a file in exactly this workbook's format."""
+        lines = [
+            f'Make an Excel (.xlsx) file with these sheets, named exactly: "{STOCK_SHEET}", "{MENU_SHEET}", "{RECIPE_SHEET}".',
+            "Write numbers as plain numbers without currency or units (1400, not Rs. 1400). Leave a cell empty when you do not know the value; do not invent prices or quantities.",
+        ]
+        for sheet in self.sheets:
+            lines += [
+                "",
+                f'Sheet "{sheet.sheet_title}". Row 1 must contain exactly these column headers, in this order:',
+                " | ".join(column.label for column in sheet.columns),
+                "Rules for each column (* = must not be empty):",
+            ]
+            for column in sheet.columns:
+                example = f' Example: "{column.example}".' if column.example else ""
+                lines.append(f"- {column.label}: {column.help}{example}")
+            lines += sheet.rules
+        lists = self.lists()
+        for name in ("Categories", "Suppliers"):
+            if lists[name]:
+                lines += ["", f"Existing {name.lower()} (use exactly these spellings when you mean one of them):", ", ".join(lists[name][:300])]
+        existing = {
+            "dishes": [p.name_en or p.name_ar for p in Product.objects.filter(branch=self.branch).order_by("name_en")],
+            "stock items": [i.name for i in InventoryItem.objects.filter(branch=self.branch).order_by("name")],
+        }
+        for name, values in existing.items():
+            if values:
+                lines += ["", f"Existing {name} (use exactly these spellings when you mean one of them):", ", ".join(values[:300])]
+        lines += ["", "Give me the finished .xlsx file to download. My data is below:", ""]
+        return "\n".join(lines)
