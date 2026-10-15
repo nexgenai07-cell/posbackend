@@ -171,7 +171,8 @@ class OrderSerializer(serializers.ModelSerializer):
             "id", "order_number", "order_code", "branch", "table", "customer", "source", "staff",
             "assigned_cashier", "assigned_waiter", "waiter_confirmed_at", "waiter_confirmed_by",
             "status", "payment_status", "items", "payments", "history", "total",
-            "opened_at", "closed_at", "cancelled_at", "cancel_reason", "created_at", "updated_at",
+            "opened_at", "closed_at", "cancelled_at", "cancel_reason", "cancelled_by", "cancelled_from_status",
+            "cancelled_total", "refunded_amount", "created_at", "updated_at",
         ]
         read_only_fields = fields
 

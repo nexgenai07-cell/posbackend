@@ -273,6 +273,11 @@ AI_API_KEY = env('AI_API_KEY', default='')
 AI_BASE_URL = env('AI_BASE_URL', default='https://integrate.api.nvidia.com/v1')
 AI_MODEL = env('AI_MODEL', default='nvidia/nemotron-3-super-120b-a12b')
 AI_DRAFTS_PER_DAY = env.int('AI_DRAFTS_PER_DAY', default=20)
+# Recipe calls run this many at a time (one per dish).
+AI_PARALLEL = env.int('AI_PARALLEL', default=6)
+# Extra request fields that turn the model's reasoning off for the quick menu
+# call. The default is NVIDIA Nemotron's switch; set {} for a model without one.
+AI_FAST_EXTRA_BODY = env.json('AI_FAST_EXTRA_BODY', default={"chat_template_kwargs": {"enable_thinking": False}})
 
 # Every bill is charged in SAR, hard-coded in orders/billing.py. Moyasar takes
 # the amount in halalas (1 SAR = 100 halalas), computed server-side from

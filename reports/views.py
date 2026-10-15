@@ -10,12 +10,13 @@ from rest_framework.views import APIView
 from accounts.permissions import IsOwnerOrManager
 from catalog.models import Product
 from inventory.models import InventoryItem, RecipeItem, StockMovement, StockMovementReason
-from inventory.services import required_quantity_in_inventory_unit
+from inventory.services import required_quantity_in_inventory_unit, variant_multiplier
 from orders.models import Order, OrderItem, OrderItemStatus, OrderStatus, Payment, PaymentStatus
 from purchasing.models import Purchase, PurchaseItem, PurchaseStatus
 from orders.serializers import OrderSerializer
 
 from .filters import branch_datetime_bounds, parse_date_range
+from .insights import BANDS, NEEDS_ATTENTION, attention_items, cost_rose, margin_verdict
 
 
 def branch_zone(branch):
@@ -72,8 +73,10 @@ class DashboardSummaryView(BaseReportView):
         from_date, to_date = self.get_range(request)
         orders = self.closed_orders(request, from_date, to_date)
 
-        items = OrderItem.objects.filter(order__in=orders).exclude(status=OrderItemStatus.VOIDED)
-        total_sales = items.aggregate(total=Sum(F("price_snapshot") * F("quantity")))["total"] or Decimal("0.00")
+        # Money actually taken (after discounts, without tips), the same figure
+        # as the sales, daily and financial reports. It used to add up menu
+        # prices instead, so the dashboard and the reports disagreed.
+        total_sales = Payment.objects.filter(order__in=orders).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
         order_count = orders.count()
         average_order_value = (total_sales / order_count) if order_count else Decimal("0.00")
 
@@ -158,7 +161,10 @@ class SalesOverviewView(BaseReportView):
             by_day_map[day]["total"] += payment.amount
             by_day_map[day]["orders"].add(payment.order_id)
         by_day = [
-            {"day": day, "total": values["total"], "order_count": len(values["orders"])}
+            {
+                "day": day, "total": values["total"], "order_count": len(values["orders"]),
+                "average_order_value": values["total"] / len(values["orders"]) if values["orders"] else Decimal("0"),
+            }
             for day, values in sorted(by_day_map.items())
         ]
 
@@ -195,7 +201,8 @@ class SalesOverviewView(BaseReportView):
 
 
 class ProductPerformanceView(BaseReportView):
-    """Optional ?category= narrows to one category."""
+    """One row per dish and size, with its share of dish sales. Optional
+    ?category= narrows to one category."""
 
     def get(self, request):
         from_date, to_date = self.get_range(request)
@@ -207,11 +214,18 @@ class ProductPerformanceView(BaseReportView):
             items = items.filter(product__category_id=category_param)
 
         results = list(
-            items.values("product_id", "name_en_snapshot", "variant_name_en_snapshot")
+            items.values("product_id", "name_en_snapshot", "name_ar_snapshot", "variant_name_en_snapshot", "variant_name_ar_snapshot")
             .annotate(quantity_sold=Sum("quantity"), revenue=Sum(F("price_snapshot") * F("quantity")))
             .order_by("-revenue")
         )
-        return Response({"from": from_date, "to": to_date, "results": results})
+        total = sum((row["revenue"] for row in results), Decimal("0"))
+        for row in results:
+            row["average_price"] = row["revenue"] / row["quantity_sold"] if row["quantity_sold"] else None
+            row["share_pct"] = row["revenue"] / total * 100 if total else None
+        return Response({
+            "from": from_date, "to": to_date, "results": results,
+            "totals": {"quantity_sold": sum(row["quantity_sold"] for row in results), "revenue": total},
+        })
 
 
 class PeakHoursView(BaseReportView):
@@ -302,31 +316,55 @@ class TableTurnoverView(BaseReportView):
         return Response({"from": from_date, "to": to_date, "results": results})
 
 
+def wastage(request, from_date, to_date):
+    """
+    Waste per ingredient, valued at each movement's own cost snapshot (the
+    purchase price of that stock when it was thrown away), not the hand-typed
+    cost per unit on the stock item, which purchases never update and is
+    often 0. Movements from before snapshots existed are counted in quantity
+    and listed as unpriced instead of guessed.
+    """
+    start, end = branch_datetime_bounds(request.user.branch, from_date, to_date)
+    movements = StockMovement.objects.filter(
+        inventory_item__branch=request.user.branch,
+        reason=StockMovementReason.WASTE,
+        created_at__gte=start,
+        created_at__lt=end,
+    ).select_related("inventory_item")
+    by_item = {}
+    for movement in movements:
+        row = by_item.setdefault(movement.inventory_item_id, {
+            "inventory_item_id": movement.inventory_item_id,
+            "inventory_item_name": movement.inventory_item.name,
+            "unit": movement.inventory_item.unit,
+            "quantity_wasted": Decimal("0"),
+            "estimated_cost": Decimal("0"),
+            "unpriced_quantity": Decimal("0"),
+        })
+        quantity = abs(movement.quantity_delta)
+        row["quantity_wasted"] += quantity
+        if movement.unit_cost_snapshot is None:
+            row["unpriced_quantity"] += quantity
+        else:
+            row["estimated_cost"] += quantity * movement.unit_cost_snapshot
+    rows = sorted(by_item.values(), key=lambda row: (row["estimated_cost"], row["quantity_wasted"]), reverse=True)
+    for row in rows:
+        row["cost_complete"] = row["unpriced_quantity"] == 0
+    return {
+        "rows": rows,
+        "total": sum((row["estimated_cost"] for row in rows), Decimal("0")),
+        "unpriced_items": sum(1 for row in rows if not row["cost_complete"]),
+    }
+
+
 class WastageView(BaseReportView):
     def get(self, request):
         from_date, to_date = self.get_range(request)
-        start, end = self.bounds(request, from_date, to_date)
-        movements = StockMovement.objects.filter(
-            inventory_item__branch=request.user.branch,
-            reason=StockMovementReason.WASTE,
-            created_at__gte=start,
-            created_at__lt=end,
-        )
-        rows = (
-            movements.values("inventory_item_id", "inventory_item__name", "inventory_item__cost_per_unit")
-            .annotate(quantity_wasted=Sum("quantity_delta"))
-            .order_by("quantity_wasted")  # most negative (most wasted) first
-        )
-        results = [
-            {
-                "inventory_item_id": row["inventory_item_id"],
-                "inventory_item_name": row["inventory_item__name"],
-                "quantity_wasted": abs(row["quantity_wasted"]),
-                "estimated_cost": abs(row["quantity_wasted"]) * row["inventory_item__cost_per_unit"],
-            }
-            for row in rows
-        ]
-        return Response({"from": from_date, "to": to_date, "results": results})
+        waste = wastage(request, from_date, to_date)
+        return Response({
+            "from": from_date, "to": to_date, "results": waste["rows"],
+            "totals": {"cost": waste["total"], "unpriced_items": waste["unpriced_items"]},
+        })
 
 
 class RepeatCustomersView(BaseReportView):
@@ -402,65 +440,73 @@ def _financial_context(request):
     return branch, from_date, to_date, start, end, orders, items, payments, movements
 
 
-class FinancialSummaryView(BaseReportView):
+def financial_summary(request):
     """Owner summary using completed, paid orders and the stock ledger."""
+    branch, from_date, to_date, _start, _end, orders, items, payments, movements = _financial_context(request)
+    revenue = sum((payment.amount for payment in payments), Decimal("0"))
+    tips = sum((payment.tip or Decimal("0") for payment in payments), Decimal("0"))
+    by_method = defaultdict(lambda: Decimal("0"))
+    for payment in payments:
+        by_method[payment.method] += payment.amount
+    units_sold = sum((item.quantity for item in items), 0)
 
+    known_cost = Decimal("0")
+    movements_by_item = defaultdict(list)
+    legacy_cost_movements = 0
+    for movement in movements:
+        if movement.unit_cost_snapshot is None:
+            legacy_cost_movements += 1
+        else:
+            known_cost += abs(movement.quantity_delta) * movement.unit_cost_snapshot
+        if movement.order_item_id:
+            movements_by_item[movement.order_item_id].append(movement)
+    cost_complete = legacy_cost_movements == 0
+    for item in items:
+        if not movements_by_item.get(item.pk):
+            cost_complete = False
+    ingredient_cost = known_cost if cost_complete else None
+    gross_profit = revenue - ingredient_cost if ingredient_cost is not None else None
+    gross_margin = (gross_profit / revenue * 100) if gross_profit is not None and revenue else None
+
+    received = Purchase.objects.filter(
+        branch=branch, status=PurchaseStatus.RECEIVED,
+        received_at__gte=_start, received_at__lt=_end,
+    )
+    purchase_total = sum(
+        (line.quantity * line.unit_cost for line in PurchaseItem.objects.filter(purchase__in=received)),
+        Decimal("0"),
+    )
+    return {
+        "from": from_date,
+        "to": to_date,
+        "currency": branch.currency,
+        "revenue": revenue,
+        "paid_order_count": orders.count(),
+        "items_sold": units_sold,
+        "average_order_value": revenue / orders.count() if orders.count() else Decimal("0"),
+        "cash_revenue": by_method.get("cash", Decimal("0")),
+        "card_revenue": by_method.get("card", Decimal("0")),
+        "other_revenue": by_method.get("other", Decimal("0")),
+        "tips": tips,
+        "ingredient_cost_consumed": ingredient_cost,
+        "known_ingredient_cost": known_cost,
+        "historical_cost_complete": cost_complete,
+        "unpriced_movement_count": legacy_cost_movements,
+        "gross_profit": gross_profit,
+        "gross_margin_pct": gross_margin,
+        # What is left after the ingredients we DO know the cost of; equal
+        # to gross_profit when the cost is complete, higher than the truth
+        # otherwise (historical_cost_complete says which).
+        "known_gross_profit": revenue - known_cost,
+        "known_cost_share_pct": (known_cost / revenue * 100) if revenue else None,
+        "total_purchases": purchase_total,
+        "received_purchase_count": received.count(),
+    }
+
+
+class FinancialSummaryView(BaseReportView):
     def get(self, request):
-        branch, from_date, to_date, _start, _end, orders, items, payments, movements = _financial_context(request)
-        revenue = sum((payment.amount for payment in payments), Decimal("0"))
-        tips = sum((payment.tip or Decimal("0") for payment in payments), Decimal("0"))
-        by_method = defaultdict(lambda: Decimal("0"))
-        for payment in payments:
-            by_method[payment.method] += payment.amount
-        units_sold = sum((item.quantity for item in items), 0)
-
-        known_cost = Decimal("0")
-        movements_by_item = defaultdict(list)
-        legacy_cost_movements = 0
-        for movement in movements:
-            if movement.unit_cost_snapshot is None:
-                legacy_cost_movements += 1
-            else:
-                known_cost += abs(movement.quantity_delta) * movement.unit_cost_snapshot
-            if movement.order_item_id:
-                movements_by_item[movement.order_item_id].append(movement)
-        cost_complete = legacy_cost_movements == 0
-        for item in items:
-            if not movements_by_item.get(item.pk):
-                cost_complete = False
-        ingredient_cost = known_cost if cost_complete else None
-        gross_profit = revenue - ingredient_cost if ingredient_cost is not None else None
-        gross_margin = (gross_profit / revenue * 100) if gross_profit is not None and revenue else None
-
-        received = Purchase.objects.filter(
-            branch=branch, status=PurchaseStatus.RECEIVED,
-            received_at__gte=_start, received_at__lt=_end,
-        )
-        purchase_total = sum(
-            (line.quantity * line.unit_cost for line in PurchaseItem.objects.filter(purchase__in=received)),
-            Decimal("0"),
-        )
-        return Response({
-            "from": from_date,
-            "to": to_date,
-            "currency": branch.currency,
-            "revenue": revenue,
-            "paid_order_count": orders.count(),
-            "items_sold": units_sold,
-            "average_order_value": revenue / orders.count() if orders.count() else Decimal("0"),
-            "cash_revenue": by_method.get("cash", Decimal("0")),
-            "card_revenue": by_method.get("card", Decimal("0")),
-            "other_revenue": by_method.get("other", Decimal("0")),
-            "tips": tips,
-            "ingredient_cost_consumed": ingredient_cost,
-            "known_ingredient_cost": known_cost,
-            "historical_cost_complete": cost_complete,
-            "unpriced_movement_count": legacy_cost_movements,
-            "gross_profit": gross_profit,
-            "gross_margin_pct": gross_margin,
-            "total_purchases": purchase_total,
-            "received_purchase_count": received.count(),
-        })
+        return Response(financial_summary(request))
 
 
 def _current_recipe_costs(branch):
@@ -490,55 +536,104 @@ def _current_recipe_costs(branch):
 
 
 class ProductProfitabilityView(BaseReportView):
-    """Historical profit uses cost snapshots on SALE movements; legacy gaps stay null."""
+    """
+    One row per dish AND size: "Chicken Karahi · Half KG" and "· 1 KG" are
+    priced and cost differently, so averaging them into one row hid which
+    size actually makes money. Historical cost comes from the SALE stock
+    movements' own cost snapshots (legacy gaps stay null); today's cost per
+    plate is the current recipe at the latest purchase prices times the
+    size's recipe multiplier, so the two are comparable size for size.
+    """
 
     def get(self, request):
-        branch, from_date, to_date, _start, _end, orders, items, _payments, movements = _financial_context(request)
-        current_costs, current_complete = _current_recipe_costs(branch)
-        item_rows = list(items)
-        product_names = {}
-        by_product = defaultdict(lambda: {"units": 0, "revenue": Decimal("0"), "cost": Decimal("0"), "cost_complete": True})
-        for item in item_rows:
-            row = by_product[item.product_id]
-            product_names[item.product_id] = item.name_en_snapshot
-            row["units"] += item.quantity
-            row["revenue"] += item.price_snapshot * item.quantity
-        movement_item_ids = set()
-        for movement in movements:
-            if movement.order_item_id is None:
-                if movement.unit_cost_snapshot is None:
-                    for row in by_product.values():
-                        row["cost_complete"] = False
-                continue
-            movement_item_ids.add(movement.order_item_id)
-            row = by_product[movement.order_item.product_id]
-            if movement.unit_cost_snapshot is None:
-                row["cost_complete"] = False
-            else:
-                row["cost"] += abs(movement.quantity_delta) * movement.unit_cost_snapshot
-        for item in item_rows:
-            if item.pk not in movement_item_ids:
-                by_product[item.product_id]["cost_complete"] = False
+        from_date, to_date, results, totals = profitability(request)
+        return Response({"from": from_date, "to": to_date, "results": results, "totals": totals, "bands": BANDS})
 
-        results = []
-        for product_id, values in by_product.items():
-            cost = values["cost"] if values["cost_complete"] else None
-            profit = values["revenue"] - cost if cost is not None else None
-            results.append({
-                "product_id": product_id,
-                "product_name": product_names[product_id],
-                "units_sold": values["units"],
-                "average_selling_price": values["revenue"] / values["units"] if values["units"] else None,
-                "revenue": values["revenue"],
-                "ingredient_cost": cost,
-                "gross_profit_per_unit": profit / values["units"] if profit is not None and values["units"] else None,
-                "gross_profit": profit,
-                "gross_margin_pct": (profit / values["revenue"] * 100) if profit is not None and values["revenue"] else None,
-                "current_recipe_cost_per_unit": current_costs.get(product_id) if current_complete[product_id] else None,
-                "historical_cost_complete": values["cost_complete"],
-            })
-        results.sort(key=lambda row: row["revenue"], reverse=True)
-        return Response({"from": from_date, "to": to_date, "results": results})
+
+def profitability(request):
+    """Rows per dish and size (see ProductProfitabilityView), with the
+    verdict, cost per plate and cost-rise flag, plus totals."""
+    branch, from_date, to_date, _start, _end, orders, items, _payments, movements = _financial_context(request)
+    current_costs, current_complete = _current_recipe_costs(branch)
+    item_rows = list(items.select_related("variant"))
+    by_line = defaultdict(lambda: {"units": 0, "revenue": Decimal("0"), "cost": Decimal("0"), "cost_complete": True})
+    meta = {}
+    for item in item_rows:
+        key = (item.product_id, item.variant_id)
+        row = by_line[key]
+        meta.setdefault(key, item)
+        row["units"] += item.quantity
+        row["revenue"] += item.price_snapshot * item.quantity
+    movement_item_ids = set()
+    for movement in movements:
+        if movement.order_item_id is None:
+            if movement.unit_cost_snapshot is None:
+                for row in by_line.values():
+                    row["cost_complete"] = False
+            continue
+        movement_item_ids.add(movement.order_item_id)
+        row = by_line[(movement.order_item.product_id, movement.order_item.variant_id)]
+        if movement.unit_cost_snapshot is None:
+            row["cost_complete"] = False
+        else:
+            row["cost"] += abs(movement.quantity_delta) * movement.unit_cost_snapshot
+    for item in item_rows:
+        if item.pk not in movement_item_ids:
+            by_line[(item.product_id, item.variant_id)]["cost_complete"] = False
+
+    results = []
+    for key, values in by_line.items():
+        if key not in meta:
+            continue
+        item = meta[key]
+        product_id, variant_id = key
+        multiplier = variant_multiplier(item.variant)
+        cost = values["cost"] if values["cost_complete"] else None
+        profit = values["revenue"] - cost if cost is not None else None
+        margin = (profit / values["revenue"] * 100) if profit is not None and values["revenue"] else None
+        cost_per_plate = cost / values["units"] if cost is not None and values["units"] else None
+        current = current_costs.get(product_id, Decimal("0")) * multiplier if current_complete[product_id] else None
+        results.append({
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "product_name": item.name_en_snapshot,
+            "product_name_ar": item.name_ar_snapshot,
+            "variant_name": item.variant_name_en_snapshot,
+            "variant_name_ar": item.variant_name_ar_snapshot,
+            "recipe_multiplier": multiplier,
+            "units_sold": values["units"],
+            "average_selling_price": values["revenue"] / values["units"] if values["units"] else None,
+            "revenue": values["revenue"],
+            "ingredient_cost": cost,
+            "gross_profit_per_unit": profit / values["units"] if profit is not None and values["units"] else None,
+            "gross_profit": profit,
+            "gross_margin_pct": margin,
+            "cost_per_plate": cost_per_plate,
+            "current_recipe_cost_per_unit": current,
+            "cost_rose": cost_rose(cost_per_plate, current),
+            "verdict": margin_verdict(margin),
+            "needs_attention": margin_verdict(margin) in NEEDS_ATTENTION,
+            "historical_cost_complete": values["cost_complete"],
+        })
+    results.sort(key=lambda row: row["revenue"], reverse=True)
+    priced = [row for row in results if row["ingredient_cost"] is not None]
+    priced_revenue = sum((row["revenue"] for row in priced), Decimal("0"))
+    profit_total = sum((row["gross_profit"] for row in priced), Decimal("0"))
+    revenue_total = sum((row["revenue"] for row in results), Decimal("0"))
+    totals = {
+        "units_sold": sum(row["units_sold"] for row in results),
+        "revenue": revenue_total,
+        "ingredient_cost": sum((row["ingredient_cost"] for row in priced), Decimal("0")),
+        # Profit only over dishes whose cost is known; the rest is listed
+        # as unpriced revenue rather than counted as all profit.
+        "gross_profit": profit_total,
+        "priced_revenue": priced_revenue,
+        "gross_margin_pct": profit_total / priced_revenue * 100 if priced_revenue else None,
+        "unpriced_revenue": revenue_total - priced_revenue,
+        "no_recipe_count": len(results) - len(priced),
+        "attention_count": sum(1 for row in results if row["needs_attention"]),
+    }
+    return from_date, to_date, results, totals
 
 
 class IngredientCostView(BaseReportView):
@@ -580,6 +675,9 @@ class IngredientCostView(BaseReportView):
         for ingredient in ingredients:
             purchased = purchase_by_item[ingredient.pk]
             consumed = used[ingredient.pk]
+            # Nothing bought, used or on the shelf: nothing to account for.
+            if not purchased["quantity"] and not consumed["quantity"] and not ingredient.current_stock:
+                continue
             results.append({
                 "inventory_item_id": ingredient.pk,
                 "name": ingredient.name,
@@ -596,7 +694,16 @@ class IngredientCostView(BaseReportView):
                     if ingredient.pk in latest_actual_costs else None
                 ),
             })
-        return Response({"from": from_date, "to": to_date, "results": results})
+        totals = {
+            "purchase_spending": sum((row["purchase_spending"] for row in results), Decimal("0")),
+            "consumed_cost": sum((row["consumed_cost"] or Decimal("0") for row in results), Decimal("0")),
+            "consumed_cost_complete": all(row["used_quantity"] == 0 or row["consumed_cost"] is not None for row in results),
+            "current_stock_value": sum((row["current_stock_value_at_latest_cost"] or Decimal("0") for row in results), Decimal("0")),
+            "unvalued_items": sum(
+                1 for row in results if row["current_stock"] > 0 and row["current_stock_value_at_latest_cost"] is None
+            ),
+        }
+        return Response({"from": from_date, "to": to_date, "results": results, "totals": totals})
 
 
 def _pct(part, whole):
@@ -700,6 +807,8 @@ class DailySalesView(BaseReportView):
             products = sorted(values["products"].values(), key=lambda row: row["revenue"], reverse=True)
             for row in products:
                 row["profit"] = row["revenue"] - row["cost"]
+                row["gross_margin_pct"] = _pct(row["profit"], row["revenue"]) if row["cost_complete"] else None
+                row["verdict"] = margin_verdict(row["gross_margin_pct"])
             ingredients = sorted(values["ingredients"].values(), key=lambda row: row["cost"], reverse=True)
             profit = values["revenue"] - values["cost"]
             results.append({
@@ -710,6 +819,7 @@ class DailySalesView(BaseReportView):
                 "ingredient_cost": values["cost"],
                 "gross_profit": profit,
                 "gross_margin_pct": _pct(profit, values["revenue"]),
+                "verdict": margin_verdict(_pct(profit, values["revenue"])),
                 "cost_complete": values["cost_complete"],
                 "products": products,
                 "ingredients": ingredients,
@@ -780,3 +890,291 @@ class StaffAttendanceView(BaseReportView):
                 "hours_in_window": round(hours.get(member.pk, 0.0), 2),
             })
         return Response({"from": from_date, "to": to_date, "results": results})
+
+
+def _minutes(start, end):
+    if not start or not end or end < start:
+        return None
+    return round((end - start).total_seconds() / 60)
+
+
+def _person(staff):
+    return staff.name if staff else ""
+
+
+def _line(item):
+    return {
+        "name_en": item.name_en_snapshot,
+        "name_ar": item.name_ar_snapshot,
+        "variant_en": item.variant_name_en_snapshot,
+        "variant_ar": item.variant_name_ar_snapshot,
+        "quantity": item.quantity,
+        "unit_price": item.price_snapshot,
+        "total": item.price_snapshot * item.quantity,
+        "voided": item.status == OrderItemStatus.VOIDED,
+        "notes": item.notes,
+    }
+
+
+def _table(order):
+    if not order.table_id:
+        return None
+    return {"id": order.table_id, "label_en": order.table.label_en, "label_ar": order.table.label_ar}
+
+
+def _customer(order):
+    if not order.customer_id:
+        return None
+    return {"id": order.customer_id, "name": order.customer.name, "phone": order.customer.phone}
+
+
+def _with_time(entry):
+    sittings = [minutes for minutes in entry.pop("sessions").values() if minutes is not None]
+    entry["visits"] = len(sittings)
+    entry["total_minutes"] = sum(sittings)
+    entry["average_minutes"] = round(sum(sittings) / len(sittings)) if sittings else None
+    # Takeaway-only customers have no sittings: their spend is per order then.
+    entry["spend_per_visit"] = entry["spend"] / (len(sittings) or entry["orders"]) if entry["orders"] else Decimal("0")
+    entry["spend_per_hour"] = entry["spend"] / Decimal(entry["total_minutes"]) * 60 if entry["total_minutes"] else None
+    return entry
+
+
+def _group_totals(rows):
+    return {
+        "orders": sum(row["orders"] for row in rows),
+        "visits": sum(row["visits"] for row in rows),
+        "total_minutes": sum(row["total_minutes"] for row in rows),
+        "spend": sum((row["spend"] for row in rows), Decimal("0")),
+    }
+
+
+class OrderDetailsView(BaseReportView):
+    """
+    Every riyal per order, for the sales report's detail tabs.
+
+    - `orders`: each paid order in range (the same set and day rule as every
+      revenue report, sales_orders), with its lines, what the menu prices
+      added up to, what was actually paid (the gap is the discount), tips,
+      how it was paid, its ingredient cost from the stock it used, who served
+      it, its table and customer, and how long the table was held.
+    - `cancelled`: orders cancelled in range: when, by whom, at what stage,
+      why, what they were worth, what has to be refunded and what the cooked
+      food cost in wasted stock.
+    - `customers` / `tables`: the same paid orders grouped, with spend and
+      time seated.
+
+    Time seated is the table session: the bill's open-to-release time when
+    the order was on a table bill (several orders at one sitting share it),
+    otherwise the order's own open-to-close time. Takeaway has none.
+    """
+
+    LIMIT = 3000
+
+    def get(self, request):
+        branch = request.user.branch
+        from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
+        orders = list(
+            sales_orders(branch, start, end)
+            .select_related("table", "customer", "bill", "staff", "assigned_waiter", "assigned_cashier")
+            .prefetch_related("items", "payments")
+            .order_by("-sold_at")[: self.LIMIT + 1]
+        )
+        truncated = len(orders) > self.LIMIT
+        orders = orders[: self.LIMIT]
+
+        cost_by_order = defaultdict(lambda: {"cost": Decimal("0"), "complete": True})
+        for movement in StockMovement.objects.filter(order__in=[o.pk for o in orders], reason=StockMovementReason.SALE):
+            row = cost_by_order[movement.order_id]
+            if movement.unit_cost_snapshot is None:
+                row["complete"] = False
+            else:
+                row["cost"] += abs(movement.quantity_delta) * movement.unit_cost_snapshot
+
+        def session(order):
+            """(key, minutes) of the sitting this order belongs to."""
+            if not order.table_id:
+                return None, None
+            if order.bill_id:
+                bill = order.bill
+                return f"bill-{bill.pk}", _minutes(bill.created_at, bill.closed_at or order.closed_at or order.sold_at)
+            return f"order-{order.pk}", _minutes(order.opened_at, order.closed_at or order.sold_at)
+
+        rows = []
+        customers = {}
+        tables = {}
+        totals = {
+            "orders": 0, "items_total": Decimal("0"), "paid": Decimal("0"), "discount": Decimal("0"),
+            "tips": Decimal("0"), "voided_total": Decimal("0"), "cost": Decimal("0"), "cost_complete": True,
+        }
+        for order in orders:
+            items = list(order.items.all())
+            payments = list(order.payments.all())
+            live = [item for item in items if item.status != OrderItemStatus.VOIDED]
+            items_total = sum((i.price_snapshot * i.quantity for i in live), Decimal("0"))
+            voided_total = sum((i.price_snapshot * i.quantity for i in items if i.status == OrderItemStatus.VOIDED), Decimal("0"))
+            paid = sum((p.amount for p in payments), Decimal("0"))
+            tips = sum((p.tip or Decimal("0") for p in payments), Decimal("0"))
+            discount = items_total - paid if items_total > paid else Decimal("0")
+            costs = cost_by_order[order.pk] if order.pk in cost_by_order else {"cost": Decimal("0"), "complete": not live}
+            # An order whose lines took nothing from stock has no recipe cost to show.
+            cost_complete = costs["complete"]
+            session_key, seated = session(order)
+            methods = defaultdict(lambda: Decimal("0"))
+            for payment in payments:
+                methods[payment.method] += payment.amount
+            rows.append({
+                "id": order.pk,
+                "order_number": order.order_number,
+                "source": order.source,
+                "table": _table(order),
+                "customer": _customer(order),
+                "waiter": _person(order.assigned_waiter),
+                "cashier": _person(order.assigned_cashier),
+                "taken_by": _person(order.staff),
+                "opened_at": order.opened_at,
+                "paid_at": order.sold_at,
+                "closed_at": order.closed_at,
+                "seated_minutes": seated,
+                "items": [_line(item) for item in items],
+                "plates": sum(item.quantity for item in live),
+                "items_total": items_total,
+                "voided_total": voided_total,
+                "paid": paid,
+                "discount": discount,
+                "tips": tips,
+                "methods": [{"method": method, "amount": amount} for method, amount in sorted(methods.items())],
+                "cost": costs["cost"],
+                "cost_complete": cost_complete,
+                "profit": paid - costs["cost"],
+            })
+            totals["orders"] += 1
+            totals["items_total"] += items_total
+            totals["paid"] += paid
+            totals["discount"] += discount
+            totals["tips"] += tips
+            totals["voided_total"] += voided_total
+            totals["cost"] += costs["cost"]
+            totals["cost_complete"] = totals["cost_complete"] and cost_complete
+
+            if order.customer_id:
+                entry = customers.setdefault(order.customer_id, {
+                    **_customer(order), "orders": 0, "spend": Decimal("0"), "sessions": {}, "last_visit": order.sold_at,
+                })
+                entry["orders"] += 1
+                entry["spend"] += paid
+                entry["last_visit"] = max(entry["last_visit"], order.sold_at)
+                if session_key:
+                    entry["sessions"][session_key] = seated
+            if order.table_id:
+                entry = tables.setdefault(order.table_id, {**_table(order), "orders": 0, "spend": Decimal("0"), "sessions": {}})
+                entry["orders"] += 1
+                entry["spend"] += paid
+                if session_key:
+                    entry["sessions"][session_key] = seated
+
+        cancelled_orders = list(
+            Order.objects.filter(branch=branch, status=OrderStatus.CANCELLED, cancelled_at__gte=start, cancelled_at__lt=end)
+            .select_related("table", "customer", "cancelled_by")
+            .prefetch_related("items")
+            .order_by("-cancelled_at")[: self.LIMIT]
+        )
+        waste_by_order = defaultdict(lambda: Decimal("0"))
+        for movement in StockMovement.objects.filter(
+            order__in=[o.pk for o in cancelled_orders], reason=StockMovementReason.WASTE, unit_cost_snapshot__isnull=False,
+        ):
+            waste_by_order[movement.order_id] += abs(movement.quantity_delta) * movement.unit_cost_snapshot
+        cancelled = []
+        for order in cancelled_orders:
+            items = list(order.items.all())
+            cancelled.append({
+                "id": order.pk,
+                "order_number": order.order_number,
+                "table": _table(order),
+                "customer": _customer(order),
+                "opened_at": order.opened_at,
+                "cancelled_at": order.cancelled_at,
+                "cancelled_by": _person(order.cancelled_by),
+                "from_status": order.cancelled_from_status,
+                "reason": order.cancel_reason,
+                # Orders cancelled before these fields existed: their lines' prices.
+                "total": order.cancelled_total if order.cancelled_total is not None
+                else sum((i.price_snapshot * i.quantity for i in items), Decimal("0")),
+                "refunded": order.refunded_amount or Decimal("0"),
+                "waste_cost": waste_by_order[order.pk],
+                "items": [_line(item) for item in items],
+            })
+
+        customer_rows = sorted((_with_time(entry) for entry in customers.values()), key=lambda row: row["spend"], reverse=True)
+        table_rows = sorted((_with_time(entry) for entry in tables.values()), key=lambda row: row["spend"], reverse=True)
+        return Response({
+            "from": from_date,
+            "to": to_date,
+            "truncated": truncated,
+            "totals": {
+                **totals,
+                "cancelled_count": len(cancelled),
+                "cancelled_total": sum((row["total"] for row in cancelled), Decimal("0")),
+                "refunded": sum((row["refunded"] for row in cancelled), Decimal("0")),
+                "cancelled_waste": sum((row["waste_cost"] for row in cancelled), Decimal("0")),
+                "profit": totals["paid"] - totals["cost"],
+            },
+            "orders": rows,
+            "cancelled": cancelled,
+            "customers": customer_rows,
+            "tables": table_rows,
+            "customer_totals": _group_totals(customer_rows),
+            "table_totals": _group_totals(table_rows),
+        })
+
+
+class BusinessSummaryView(BaseReportView):
+    """
+    The owner's one-page summary in one call: money in and where it went,
+    stock bought and thrown away, best and most-sold dishes, busiest hours,
+    and the "needs your attention" list -- every figure and every judgement
+    made here (insights.py), so the admin only formats and translates.
+    """
+
+    def get(self, request):
+        branch = request.user.branch
+        from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
+        money = financial_summary(request)
+        _from, _to, dishes, dish_totals = profitability(request)
+        waste = wastage(request, from_date, to_date)
+        low_stock = list(
+            InventoryItem.objects.filter(branch=branch, current_stock__lte=F("par_level"))
+            .order_by("current_stock", "name").values("id", "name", "unit", "current_stock", "par_level")
+        )
+        cancelled_orders = Order.objects.filter(
+            branch=branch, status=OrderStatus.CANCELLED, cancelled_at__gte=start, cancelled_at__lt=end,
+        )
+        cancelled = {
+            "count": cancelled_orders.count(),
+            "total": cancelled_orders.aggregate(total=Sum("cancelled_total"))["total"] or Decimal("0"),
+            "refunded": cancelled_orders.aggregate(total=Sum("refunded_amount"))["total"] or Decimal("0"),
+        }
+        hours = list(
+            self.closed_orders(request, from_date, to_date)
+            .annotate(hour=ExtractHour("opened_at", tzinfo=branch_zone(branch)))
+            .values("hour").annotate(order_count=Count("id")).order_by("-order_count", "hour")[:3]
+        )
+        top_profit = sorted(
+            (row for row in dishes if row["gross_profit"] is not None and row["gross_profit"] > 0),
+            key=lambda row: row["gross_profit"], reverse=True,
+        )[:5]
+        most_sold = sorted(dishes, key=lambda row: row["units_sold"], reverse=True)[:5]
+        return Response({
+            "from": from_date,
+            "to": to_date,
+            "money": money,
+            "waste": {"total": waste["total"], "unpriced_items": waste["unpriced_items"], "item_count": len(waste["rows"])},
+            "cancelled": cancelled,
+            "dish_totals": dish_totals,
+            "top_profit": top_profit,
+            "most_sold": most_sold,
+            "busiest_hours": hours,
+            "low_stock": low_stock,
+            "attention": attention_items(dishes, [row["name"] for row in low_stock], waste, cancelled),
+        })

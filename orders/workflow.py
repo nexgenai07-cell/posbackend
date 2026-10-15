@@ -14,8 +14,10 @@ ALLOWED_ORDER_TRANSITIONS = {
     OrderStatus.SERVED: {OrderStatus.PREPARING, OrderStatus.PAID, OrderStatus.PENDING_CASHIER, OrderStatus.CANCELLED},
     # PAID -> SERVED: the same customer added items after paying, before the
     # table was released; the order reopens and only the new lines are owed.
-    OrderStatus.PAID: {OrderStatus.CLOSED, OrderStatus.SERVED},
-    OrderStatus.CLOSED: set(),
+    # PAID/CLOSED -> CANCELLED: only an owner or manager, with a reason, and
+    # the money taken is recorded as owed back (CancelOrderView).
+    OrderStatus.PAID: {OrderStatus.CLOSED, OrderStatus.SERVED, OrderStatus.CANCELLED},
+    OrderStatus.CLOSED: {OrderStatus.CANCELLED},
     OrderStatus.CANCELLED: set(),
 }
 

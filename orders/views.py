@@ -487,29 +487,90 @@ class WaiterConfirmView(APIView):
         return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
 
 
+_BEFORE_KITCHEN = {OrderStatus.OPEN, OrderStatus.PENDING_CASHIER, OrderStatus.AWAITING_WAITER, OrderStatus.CONFIRMED}
+# Lines already sent to the kitchen: their stock is gone, so cancelling makes it waste.
+_COOKED_ITEM_STATUSES = {OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY, OrderItemStatus.SERVED}
+
+
 class CancelOrderView(APIView):
+    """
+    Cashiers cancel only before anything reaches the kitchen. An owner or
+    manager can cancel at any stage — cooking, served, even paid — but must
+    say why once food was made or money taken, because then the cancellation
+    costs something: dispatched lines' stock is moved to waste (the food was
+    made), and any money already paid is recorded as owed back
+    (refunded_amount). What the order was worth and the stage it was at are
+    frozen on the order for the cancelled-orders report.
+    """
+
     permission_classes = [IsCashierStaff]
+
+    def get(self, request, pk):
+        """What cancelling would do, for the confirm dialog: the same figures
+        and rules the POST applies, so the dialog never works them out."""
+        order = get_object_or_404(Order.objects.filter(branch=request.user.branch), pk=pk)
+        is_admin = request.user.role in (StaffRole.OWNER, StaffRole.MANAGER)
+        live_items = list(order.items.exclude(status=OrderItemStatus.VOIDED))
+        paid = sum((payment.amount for payment in order.payments.all()), Decimal("0"))
+        allowed = order.status != OrderStatus.CANCELLED and (
+            is_admin or (order.status not in TERMINAL_ORDER_STATUSES and order.status in _BEFORE_KITCHEN)
+        )
+        return Response({
+            "allowed": allowed,
+            "total": sum((item.price_snapshot * item.quantity for item in live_items), Decimal("0")),
+            "refund": paid,
+            "cooked_plates": sum(item.quantity for item in live_items if item.status in _COOKED_ITEM_STATUSES),
+            "reason_required": is_admin and (order.status not in _BEFORE_KITCHEN or paid > 0),
+        })
 
     def post(self, request, pk):
         with transaction.atomic():
             order = get_object_or_404(
                 Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk
             )
-            if order.status in TERMINAL_ORDER_STATUSES:
+            is_admin = request.user.role in (StaffRole.OWNER, StaffRole.MANAGER)
+            if order.status == OrderStatus.CANCELLED:
                 return Response({"error": "error.orderAlreadyClosed"}, status=status.HTTP_409_CONFLICT)
-            if order.status not in {
-                OrderStatus.OPEN, OrderStatus.PENDING_CASHIER, OrderStatus.AWAITING_WAITER, OrderStatus.CONFIRMED
-            }:
-                return Response({"error": "error.orderAlreadyInKitchen"}, status=status.HTTP_409_CONFLICT)
-            kitchen_was_notified = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)).exists()
+            if not is_admin:
+                if order.status in TERMINAL_ORDER_STATUSES:
+                    return Response({"error": "error.orderAlreadyClosed"}, status=status.HTTP_409_CONFLICT)
+                if order.status not in _BEFORE_KITCHEN:
+                    return Response({"error": "error.orderAlreadyInKitchen"}, status=status.HTTP_409_CONFLICT)
             reason = str(request.data.get("reason", "")).strip()[:500]
+            paid = sum((payment.amount for payment in order.payments.all()), Decimal("0"))
+            if is_admin and not reason and (order.status not in _BEFORE_KITCHEN or paid > 0):
+                return Response({"error": "error.cancelReasonRequired"}, status=status.HTTP_400_BAD_REQUEST)
+            kitchen_was_notified = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)).exists()
+            live_items = list(order.items.exclude(status=OrderItemStatus.VOIDED))
+            total = sum((item.price_snapshot * item.quantity for item in live_items), Decimal("0"))
+            # Dispatched lines already took their ingredients out of stock; the
+            # food exists, so that stock is waste now, not a sale.
+            sale_movements = StockMovement.objects.filter(
+                order_item__in=[item.pk for item in live_items], reason=StockMovementReason.SALE,
+            )
+            wasted = sale_movements.count()
+            sale_movements.update(reason=StockMovementReason.WASTE)
+            from_status = order.status
             conflict = _transition_or_conflict(
                 order,
                 OrderStatus.CANCELLED,
                 request.user,
                 "order_cancelled",
-                details={"reason": reason},
-                extra_fields={"cancelled_at": timezone.now(), "cancel_reason": reason},
+                details={
+                    "reason": reason,
+                    "total": str(total),
+                    "refund": str(paid) if paid else "",
+                    "waste_movements": wasted,
+                    "actor_role": request.user.role,
+                },
+                extra_fields={
+                    "cancelled_at": timezone.now(),
+                    "cancel_reason": reason,
+                    "cancelled_by": request.user,
+                    "cancelled_from_status": from_status,
+                    "cancelled_total": total,
+                    "refunded_amount": paid if paid else None,
+                },
             )
             if conflict:
                 return conflict

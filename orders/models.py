@@ -166,6 +166,17 @@ class Order(BaseModel):
     )
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancel_reason = models.CharField(max_length=500, blank=True)
+    # What a cancellation took away, frozen at that moment: cancelling voids
+    # every line, so the order's own total reads 0 afterwards and the stage
+    # it was at is only in history. The cancelled-orders report reads these.
+    cancelled_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="cancelled_orders"
+    )
+    cancelled_from_status = models.CharField(max_length=16, choices=OrderStatus.choices, blank=True)
+    cancelled_total = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Money already taken when an owner/manager cancelled a paid order: what
+    # has to go back to the customer. Null when nothing had been paid.
+    refunded_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
 

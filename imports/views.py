@@ -107,6 +107,7 @@ class ImportAiDraftView(APIView):
             "file": base64.b64encode(content).decode("ascii"),
             "filename": f"restaurant-ai-draft-{timezone.localdate().isoformat()}.xlsx",
             "summary": draft["summary"],
+            "failed_recipes": draft["failed_recipes"],
             "estimated": [{"sheet": key, "row": row, "fields": fields} for (key, row), fields in rows.items()],
         })
 
@@ -147,7 +148,10 @@ class ImportView(APIView):
                 "columns": [{"key": column.key, "header": column.header} for column in sheet.columns],
                 "rows": rows, "summary": sheet_summary,
             })
-        payload = {"file_errors": file_errors, "sheets": sheets, "summary": summary, "committed": False}
+        payload = {
+            "file_errors": file_errors, "sheets": sheets, "summary": summary, "committed": False,
+            "to_buy": [] if file_errors else restaurant.to_buy(),
+        }
         if not commit:
             return Response(payload)
         if file_errors or summary["error"]:
@@ -155,6 +159,7 @@ class ImportView(APIView):
         with transaction.atomic():
             restaurant.apply()
         payload["committed"] = True
+        payload["to_buy"] = restaurant.to_buy()
         return Response(payload)
 
 

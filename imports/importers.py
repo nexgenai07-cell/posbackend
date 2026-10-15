@@ -106,6 +106,10 @@ class Batch:
         self.auto_items = {}
         # pks of existing dishes whose whole recipe the file sets.
         self.recipe_products = set()
+        # key -> current stock the Stock sheet gives a new item (None = empty).
+        self.new_item_stock = {}
+        # key of a new item -> names of the dishes whose recipes use it.
+        self.item_dishes = {}
         self.created_items = {}
         self.created_products = {}
 
@@ -207,6 +211,7 @@ class StockImporter(SheetImporter):
                 # Known to the Recipes sheet even if this row has an error, so
                 # a recipe using it is not wrongly reported as unknown too.
                 self.batch.new_items.setdefault(_key(name), (name, unit))
+                self.batch.new_item_stock.setdefault(_key(name), numbers["current_stock"])
             if result.errors:
                 continue
 
@@ -665,6 +670,9 @@ class RecipeImporter(SheetImporter):
                 result.error("unitIncompatible", "unit", unit=unit, stockUnit=stock_unit, ingredient=ingredient_name)
             if product is None:
                 continue
+            if isinstance(item, str):
+                dish = (product.name_en or product.name_ar) if isinstance(product, Product) else self.batch.new_products[product]
+                self.batch.item_dishes.setdefault(item, set()).add(dish)
             group_key = product.pk if isinstance(product, Product) else product
             group = groups.setdefault(group_key, {"product": product, "lines": {}, "rows": []})
             if item is not None:
@@ -851,6 +859,21 @@ class RestaurantImport:
     def apply(self):
         for sheet in self.sheets:
             sheet.apply()
+
+    def to_buy(self):
+        """Stock items this file adds with nothing in hand, and the dishes
+        whose recipes use them: what to purchase before those dishes can be
+        made. After apply() each carries its new id, for the purchase form."""
+        items = []
+        for key, (name, unit) in {**self.batch.auto_items, **self.batch.new_items}.items():
+            if self.batch.new_item_stock.get(key):
+                continue
+            created = self.batch.created_items.get(key)
+            items.append({
+                "name": name, "unit": unit, "dishes": sorted(self.batch.item_dishes.get(key, ()), key=str.casefold),
+                "id": str(created.pk) if created else None,
+            })
+        return sorted(items, key=lambda entry: entry["name"].casefold())
 
     def checklist(self):
         products = Product.objects.filter(branch=self.branch)
