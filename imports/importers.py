@@ -36,7 +36,7 @@ from inventory.models import InventoryItem, RecipeItem, StockMovementReason
 from inventory.services import adjust_stock, units_compatible
 from purchasing.models import Supplier
 
-from .workbook import MAX_ROWS, Column, SheetSpec, decimal, sheet_column_range, show, text, yes_no
+from .workbook import MAX_ROWS, Column, SheetSpec, decimal, paragraph, sheet_column_range, show, text, yes_no
 
 UNITS = ["kg", "g", "l", "ml", "pcs", "dozen"]
 STOCK_SHEET, MENU_SHEET, RECIPE_SHEET = "1 Stock", "2 Menu", "3 Recipes"
@@ -232,7 +232,7 @@ class StockImporter(SheetImporter):
                 continue
 
             fields = {}
-            if unit != item.unit:
+            if unit != text(item.unit):
                 fields["unit"] = unit
                 result.change("unit", item.unit, unit)
                 self.batch.new_units[item.pk] = unit
@@ -348,7 +348,8 @@ class ProductImporter(SheetImporter):
 
     def _read(self, row, result):
         values = row.values
-        parsed = {key: text(values.get(key)) for key in ("category", "name_en", "name_ar", "description_en", "description_ar", "size_en", "size_ar")}
+        parsed = {key: text(values.get(key)) for key in ("category", "name_en", "name_ar", "size_en", "size_ar")}
+        parsed.update({key: paragraph(values.get(key)) for key in ("description_en", "description_ar")})
         for key, max_length in (("category", 255), ("name_en", 255), ("name_ar", 255), ("size_en", 120), ("size_ar", 120)):
             _limit(result, parsed[key], self.col(key), max_length)
         for key in ("price", "size_price"):
@@ -456,7 +457,10 @@ class ProductImporter(SheetImporter):
                     product_fields["category"] = values["category"]
                     first_result.change("category", current_category, values["category"])
                 for field_key in ("name_en", "name_ar", "description_en", "description_ar"):
-                    if values[field_key] and values[field_key] != getattr(product, field_key):
+                    # Compared the way the file was read, so stray spaces
+                    # already in the database are not reported as a change.
+                    read = paragraph if field_key.startswith("description") else text
+                    if values[field_key] and values[field_key] != read(getattr(product, field_key)):
                         product_fields[field_key] = values[field_key]
                         first_result.change(field_key, getattr(product, field_key), values[field_key])
                 if values["price"] is not None and values["price"] != product.price:
@@ -492,7 +496,7 @@ class ProductImporter(SheetImporter):
                     size_ops.append(("create", parsed["size_en"], parsed["size_ar"], parsed["size_price"], multiplier))
                     continue
                 variant_fields = {}
-                if parsed["size_ar"] and parsed["size_ar"] != variant.name_ar:
+                if parsed["size_ar"] and parsed["size_ar"] != text(variant.name_ar):
                     variant_fields["name_ar"] = parsed["size_ar"]
                     result.change("size_ar", variant.name_ar, parsed["size_ar"])
                 if parsed["size_price"] is not None and parsed["size_price"] != variant.price:
@@ -777,6 +781,66 @@ class RestaurantImport:
 
     def specs(self):
         return [sheet.spec() for sheet in self.sheets]
+
+    def draft_specs(self, draft):
+        """The current data with an AI draft (ai.draft()) merged in, as
+        SheetSpecs, and the cells it estimated as [(sheet key, row number,
+        column key)] — the workbook the admin would have made by hand."""
+        stock, menu, recipes = self.sheets
+        guessed = {}  # id(row dict) -> estimated column keys
+
+        stock_rows = stock.template_rows()
+        by_name = {_key(row["name"]): row for row in stock_rows}
+        for values, estimated in draft["stock"]:
+            row = by_name.get(_key(values.get("name")))
+            if row is None:
+                row = by_name[_key(values.get("name"))] = {}
+                stock_rows.append(row)
+            row.update({key: value for key, value in values.items() if value not in (None, "")})
+            guessed.setdefault(id(row), set()).update(estimated)
+
+        menu_rows = menu.template_rows()
+        dishes = {}
+        for row in menu_rows:
+            dishes.setdefault(_key(row.get("name_en") or row.get("name_ar")), []).append(row)
+        for values, estimated in draft["products"]:
+            dish_rows = dishes.setdefault(_key(values.get("name_en") or values.get("name_ar")), [])
+            dish_values = {key: values[key] for key in PRODUCT_FIELDS if values.get(key) not in (None, "")}
+            size_values = {key: value for key, value in values.items() if key not in PRODUCT_FIELDS and value not in (None, "")}
+            # A dish's own values sit on every one of its size rows, or the
+            # rows would disagree with each other (conflictingValue).
+            for row in dish_rows:
+                row.update(dish_values)
+            size = _key(values.get("size_en") or values.get("size_ar"))
+            target = next((row for row in dish_rows if _key(row.get("size_en") or row.get("size_ar")) == size), None)
+            if target is None:
+                target = {key: dish_rows[0].get(key) for key in PRODUCT_FIELDS} if dish_rows else {}
+                target.update(dish_values)
+                dish_rows.append(target)
+                menu_rows.append(target)
+            target.update(size_values)
+            guessed.setdefault(id(target), set()).update(estimated)
+
+        drafted = {}
+        for values, estimated in draft["recipes"]:
+            drafted.setdefault(_key(values.get("product")), []).append((values, estimated))
+        # A dish the draft gives a recipe gets exactly that recipe, the same
+        # replace-all rule as the Recipes sheet itself.
+        recipe_rows = [row for row in recipes.template_rows() if _key(row["product"]) not in drafted]
+        for lines in drafted.values():
+            for values, estimated in lines:
+                row = dict(values)
+                recipe_rows.append(row)
+                guessed[id(row)] = set(estimated)
+
+        rows = {stock.key: stock_rows, menu.key: menu_rows, recipes.key: recipe_rows}
+        specs, marks = [], []
+        for sheet in self.sheets:
+            specs.append(SheetSpec(sheet.sheet_title, sheet.columns, rows[sheet.key], sheet.rules))
+            for number, row in enumerate(rows[sheet.key], start=2):
+                for key in sorted(guessed.get(id(row), ())):
+                    marks.append((sheet.key, number, key))
+        return specs, marks
 
     def plan(self, parsed):
         """{sheet key: [RowResult]} for {sheet key: ParsedSheet}."""

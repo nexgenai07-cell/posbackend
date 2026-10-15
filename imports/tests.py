@@ -1,9 +1,12 @@
+import base64
 import json
 from decimal import Decimal
 from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from openpyxl import Workbook, load_workbook
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -12,6 +15,8 @@ from accounts.models import Staff, StaffRole
 from branches.models import Branch
 from catalog.models import Category, Product, ProductVariant
 from inventory.models import InventoryItem, RecipeItem, StockMovement, StockMovementReason
+
+from .models import AiDraft
 
 STOCK = ("Name *", "Unit *", "Current stock", "Par level", "Cost per unit", "Supplier")
 MENU = ("Category *", "Name (English)", "Name (Arabic)", "Description (English)", "Description (Arabic)",
@@ -273,3 +278,109 @@ class MarkedFileTests(ImportTestCase):
         self.assertEqual(sheet["C2"].comment.text, "Current stock: write a number")
         self.assertEqual(sheet["C2"].fill.fgColor.rgb[-6:], "FF9999")
         self.assertEqual(sheet["A2"].comment.text, "Whole row problem")
+
+
+class RoundTripTests(ImportTestCase):
+    def test_uploading_the_downloaded_file_unchanged_changes_nothing(self):
+        supplier_item = InventoryItem.objects.create(branch=self.branch, name="Oil", unit="l", current_stock=Decimal("12.345"), par_level=Decimal("0.5"), cost_per_unit=Decimal("549.99"))
+        drinks = Category.objects.create(branch=self.branch, name_en="", name_ar="مشروبات")
+        Product.objects.create(branch=self.branch, category=drinks, name_en="", name_ar="لبن", description_ar="بارد", price=300, cost_price=0, is_available=False)
+        self.karahi.description_en = "Spicy  chicken\nwith fresh tomatoes "
+        self.karahi.save()
+        ProductVariant.objects.create(product=self.karahi, name_en="1 KG", name_ar="", price=2600, recipe_multiplier=Decimal("2.5"))
+        RecipeItem.objects.create(product=self.karahi, inventory_item=self.chicken, quantity=Decimal("0.75"), unit="kg")
+        RecipeItem.objects.create(product=self.karahi, inventory_item=supplier_item, quantity=50, unit="ml")
+
+        template = self.client.get("/api/imports/template/").content
+        body = self.upload(SimpleUploadedFile("same.xlsx", template)).json()
+        self.assertEqual(body["file_errors"], [])
+        changed = [(sheet["key"], row) for sheet in body["sheets"] for row in sheet["rows"] if row["action"] != "unchanged"]
+        self.assertEqual(changed, [])
+        self.assertEqual(body["summary"]["unchanged"], 7)
+
+
+def ai_reply(body, finish_reason="stop"):
+    """What the OpenAI client returns for one chat completion."""
+    message = SimpleNamespace(content=json.dumps(body))
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=SimpleNamespace(prompt_tokens=1200, completion_tokens=800),
+    )
+
+
+def stock_row(name, unit, estimated=()):
+    return {"name": name, "unit": unit, "current_stock": None, "par_level": None, "cost_per_unit": None, "supplier": None, "estimated_fields": list(estimated)}
+
+
+def menu_row(name, category, price=None, estimated=()):
+    return {"category": category, "name_en": name, "name_ar": None, "description_en": None, "description_ar": None, "price": price,
+            "available": None, "size_en": None, "size_ar": None, "size_price": None, "recipe_multiplier": None, "estimated_fields": list(estimated)}
+
+
+def recipe_row(dish, ingredient, quantity, unit):
+    return {"product": dish, "ingredient": ingredient, "quantity": quantity, "unit": unit, "estimated_fields": ["quantity"]}
+
+
+@override_settings(AI_API_KEY="test-key", AI_DRAFTS_PER_DAY=2)
+class AiDraftTests(ImportTestCase):
+    def draft(self, body, text="Add chicken pulao 900 with its recipe", **kwargs):
+        with patch("imports.ai.OpenAI") as client_class:
+            client_class.return_value.chat.completions.create.return_value = ai_reply(body, **kwargs)
+            response = self.client.post("/api/imports/ai-draft/", {"text": text}, format="json")
+        return response, client_class
+
+    def test_draft_is_a_file_that_previews_like_any_upload(self):
+        body = {
+            "summary": "Added Chicken Pulao with a recipe.",
+            "stock": [stock_row("Rice", "kg")],
+            "products": [menu_row("Chicken Pulao", "Rice", 900)],
+            "recipes": [recipe_row("Chicken Pulao", "Rice", 250, "g"), recipe_row("Chicken Pulao", "Chicken", 200, "g")],
+        }
+        response, client_class = self.draft(body)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data["summary"], "Added Chicken Pulao with a recipe.")
+        content = base64.b64decode(data["file"])
+        # The current data is still there, the draft's rows are added to it.
+        book = load_workbook(BytesIO(content))
+        self.assertEqual([row[0].value for row in book["1 Stock"].iter_rows(min_row=2)], ["Chicken", "Rice"])
+        # Recipe quantities are the AI's guess: marked yellow, and listed.
+        self.assertEqual(book["3 Recipes"]["C2"].fill.fgColor.rgb[-6:], "FFF2A8")
+        self.assertIn({"sheet": "recipes", "row": 2, "fields": ["quantity"]}, data["estimated"])
+
+        preview = self.upload(SimpleUploadedFile("draft.xlsx", content)).json()
+        self.assertEqual(preview["summary"]["error"], 0)
+        self.assertEqual(preview["summary"]["create"], 4)
+        self.assertFalse(Product.objects.filter(name_en="Chicken Pulao").exists())
+        self.assertEqual(AiDraft.objects.get().completion_tokens, 800)
+        # The model sees what exists, so it can reuse the exact names.
+        request = client_class.return_value.chat.completions.create.call_args.kwargs
+        self.assertIn("Chicken Karahi", request["messages"][1]["content"])
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+
+    def test_only_prices_the_admin_wrote_are_kept(self):
+        # The request text says 900. The AI's own flags do not decide it:
+        # 900 stays even though flagged, 2200 goes even though not flagged.
+        products = [menu_row("Chicken Pulao", "Rice", 900, estimated=["price"]), menu_row("Mutton Karahi", "Karahi", 2200)]
+        data = self.draft({"summary": "", "stock": [], "products": products, "recipes": []})[0].json()
+        preview = self.upload(SimpleUploadedFile("draft.xlsx", base64.b64decode(data["file"]))).json()
+        pulao, mutton = self.rows(preview, "products")[-2:]
+        self.assertIn({"field": "price", "old": "", "new": "900"}, pulao["changes"])
+        self.assertEqual(mutton["errors"][0]["code"], "priceRequired")
+
+    def test_drafting_an_existing_dish_keeps_its_other_rows_consistent(self):
+        ProductVariant.objects.create(product=self.karahi, name_en="1 KG", name_ar="", price=2600, recipe_multiplier=2)
+        body = {"summary": "", "stock": [], "products": [menu_row("Chicken Karahi", "Karahi", 1500)], "recipes": []}
+        data = self.draft(body, text="Chicken Karahi is now Rs. 1,500")[0].json()
+        preview = self.upload(SimpleUploadedFile("draft.xlsx", base64.b64decode(data["file"]))).json()
+        self.assertEqual(preview["summary"]["error"], 0)
+        self.assertIn({"field": "price", "old": "1400", "new": "1500"}, self.rows(preview, "products")[0]["changes"])
+
+    def test_cut_off_answer_daily_limit_and_missing_key(self):
+        self.assertEqual(self.draft({}, finish_reason="length")[0].json(), {"error": "imports.aiTooLong"})
+        self.draft({})
+        response = self.draft({})[0]
+        self.assertEqual((response.status_code, response.json()["error"]), (status.HTTP_429_TOO_MANY_REQUESTS, "imports.aiDailyLimit"))
+        self.assertEqual(self.client.get("/api/imports/guide/").json()["ai"], {"enabled": True, "left_today": 0})
+        with override_settings(AI_API_KEY=""):
+            self.assertEqual(self.draft({})[0].status_code, status.HTTP_503_SERVICE_UNAVAILABLE)

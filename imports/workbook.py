@@ -28,6 +28,7 @@ LISTS_SHEET = "Lists"
 REQUIRED_FILL = PatternFill("solid", fgColor="F4B183")
 OPTIONAL_FILL = PatternFill("solid", fgColor="E7E6E6")
 ERROR_FILL = PatternFill("solid", fgColor="FF9999")
+ESTIMATE_FILL = PatternFill("solid", fgColor="FFF2A8")
 
 
 @dataclass
@@ -245,16 +246,17 @@ def read_sheet(book, sheet_title, columns):
     return result, []
 
 
-def mark_problems(book, marks):
-    """The admin's own file back with every problem cell filled red and the
-    message as the cell's comment, so they fix it where it is.
+def mark_cells(book, marks, fill=ERROR_FILL):
+    """The workbook with every marked cell filled and its message as the
+    cell's comment — red problems for the admin to fix where they are, or
+    yellow AI estimates for them to check.
 
     `marks`: [(sheet title, row number, 1-based column, message)]."""
     for sheet_title, row, column, message in marks:
         if sheet_title not in book.sheetnames:
             continue
         cell = book[sheet_title].cell(row=row, column=column)
-        cell.fill = ERROR_FILL
+        cell.fill = fill
         text_value = f"{cell.comment.text}\n{message}" if cell.comment and cell.comment.author == "Check" else message
         cell.comment = Comment(text_value, "Check", width=300, height=110)
     output = BytesIO()
@@ -271,6 +273,14 @@ def text(value):
     if isinstance(value, float) and value.is_integer():
         value = int(value)  # "12" typed into a cell Excel decided was a number
     return " ".join(str(value).split())
+
+
+def paragraph(value):
+    """Free text such as a description: line breaks and spacing are the
+    admin's own, so only the edges are trimmed."""
+    if value is None:
+        return ""
+    return str(value).replace("\r\n", "\n").strip()
 
 
 def decimal(value, column, *, minimum=Decimal("0"), allow_zero=True):

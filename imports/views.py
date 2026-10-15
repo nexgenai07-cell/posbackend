@@ -1,5 +1,8 @@
+import base64
 import json
+from io import BytesIO
 
+from django.conf import settings
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -8,10 +11,14 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from openpyxl import load_workbook
+
 from accounts.permissions import IsOwnerOrManager
 
+from . import ai
 from .importers import ACTIONS, START_LINES, RestaurantImport
-from .workbook import build_workbook, mark_problems, open_upload, read_sheet
+from .models import AiDraft
+from .workbook import ESTIMATE_FILL, build_workbook, mark_cells, open_upload, read_sheet
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -41,7 +48,67 @@ class ImportGuideView(APIView):
     permission_classes = [IsOwnerOrManager]
 
     def get(self, request):
-        return Response(RestaurantImport(request.user.branch).guide())
+        guide = RestaurantImport(request.user.branch).guide()
+        guide["ai"] = {"enabled": ai.enabled(), "left_today": _ai_left_today(request.user.branch)}
+        return Response(guide)
+
+
+def _ai_left_today(branch):
+    used = AiDraft.objects.filter(branch=branch, created_at__date=timezone.localdate()).count()
+    return max(settings.AI_DRAFTS_PER_DAY - used, 0)
+
+
+class ImportAiDraftView(APIView):
+    """POST {text} — the restaurant workbook with an AI draft of the admin's
+    request merged in, as a file the page then previews like any upload:
+    {file (base64 .xlsx), filename, summary, estimated: [{sheet, row, fields}]}.
+    Nothing is written here except the AiDraft log row; saving still goes
+    through the import preview and Confirm."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def post(self, request):
+        branch = request.user.branch
+        if not ai.enabled():
+            return Response({"error": "imports.aiNotConfigured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            return Response({"error": "imports.aiTextRequired"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(text) > ai.MAX_TEXT:
+            return Response({"error": "imports.aiTextTooLong"}, status=status.HTTP_400_BAD_REQUEST)
+        if _ai_left_today(branch) == 0:
+            return Response({"error": "imports.aiDailyLimit"}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Logged before the call: a request that fails still costs money and
+        # still counts toward the day's allowance.
+        log = AiDraft.objects.create(branch=branch, requested_by=request.user)
+        restaurant = RestaurantImport(branch)
+        try:
+            draft, (log.prompt_tokens, log.completion_tokens) = ai.draft(restaurant, text)
+        except ai.AiDraftError as error:
+            log.error = error.code
+            log.save(update_fields=["error"])
+            return Response({"error": error.code}, status=status.HTTP_502_BAD_GATEWAY)
+        log.succeeded = True
+        log.save(update_fields=["succeeded", "prompt_tokens", "completion_tokens"])
+
+        specs, estimated = restaurant.draft_specs(draft)
+        book = load_workbook(BytesIO(build_workbook(START_LINES, specs, restaurant.lists())))
+        sheets = {sheet.key: sheet for sheet in restaurant.sheets}
+        cells = [
+            (sheets[key].sheet_title, row, [c.key for c in sheets[key].columns].index(field) + 1, "AI estimate: check this value before saving.")
+            for key, row, field in estimated
+        ]
+        content = mark_cells(book, cells, fill=ESTIMATE_FILL)
+        rows = {}
+        for key, row, field in estimated:
+            rows.setdefault((key, row), []).append(field)
+        return Response({
+            "file": base64.b64encode(content).decode("ascii"),
+            "filename": f"restaurant-ai-draft-{timezone.localdate().isoformat()}.xlsx",
+            "summary": draft["summary"],
+            "estimated": [{"sheet": key, "row": row, "fields": fields} for (key, row), fields in rows.items()],
+        })
 
 
 class ImportView(APIView):
@@ -124,4 +191,4 @@ class ImportMarkedView(APIView):
             columns = positions[sheet.key]
             column = columns.get(mark.get("field")) or columns.get(sheet.name_field) or 1
             cells.append((sheet.sheet_title, row, column, str(mark.get("text", ""))[:1000]))
-        return _xlsx(mark_problems(book, cells), "restaurant-to-fix")
+        return _xlsx(mark_cells(book, cells), "restaurant-to-fix")

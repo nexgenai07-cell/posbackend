@@ -266,6 +266,14 @@ MOYASAR_API_BASE = env('MOYASAR_API_BASE', default='https://api.moyasar.com/v1')
 # is the real gate either way. See orders/moyasar.webhook_secret_matches().
 MOYASAR_WEBHOOK_SECRET = env('MOYASAR_WEBHOOK_SECRET', default='')
 
+# "Fill with AI" in the Excel import (imports/ai.py): any OpenAI-compatible
+# chat endpoint (NVIDIA by default). A blank key turns the option off and the
+# endpoint answers 503 imports.aiNotConfigured instead of failing obscurely.
+AI_API_KEY = env('AI_API_KEY', default='')
+AI_BASE_URL = env('AI_BASE_URL', default='https://integrate.api.nvidia.com/v1')
+AI_MODEL = env('AI_MODEL', default='nvidia/nemotron-3-super-120b-a12b')
+AI_DRAFTS_PER_DAY = env.int('AI_DRAFTS_PER_DAY', default=20)
+
 # Every bill is charged in SAR, hard-coded in orders/billing.py. Moyasar takes
 # the amount in halalas (1 SAR = 100 halalas), computed server-side from
 # Decimal only. NOTE FOR GOING LIVE: catalog Product.price is a bare Decimal
