@@ -40,8 +40,10 @@ logger = logging.getLogger("orders.billing")
 
 
 def _bill_queryset():
-    return Bill.objects.select_related("table", "branch").prefetch_related(
-        "orders__items", "orders__history", "moyasar_payments"
+    # Everything BillSerializer reads, loaded up front — payments feed
+    # amount_paid / amount_outstanding, customer the staff-only phone/name.
+    return Bill.objects.select_related("table", "branch", "customer").prefetch_related(
+        "orders__items", "orders__history", "orders__payments", "moyasar_payments"
     )
 
 

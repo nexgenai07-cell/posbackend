@@ -163,11 +163,14 @@ def unserved_orders(bill):
     customer is told to wait rather than being handed a form that would strand
     their money against an order that cannot transition.
     """
+    # order.items.all(), not .exclude().exists(): read the same way as
+    # order_total(), it uses the bill list's prefetched items instead of one
+    # query per order.
     return [
         order for order in billable_orders(bill)
         if order.status != OrderStatus.PAID and (
             order.status != OrderStatus.SERVED
-            or order.items.exclude(status__in=(OrderItemStatus.SERVED, OrderItemStatus.VOIDED)).exists()
+            or any(item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED) for item in order.items.all())
         )
     ]
 

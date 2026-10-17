@@ -52,6 +52,8 @@ class PurchaseItemSerializer(serializers.ModelSerializer):
     def _movement(self, obj):
         if obj.purchase.status != PurchaseStatus.RECEIVED:
             return None
+        if hasattr(obj, "movements_by_id"):  # prefetched by PurchaseViewSet
+            return obj.movements_by_id[0] if obj.movements_by_id else None
         return StockMovement.objects.filter(
             purchase_item_id=obj.pk,
         ).order_by("id").first()

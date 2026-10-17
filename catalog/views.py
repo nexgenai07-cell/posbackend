@@ -7,7 +7,7 @@ from rest_framework.views import APIView
 from accounts.permissions import IsOwnerOrManager
 from branches.models import Branch
 from common.mixins import BranchScopedQuerysetMixin
-from inventory.services import check_product_stock, check_products_stock, orderable_units
+from inventory.services import availability_from, stock_requirements, units_from, variant_multiplier
 
 from .models import Category, Deal, Product, ProductVariant
 from .serializers import CategorySerializer, DealSerializer, ProductSerializer, ProductVariantSerializer
@@ -90,11 +90,11 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
         products = list(page if page is not None else queryset)
-        stock_status = check_products_stock(products)
-        units = orderable_units(products)
+        items, requirements = stock_requirements(products)
         for product in products:
-            product._is_orderable = is_available_today(product) and stock_status.get(product.pk, (False, None))[0]
-            product._available_quantity = units.get(product.pk, 0) if product._is_orderable else 0
+            requirement = requirements.get(product.pk, "missing_recipe")
+            product._is_orderable = is_available_today(product) and availability_from(items, requirement)[0]
+            product._available_quantity = units_from(items, requirement) if product._is_orderable else 0
         serializer = self.get_serializer(products, many=True)
         return self.get_paginated_response(serializer.data) if page is not None else Response(serializer.data)
 
@@ -179,15 +179,17 @@ class PublicMenuView(APIView):
             .prefetch_related("deal__windows", "recipe_items__inventory_item", "variants")
         )
         products = list(products)
-        stock_status = check_products_stock(products)
-        units = orderable_units(products)
+        # Recipes and stock read once for the whole menu; every product and
+        # every size below is checked against this same snapshot.
+        items, requirements = stock_requirements(products)
 
         by_category = {}
         for product in products:
+            requirement = requirements.get(product.pk, "missing_recipe")
             is_orderable = (
                 product.is_available
                 and is_available_today(product)
-                and stock_status.get(product.pk, (False, None))[0]
+                and availability_from(items, requirement)[0]
             )
             # .all() reuses the prefetched recipe; .exists() queried per product.
             has_recipe = bool(product.recipe_items.all())
@@ -221,7 +223,7 @@ class PublicMenuView(APIView):
                 # How many the customer can still add, so the menu and cart
                 # disable "+" at the limit. Capped: this endpoint is public,
                 # and the exact stock level is not a customer's business.
-                "available_quantity": min(units.get(product.pk, 0), PUBLIC_QUANTITY_CAP),
+                "available_quantity": min(units_from(items, requirement), PUBLIC_QUANTITY_CAP),
                 "has_recipe": has_recipe,
                 # Active variants only — an inactive size must not be
                 # orderable. Each carries its own deal-resolved price via the
@@ -238,9 +240,9 @@ class PublicMenuView(APIView):
                         "price": str(current_price(product, variant)),
                         "original_price": str(variant.price) if current_price(product, variant) != variant.price else None,
                         "on_deal": current_price(product, variant) != variant.price,
-                        "is_orderable": is_orderable and check_product_stock(product, 1, variant=variant)[0],
+                        "is_orderable": is_orderable and availability_from(items, requirement, 1, variant_multiplier(variant))[0],
                         "available_quantity": min(
-                            orderable_units([product], multiplier=variant.recipe_multiplier).get(product.pk, 0),
+                            units_from(items, requirement, variant.recipe_multiplier),
                             PUBLIC_QUANTITY_CAP,
                         ) if is_orderable else 0,
                     }

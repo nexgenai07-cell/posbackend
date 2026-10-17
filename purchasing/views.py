@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.http import HttpResponse
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -11,11 +11,11 @@ from rest_framework.response import Response
 
 from accounts.permissions import IsOwnerOrManager
 from common.mixins import BranchScopedQuerysetMixin
-from inventory.models import InventoryItem, StockMovementReason
+from inventory.models import InventoryItem, StockMovement, StockMovementReason
 from inventory.services import adjust_stock
 from reports.filters import branch_datetime_bounds, parse_date_range
 
-from .models import Purchase, PurchaseStatus, Supplier
+from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier
 from .services import apply_purchase_stock, reverse_purchase_stock
 from .serializers import PurchaseSerializer, SupplierSerializer
 
@@ -57,7 +57,14 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """Read is any authenticated staff; write is owner/manager only. Once a
     purchase is received, it's immutable — no PATCH, no DELETE."""
 
-    queryset = Purchase.objects.select_related("supplier").prefetch_related("items")
+    # Everything the serializer reads per line, loaded up front: the stock
+    # item (name, unit) and the line's stock movements (before / added /
+    # after). Without these the list ran ~4 queries per purchase line.
+    queryset = Purchase.objects.select_related("supplier", "branch").prefetch_related(
+        Prefetch("items", queryset=PurchaseItem.objects.select_related("inventory_item").prefetch_related(
+            Prefetch("stock_movements", queryset=StockMovement.objects.order_by("id"), to_attr="movements_by_id"),
+        )),
+    )
     serializer_class = PurchaseSerializer
 
     def get_permissions(self):

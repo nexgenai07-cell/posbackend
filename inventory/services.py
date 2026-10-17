@@ -103,20 +103,11 @@ def check_products_stock(products, quantity=1, *, lock=False, multiplier=None):
     made. Omitted, it checks the base recipe, which is what the public menu
     wants: a product is listed if ANY portion of it can be made.
     """
-    quantity = Decimal(str(quantity))
     items, per_product = _per_unit_requirements(products, lock=lock)
-    availability = {}
-    for product_id, requirement in per_product.items():
-        if isinstance(requirement, str):
-            availability[product_id] = (False, requirement)
-            continue
-        if any(items[item_id].current_stock <= 0
-               or items[item_id].current_stock < required * quantity * (multiplier or Decimal("1"))
-               for item_id, required in requirement.items()):
-            availability[product_id] = (False, "insufficient_stock")
-        else:
-            availability[product_id] = (True, None)
-    return availability
+    return {
+        product_id: availability_from(items, requirement, quantity, multiplier)
+        for product_id, requirement in per_product.items()
+    }
 
 
 def orderable_units(products, *, multiplier=None):
@@ -129,18 +120,46 @@ def orderable_units(products, *, multiplier=None):
     tapping and then being refused with error.productUnavailable. Same rules
     as check_products_stock(); nothing is reserved.
     """
-    scale = Decimal(str(multiplier)) if multiplier else Decimal("1")
     items, per_product = _per_unit_requirements(products)
-    units = {}
-    for product_id, requirement in per_product.items():
-        if isinstance(requirement, str) or not requirement or scale <= 0:
-            units[product_id] = 0
-            continue
-        units[product_id] = max(0, min(
-            int(items[item_id].current_stock // (required * scale)) if items[item_id].current_stock > 0 else 0
-            for item_id, required in requirement.items()
-        ))
-    return units
+    return {
+        product_id: units_from(items, requirement, multiplier)
+        for product_id, requirement in per_product.items()
+    }
+
+
+def stock_requirements(products):
+    """
+    Read recipes and stock for a batch of products ONCE, for a caller that
+    then checks several portion sizes of each with availability_from() /
+    units_from() — instead of check_product_stock() per size, which reads
+    them again every time (two queries per variant on the public menu).
+    """
+    return _per_unit_requirements(products)
+
+
+def availability_from(items, requirement, quantity=1, multiplier=None):
+    """(available, reason) for one product's requirement from
+    stock_requirements() — the rule check_products_stock() applies."""
+    if isinstance(requirement, str):
+        return False, requirement
+    quantity = Decimal(str(quantity))
+    scale = multiplier or Decimal("1")
+    if any(items[item_id].current_stock <= 0 or items[item_id].current_stock < required * quantity * scale
+           for item_id, required in requirement.items()):
+        return False, "insufficient_stock"
+    return True, None
+
+
+def units_from(items, requirement, multiplier=None):
+    """Whole units one product's requirement allows — the rule
+    orderable_units() applies."""
+    scale = Decimal(str(multiplier)) if multiplier else Decimal("1")
+    if isinstance(requirement, str) or not requirement or scale <= 0:
+        return 0
+    return max(0, min(
+        int(items[item_id].current_stock // (required * scale)) if items[item_id].current_stock > 0 else 0
+        for item_id, required in requirement.items()
+    ))
 
 
 def _per_unit_requirements(products, *, lock=False):
