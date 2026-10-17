@@ -24,6 +24,10 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 YES_NO = ("Yes", "No")
 START_SHEET = "Start here"
 LISTS_SHEET = "Lists"
+# Label of the "Start here" row that carries the file code (an
+# ImportDownload id). Plain text in a visible cell, so it survives Excel,
+# Google Sheets, LibreOffice — anything that keeps a cell's text.
+FILE_CODE_LABEL = "File code"
 
 REQUIRED_FILL = PatternFill("solid", fgColor="F4B183")
 OPTIONAL_FILL = PatternFill("solid", fgColor="E7E6E6")
@@ -115,12 +119,13 @@ def _validation(column, reference):
     return validation
 
 
-def build_workbook(start_lines, sheets, lists):
+def build_workbook(start_lines, sheets, lists, file_code=None):
     """The workbook an admin downloads: a "Start here" sheet, then one sheet
     per SheetSpec pre-filled with current data, then the hidden lists.
 
     `lists` maps a list name to its dropdown values, or to a ready Excel
-    range (str) when the values live on another sheet of the same file."""
+    range (str) when the values live on another sheet of the same file.
+    `file_code` goes on the "Start here" sheet, read back by read_file_code()."""
     book = Workbook()
     start = book.active
     start.title = START_SHEET
@@ -162,7 +167,7 @@ def build_workbook(start_lines, sheets, lists):
                 if value not in (None, ""):
                     sheet.cell(row=row_index, column=col_index, value=value)
 
-    _write_start(start, start_lines, sheets)
+    _write_start(start, start_lines, sheets, file_code)
     book.active = 0
 
     output = BytesIO()
@@ -170,7 +175,7 @@ def build_workbook(start_lines, sheets, lists):
     return output.getvalue()
 
 
-def _write_start(sheet, start_lines, sheets):
+def _write_start(sheet, start_lines, sheets, file_code):
     sheet.column_dimensions["A"].width = 26
     sheet.column_dimensions["B"].width = 12
     sheet.column_dimensions["C"].width = 90
@@ -180,6 +185,13 @@ def _write_start(sheet, start_lines, sheets):
         cell = sheet.cell(row=row, column=1, value=line)
         if index == 0:
             cell.font = Font(bold=True, size=14)
+        row += 1
+    if file_code:
+        row += 1
+        sheet.cell(row=row, column=1, value=FILE_CODE_LABEL).font = Font(bold=True)
+        sheet.cell(row=row, column=2, value=str(file_code))
+        row += 1
+        sheet.cell(row=row, column=1, value="Do not change the file code. It tells the upload which values you changed and which changed in the restaurant (sales, purchases) after you downloaded this file.")
         row += 1
     legend = sheet.cell(row=row + 1, column=1, value="Orange heading = must be filled")
     legend.fill = REQUIRED_FILL
@@ -244,6 +256,17 @@ def read_sheet(book, sheet_title, columns):
             return result, [{"code": "tooManyRows", "params": {"sheet": sheet_title, "max": MAX_ROWS}}]
         result.rows.append(ParsedRow(number=number, values=values))
     return result, []
+
+
+def read_file_code(book):
+    """The file code written by build_workbook(), or None for a file without
+    one (made by hand, or by an outside AI chat from the copied prompt)."""
+    if START_SHEET not in book.sheetnames:
+        return None
+    for row in book[START_SHEET].iter_rows(max_col=2, values_only=True):
+        if row and _normalise_header(row[0]) == _normalise_header(FILE_CODE_LABEL):
+            return text(row[1] if len(row) > 1 else None) or None
+    return None
 
 
 def mark_cells(book, marks, fill=ERROR_FILL):

@@ -27,7 +27,11 @@ ingredient line is shown in the preview as a delete.
 
 import difflib
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
+
+from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 from openpyxl.utils import get_column_letter, quote_sheetname
 
@@ -36,11 +40,13 @@ from inventory.models import InventoryItem, RecipeItem, StockMovementReason
 from inventory.services import adjust_stock, units_compatible
 from purchasing.models import Supplier
 
+from .models import ImportDownload
 from .workbook import MAX_ROWS, Column, SheetSpec, decimal, paragraph, sheet_column_range, show, text, yes_no
 
 UNITS = ["kg", "g", "l", "ml", "pcs", "dozen"]
 STOCK_SHEET, MENU_SHEET, RECIPE_SHEET = "1 Stock", "2 Menu", "3 Recipes"
 ACTIONS = ("create", "update", "unchanged", "delete", "error")
+DOWNLOAD_DAYS = 90
 
 
 @dataclass
@@ -112,6 +118,9 @@ class Batch:
         self.item_dishes = {}
         self.created_items = {}
         self.created_products = {}
+        # key -> {field: Decimal} for each stock item as it was when the file
+        # was downloaded (ImportDownload); None for a file without a code.
+        self.at_download = None
 
 
 class SheetImporter:
@@ -161,8 +170,40 @@ class StockImporter(SheetImporter):
         "Removing a row from this sheet does NOT delete the item from the system.",
     ]
 
+    # Values the restaurant changes by itself between a download and an
+    # upload: sales and adjustments move stock, a received purchase sets the
+    # cost. A stale file must not quietly put the old number back.
+    tracked = ("current_stock", "par_level", "cost_per_unit")
+
     def _items(self):
         return InventoryItem.objects.filter(branch=self.branch).select_related("supplier").order_by("name")
+
+    def downloaded(self):
+        """{key: {field: value}} as the file is filled now, for ImportDownload."""
+        return {_key(item.name): {key: format(getattr(item, key), "f") for key in self.tracked} for item in self._items()}
+
+    def _against_download(self, result, item, numbers):
+        """Drop the tracked values the admin left as downloaded, and refuse
+        those the admin changed while the restaurant changed them too.
+
+        Left as downloaded: the file still shows what the item had then, so
+        it says nothing about what it should have now — today's value is
+        kept, with a note when it moved. Both changed: neither number can be
+        trusted to be the one meant, so the admin decides on a fresh file."""
+        at_download = self.batch.at_download.get(_key(item.name)) if self.batch.at_download is not None else None
+        if at_download is None:
+            return
+        for key in self.tracked:
+            value, then, now = numbers[key], at_download.get(key), getattr(item, key)
+            if value is None or then is None:
+                continue
+            column = self.col(key).header
+            if value == then:
+                numbers[key] = None
+                if now != then:
+                    result.note("keptCurrent", column=column, downloaded=show(then), now=show(now))
+            elif now != then:
+                result.error("changedSinceDownload", key, column=column, downloaded=show(then), now=show(now), file=show(value))
 
     def template_rows(self):
         return [{
@@ -207,6 +248,8 @@ class StockImporter(SheetImporter):
             supplier_name = text(values.get("supplier"))
             _limit(result, supplier_name, self.col("supplier"), 255)
             item = existing.get(_key(name)) if name else None
+            if item is not None:
+                self._against_download(result, item, numbers)
             if name and unit and item is None:
                 # Known to the Recipes sheet even if this row has an error, so
                 # a recipe using it is not wrongly reported as unknown too.
@@ -850,8 +893,28 @@ class RestaurantImport:
                     marks.append((sheet.key, number, key))
         return specs, marks
 
-    def plan(self, parsed):
-        """{sheet key: [RowResult]} for {sheet key: ParsedSheet}."""
+    def record_download(self):
+        """The file code for a workbook filled with the data as it is now.
+        Codes older than DOWNLOAD_DAYS are dropped: a file that old is stale
+        everywhere, and its upload is asked to start from a fresh one."""
+        ImportDownload.objects.filter(branch=self.branch, created_at__lt=timezone.now() - timedelta(days=DOWNLOAD_DAYS)).delete()
+        return ImportDownload.objects.create(branch=self.branch, stock=self.stock_sheet().downloaded()).pk
+
+    def find_download(self, code):
+        """The stock values recorded for a file code, or None when this
+        branch has no such download (mistyped, another branch's, expired)."""
+        try:
+            download = ImportDownload.objects.filter(branch=self.branch, pk=code).first()
+        except ValidationError:  # not a UUID at all
+            return None
+        if download is None:
+            return None
+        return {key: {field: Decimal(value) for field, value in values.items()} for key, values in download.stock.items()}
+
+    def plan(self, parsed, at_download=None):
+        """{sheet key: [RowResult]} for {sheet key: ParsedSheet}, checked
+        against find_download()'s values when the file has a code."""
+        self.batch.at_download = at_download
         results = {sheet.key: sheet.plan(parsed[sheet.key].rows) for sheet in self.sheets}
         self.stock_sheet().check_unit_changes()
         return results

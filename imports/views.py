@@ -16,9 +16,9 @@ from openpyxl import load_workbook
 from accounts.permissions import IsOwnerOrManager
 
 from . import ai
-from .importers import ACTIONS, START_LINES, RestaurantImport
+from .importers import ACTIONS, DOWNLOAD_DAYS, START_LINES, RestaurantImport
 from .models import AiDraft
-from .workbook import ESTIMATE_FILL, build_workbook, mark_cells, open_upload, read_sheet
+from .workbook import ESTIMATE_FILL, build_workbook, mark_cells, open_upload, read_file_code, read_sheet
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -38,7 +38,7 @@ class ImportTemplateView(APIView):
 
     def get(self, request):
         restaurant = RestaurantImport(request.user.branch)
-        return _xlsx(build_workbook(START_LINES, restaurant.specs(), restaurant.lists()), "restaurant")
+        return _xlsx(build_workbook(START_LINES, restaurant.specs(), restaurant.lists(), restaurant.record_download()), "restaurant")
 
 
 class ImportGuideView(APIView):
@@ -93,7 +93,7 @@ class ImportAiDraftView(APIView):
         log.save(update_fields=["succeeded", "prompt_tokens", "completion_tokens"])
 
         specs, estimated = restaurant.draft_specs(draft)
-        book = load_workbook(BytesIO(build_workbook(START_LINES, specs, restaurant.lists())))
+        book = load_workbook(BytesIO(build_workbook(START_LINES, specs, restaurant.lists(), restaurant.record_download())))
         sheets = {sheet.key: sheet for sheet in restaurant.sheets}
         cells = [
             (sheets[key].sheet_title, row, [c.key for c in sheets[key].columns].index(field) + 1, "AI estimate: check this value before saving.")
@@ -126,7 +126,13 @@ class ImportView(APIView):
         commit = str(request.data.get("commit", "")).lower() in ("1", "true", "yes")
         book, file_errors = open_upload(request.FILES.get("file"))
         parsed = {}
+        at_download = None
         if book is not None:
+            code = read_file_code(book)
+            if code:
+                at_download = restaurant.find_download(code)
+                if at_download is None:
+                    file_errors.append({"code": "fileCodeUnknown", "params": {"days": DOWNLOAD_DAYS}})
             for sheet in restaurant.sheets:
                 parsed[sheet.key], problems = read_sheet(book, sheet.sheet_title, sheet.columns)
                 file_errors += problems
@@ -134,7 +140,7 @@ class ImportView(APIView):
             if not file_errors and not any(sheet.rows for sheet in parsed.values()):
                 file_errors.append({"code": "noRows"})
 
-        results = {} if file_errors else restaurant.plan(parsed)
+        results = {} if file_errors else restaurant.plan(parsed, at_download)
         summary = dict.fromkeys(ACTIONS, 0)
         sheets = []
         for sheet in restaurant.sheets:

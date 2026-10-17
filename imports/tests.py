@@ -1,5 +1,6 @@
 import base64
 import json
+from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from openpyxl import Workbook, load_workbook
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -16,7 +18,7 @@ from branches.models import Branch
 from catalog.models import Category, Product, ProductVariant
 from inventory.models import InventoryItem, RecipeItem, StockMovement, StockMovementReason
 
-from .models import AiDraft
+from .models import AiDraft, ImportDownload
 
 STOCK = ("Name *", "Unit *", "Current stock", "Par level", "Cost per unit", "Supplier")
 MENU = ("Category *", "Name (English)", "Name (Arabic)", "Description (English)", "Description (Arabic)",
@@ -297,6 +299,104 @@ class RoundTripTests(ImportTestCase):
         changed = [(sheet["key"], row) for sheet in body["sheets"] for row in sheet["rows"] if row["action"] != "unchanged"]
         self.assertEqual(changed, [])
         self.assertEqual(body["summary"]["unchanged"], 7)
+
+
+class StaleFileTests(ImportTestCase):
+    """A file downloaded in the morning and uploaded in the afternoon, after
+    orders took stock and a purchase set a new cost."""
+
+    def download(self, **cells):
+        """The template with `cells` ({"C2": 15}) typed into the Stock sheet."""
+        book = load_workbook(BytesIO(self.client.get("/api/imports/template/").content))
+        for cell, value in cells.items():
+            book["1 Stock"][cell] = value
+        output = BytesIO()
+        book.save(output)
+        return output.getvalue()
+
+    def sold(self, stock=None, cost=None):
+        """What the restaurant did between the download and the upload."""
+        if stock is not None:
+            self.chicken.current_stock = Decimal(stock)
+        if cost is not None:
+            self.chicken.cost_per_unit = Decimal(cost)
+        self.chicken.save()
+
+    def test_untouched_cells_keep_what_the_restaurant_has_now(self):
+        file = self.download()  # Chicken: stock 10, cost 600
+        self.sold(stock="7", cost="700")
+        body = self.upload(SimpleUploadedFile("old.xlsx", file)).json()
+        chicken = self.rows(body, "stock")[0]
+        self.assertEqual((chicken["action"], chicken["changes"]), ("unchanged", []))
+        self.assertEqual([note["code"] for note in chicken["notes"]], ["keptCurrent", "keptCurrent"])
+        self.assertEqual(chicken["notes"][0]["params"], {"column": "Current stock", "downloaded": "10", "now": "7"})
+        self.assertTrue(self.upload(SimpleUploadedFile("old.xlsx", file), commit=True).json()["committed"])
+        self.chicken.refresh_from_db()
+        self.assertEqual((self.chicken.current_stock, self.chicken.cost_per_unit), (Decimal("7"), Decimal("700")))
+        self.assertFalse(StockMovement.objects.filter(inventory_item=self.chicken).exists())
+
+    def test_a_cell_both_sides_changed_blocks_the_save(self):
+        file = self.download(C2=15)
+        self.sold(stock="7")
+        response = self.upload(SimpleUploadedFile("old.xlsx", file), commit=True)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        chicken = self.rows(response.json(), "stock")[0]
+        self.assertEqual(chicken["errors"], [{"code": "changedSinceDownload", "field": "current_stock",
+                                              "params": {"column": "Current stock", "downloaded": "10", "now": "7", "file": "15"}}])
+        self.chicken.refresh_from_db()
+        self.assertEqual(self.chicken.current_stock, Decimal("7"))
+
+    def test_a_cell_only_the_admin_changed_is_saved(self):
+        file = self.download(C2=15)
+        self.sold(cost="700")  # a different cell: no conflict
+        body = self.upload(SimpleUploadedFile("old.xlsx", file), commit=True).json()
+        self.assertTrue(body["committed"])
+        self.chicken.refresh_from_db()
+        self.assertEqual((self.chicken.current_stock, self.chicken.cost_per_unit), (Decimal("15"), Decimal("700")))
+
+    def test_the_check_needs_only_the_cell_text_so_any_spreadsheet_app_works(self):
+        """Rebuilt from plain cell values — no hidden sheets, comments or
+        dropdowns, like a file saved back from Google Sheets."""
+        original = load_workbook(BytesIO(self.download()))
+        plain = Workbook()
+        plain.remove(plain.active)
+        for title in ("Start here", "1 Stock", "2 Menu", "3 Recipes"):
+            sheet = plain.create_sheet(title)
+            for row in original[title].iter_rows(values_only=True):
+                sheet.append(list(row))
+        output = BytesIO()
+        plain.save(output)
+        self.sold(stock="7")
+        chicken = self.rows(self.upload(SimpleUploadedFile("sheets.xlsx", output.getvalue())).json(), "stock")[0]
+        self.assertEqual((chicken["action"], chicken["notes"][0]["code"]), ("unchanged", "keptCurrent"))
+
+    def test_an_unknown_or_expired_file_code_asks_for_a_fresh_file(self):
+        file = self.download()
+        ImportDownload.objects.update(created_at=timezone.now() - timedelta(days=91))
+        self.client.get("/api/imports/template/")  # a new download clears the expired one
+        body = self.upload(SimpleUploadedFile("old.xlsx", file)).json()
+        self.assertEqual(body["file_errors"], [{"code": "fileCodeUnknown", "params": {"days": 90}}])
+
+        book = load_workbook(BytesIO(file))
+        for row in book["Start here"].iter_rows():
+            if row[0].value == "File code":
+                row[1].value = "not-a-code"
+        output = BytesIO()
+        book.save(output)
+        body = self.upload(SimpleUploadedFile("typo.xlsx", output.getvalue())).json()
+        self.assertEqual(body["file_errors"], [{"code": "fileCodeUnknown", "params": {"days": 90}}])
+
+    def test_another_branchs_file_code_is_not_used(self):
+        other = Branch.objects.create(name_en="Other", name_ar="", timezone="Asia/Karachi", currency="PKR")
+        file = self.download()
+        ImportDownload.objects.update(branch=other)
+        body = self.upload(SimpleUploadedFile("other.xlsx", file)).json()
+        self.assertEqual(body["file_errors"][0]["code"], "fileCodeUnknown")
+
+    def test_a_file_without_a_code_is_read_as_written(self):
+        self.sold(stock="7")
+        body = self.upload(xlsx(stock=[("Chicken", "kg", 10, None, None, None)])).json()
+        self.assertIn({"field": "current_stock", "old": "7", "new": "10"}, self.rows(body, "stock")[0]["changes"])
 
 
 def ai_reply(body, finish_reason="stop"):
