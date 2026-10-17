@@ -29,6 +29,13 @@ class Purchase(BaseModel):
     ordered_at = models.DateTimeField(auto_now_add=True)
     received_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta(BaseModel.Meta):
+        indexes = [
+            # The purchases list (by order date) and reports (by receive date).
+            models.Index(fields=["branch", "ordered_at"], name="purchase_branch_ordered"),
+            models.Index(fields=["branch", "received_at"], name="purchase_branch_received"),
+        ]
+
     def __str__(self):
         return f"Purchase #{self.pk} ({self.status})"
 

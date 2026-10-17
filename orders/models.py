@@ -126,6 +126,10 @@ class Bill(models.Model):
                 nulls_distinct=False,
             ),
         ]
+        indexes = [
+            # The cashier's queue: one branch's bills that are not closed.
+            models.Index(fields=["branch", "status"], name="bill_branch_status"),
+        ]
 
     @property
     def bill_code(self):
@@ -179,6 +183,14 @@ class Order(BaseModel):
     refunded_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta(BaseModel.Meta):
+        indexes = [
+            # The order list and reports: one branch's orders between two dates.
+            models.Index(fields=["branch", "opened_at"], name="order_branch_opened"),
+            # Queues and counts by state: open / ready / cancelled orders.
+            models.Index(fields=["branch", "status"], name="order_branch_status"),
+        ]
 
     @property
     def order_number(self):
@@ -243,6 +255,13 @@ class Payment(BaseModel):
     method = models.CharField(max_length=8, choices=PaymentMethod.choices)
     tip = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     paid_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta(BaseModel.Meta):
+        indexes = [
+            # sales_orders() dates every paid order by its LATEST payment — a
+            # lookup run once per order in every revenue report.
+            models.Index(fields=["order", "paid_at"], name="payment_order_paid"),
+        ]
 
     def __str__(self):
         return f"{self.amount} via {self.method}"

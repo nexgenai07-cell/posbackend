@@ -66,6 +66,12 @@ class Shift(BaseModel):
     clock_out = models.DateTimeField(null=True, blank=True)
     is_late = models.BooleanField(default=False)
 
+    class Meta(BaseModel.Meta):
+        indexes = [
+            # Attendance: one staff member's shifts between two dates.
+            models.Index(fields=["staff", "clock_in"], name="shift_staff_clock_in"),
+        ]
+
     def __str__(self):
         return f"{self.staff.name} shift starting {self.clock_in:%Y-%m-%d %H:%M}"
 

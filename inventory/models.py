@@ -97,5 +97,11 @@ class StockMovement(BaseModel):
         "purchasing.PurchaseItem", on_delete=models.SET_NULL, null=True, blank=True, related_name="stock_movements"
     )
 
+    class Meta(BaseModel.Meta):
+        indexes = [
+            # Reports of one kind of movement over a date range (wastage).
+            models.Index(fields=["reason", "created_at"], name="movement_reason_created"),
+        ]
+
     def __str__(self):
         return f"{self.quantity_delta} {self.inventory_item.name} ({self.reason})"
