@@ -9,7 +9,7 @@ from common.admin import SoftDeleteAdmin
 from inventory.models import InventoryItem, StockMovementReason
 from inventory.services import adjust_stock
 
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier
+from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument
 
 
 class PurchaseItemInline(admin.TabularInline):
@@ -125,7 +125,8 @@ class SupplierAdmin(SoftDeleteAdmin):
     """Not branch-scoped — the same supplier serves every branch
     (purchasing/views.py)."""
 
-    list_display = ("id", "name_en", "name_ar", "contact_info", "purchase_count", "is_deleted")
+    list_display = ("id", "name_en", "name_ar", "vat_registered", "vat_number", "contact_info", "purchase_count",
+                    "is_deleted")
     list_filter = ("is_deleted",)
     search_fields = ("name_en", "name_ar", "contact_info")
 
@@ -143,3 +144,15 @@ class SupplierAdmin(SoftDeleteAdmin):
         """Anything above zero is why the API refuses to delete this supplier
         (error.supplierInUse), so this column answers "why?"."""
         return obj._purchases
+
+
+@admin.register(SupplierDocument)
+class SupplierDocumentAdmin(admin.ModelAdmin):
+    """Supplier tax invoices and credit notes, as recorded for input VAT.
+    Nothing here is sent to ZATCA."""
+
+    list_display = ("id", "kind", "number", "issue_date", "purchase", "net", "vat", "total")
+    list_filter = ("kind",)
+    search_fields = ("number", "purchase__supplier__name_en")
+    readonly_fields = ("qr_check", "created_by", "created_at", "updated_at")
+    raw_id_fields = ("purchase",)

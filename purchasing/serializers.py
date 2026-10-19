@@ -6,7 +6,8 @@ from django.db import transaction
 from common.validators import reject_branch_mismatch, require_bilingual_pair
 from inventory.models import InventoryItem, StockMovement
 
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier
+from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument, SupplierDocumentKind
+from .vat import check_qr
 
 
 class SupplierSerializer(serializers.ModelSerializer):
@@ -17,12 +18,76 @@ class SupplierSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Supplier
-        fields = ["id", "name_en", "name_ar", "contact_info", "created_at", "updated_at"]
+        fields = ["id", "name_en", "name_ar", "contact_info", "vat_registered", "vat_number", "crn", "address",
+                  "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
 
     def validate(self, attrs):
+        from zatca.validators import other_id_error, vat_number_error
+
         require_bilingual_pair(attrs, self.instance, "name")
+        errors = {}
+        vat_number = attrs.get("vat_number", "").strip() if "vat_number" in attrs else None
+        if vat_number:
+            code = vat_number_error(vat_number)
+            if code:
+                errors["vat_number"] = code
+            attrs["vat_number"] = vat_number
+        crn = attrs.get("crn", "").strip() if "crn" in attrs else None
+        if crn:
+            code = other_id_error(crn, "CRN")
+            if code:
+                errors["crn"] = code
+            attrs["crn"] = crn
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
+
+
+class SupplierDocumentSerializer(serializers.ModelSerializer):
+    """The supplier's tax invoice or credit note, as keyed in from the
+    paper/PDF. The QR is checked on every save (purchasing/vat.py)."""
+
+    amount_messages = {"min_value": "error.amountInvalid", "invalid": "error.amountInvalid",
+                       "required": "error.amountInvalid", "max_digits": "error.amountInvalid",
+                       "max_decimal_places": "error.amountInvalid", "null": "error.amountInvalid"}
+    net = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    vat = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    number = serializers.CharField(max_length=64, error_messages={"blank": "error.supplierInvoiceNumberRequired",
+                                                                  "required": "error.supplierInvoiceNumberRequired"})
+    issue_date = serializers.DateField(error_messages={"invalid": "error.dateInvalid", "required": "error.dateInvalid",
+                                                       "null": "error.dateInvalid"})
+
+    class Meta:
+        model = SupplierDocument
+        fields = ["id", "purchase", "kind", "number", "issue_date", "net", "vat", "total", "reason", "qr_text",
+                  "qr_check", "xml", "pdf_url", "created_at", "updated_at"]
+        read_only_fields = ["id", "purchase", "kind", "qr_check", "created_at", "updated_at"]
+        extra_kwargs = {"reason": {"required": False}, "qr_text": {"required": False},
+                        "xml": {"required": False}, "pdf_url": {"required": False}}
+
+    def validate(self, attrs):
+        purchase = self.context["purchase"]
+        supplier = purchase.supplier
+        merged = {name: attrs.get(name, getattr(self.instance, name, None)) for name in ("net", "vat", "total")}
+        errors = {}
+        if not supplier.vat_registered and merged["vat"]:
+            # A supplier outside VAT can't charge it; nothing to claim either.
+            errors["vat"] = "error.supplierNotVatRegistered"
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+    def save(self, **kwargs):
+        purchase = self.context["purchase"]
+        saved = ({name: getattr(self.instance, name) for name in ("qr_text", "issue_date", "total", "vat")}
+                 if self.instance else {})
+        values = {**saved, **self.validated_data}
+        kwargs["qr_check"] = check_qr(values.get("qr_text", ""), supplier_vat=purchase.supplier.vat_number,
+                                      issue_date=values.get("issue_date"), total=values.get("total"),
+                                      vat=values.get("vat"))
+        return super().save(**kwargs)
 
 
 class PurchaseItemSerializer(serializers.ModelSerializer):
@@ -45,7 +110,7 @@ class PurchaseItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseItem
         fields = [
-            "inventory_item", "inventory_name", "unit", "quantity", "received_quantity",
+            "id", "inventory_item", "inventory_name", "unit", "quantity", "received_quantity",
             "unit_cost", "line_total", "stock_before", "stock_added", "stock_after",
         ]
 
@@ -83,14 +148,29 @@ class PurchaseSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source="branch.name_en", read_only=True)
     currency = serializers.CharField(source="branch.currency", read_only=True)
     subtotal = serializers.SerializerMethodField()
+    supplier_invoice = serializers.SerializerMethodField()
+    supplier_credit_notes = serializers.SerializerMethodField()
 
     class Meta:
         model = Purchase
-        fields = ["id", "branch", "branch_name", "currency", "supplier", "supplier_name", "status", "items", "subtotal", "ordered_at", "received_at", "created_at", "updated_at"]
+        fields = ["id", "branch", "branch_name", "currency", "supplier", "supplier_name", "status", "items", "subtotal",
+                  "supplier_invoice", "supplier_credit_notes", "ordered_at", "received_at", "created_at", "updated_at"]
         read_only_fields = ["id", "ordered_at", "received_at", "created_at", "updated_at"]
 
     def get_subtotal(self, obj):
         return sum((item.quantity * item.unit_cost for item in obj.items.all()), Decimal("0"))
+
+    def _documents(self, obj, kind):
+        # .all() so PurchaseViewSet's prefetch serves every row from memory.
+        return [document for document in obj.supplier_documents.all() if document.kind == kind]
+
+    def get_supplier_invoice(self, obj):
+        documents = self._documents(obj, SupplierDocumentKind.INVOICE)
+        return SupplierDocumentSerializer(documents[0], context={"purchase": obj}).data if documents else None
+
+    def get_supplier_credit_notes(self, obj):
+        return SupplierDocumentSerializer(self._documents(obj, SupplierDocumentKind.CREDIT_NOTE), many=True,
+                                          context={"purchase": obj}).data
 
     def validate_status(self, value):
         # Only POST /api/purchases/{id}/receive/ may set this — going

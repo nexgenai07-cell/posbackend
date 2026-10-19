@@ -502,6 +502,14 @@ def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
 
         _write_order_payments(bill, method, actor, now)
 
+        # One tax invoice for the orders this settlement paid (after commit;
+        # orders already invoiced at the till are skipped there).
+        from zatca import pos as zatca_pos
+        zatca_pos.orders_paid(
+            [order.pk for order in billable_orders(bill) if order.payment_status == PaymentStatus.PAID],
+            actor=actor, moyasar=moyasar,
+        )
+
         if bill.table_id:
             bill.table.mark_needs_bill()  # paid but not yet released by a cashier
 

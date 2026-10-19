@@ -12,6 +12,7 @@ from .billing_views import (
     BillVerifyOnlineView,
     MoyasarWebhookView,
 )
+from .refunds import OrderRefundView
 from .views import (
     CloseOrderView,
     CancelOrderView,
@@ -33,6 +34,7 @@ from .views import (
     PublicOrderBySessionView,
     SendToKitchenView,
     TableOpenOrderView,
+    OrderSummaryView,
 )
 
 urlpatterns = [
@@ -57,6 +59,7 @@ urlpatterns = [
     path("orders/customer/", PublicOrderCreateView.as_view(), name="order-customer-create"),
     path("orders/track/", PublicOrderTrackView.as_view(), name="order-public-track"),
     path("orders/qr/<str:token>/<int:order_id>/", PublicOrderBySessionView.as_view(), name="order-qr-track"),
+    path("orders/summary/", OrderSummaryView.as_view(), name="order-summary"),
     path("orders/", OrderListCreateView.as_view(), name="order-list-create"),
     path("orders/<int:pk>/", OrderDetailView.as_view(), name="order-detail"),
     path("orders/<int:pk>/history/", OrderHistoryView.as_view(), name="order-history"),
@@ -64,6 +67,7 @@ urlpatterns = [
     path("orders/<int:pk>/assign-waiter/", AssignWaiterView.as_view(), name="order-assign-waiter"),
     path("orders/<int:pk>/waiter-confirm/", WaiterConfirmView.as_view(), name="order-waiter-confirm"),
     path("orders/<int:pk>/cancel/", CancelOrderView.as_view(), name="order-cancel"),
+    path("orders/<int:pk>/refund/", OrderRefundView.as_view(), name="order-refund"),
     path("tables/<int:pk>/open-order/", TableOpenOrderView.as_view(), name="table-open-order"),
     path("orders/<int:pk>/items/", OrderItemsView.as_view(), name="order-items"),
     path("orders/<int:pk>/items/<int:item_id>/", OrderItemDetailView.as_view(), name="order-item-detail"),

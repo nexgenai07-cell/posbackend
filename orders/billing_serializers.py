@@ -6,6 +6,8 @@ Nothing here accepts an amount. The only money that crosses this boundary goes
 outward, computed by orders/billing.py from the database.
 """
 
+import logging
+
 from rest_framework import serializers
 
 from .billing import (
@@ -20,6 +22,8 @@ from .billing import (
 )
 from .models import Bill, BillMethod, MoyasarPayment, OrderItemStatus
 from .serializers import additional_batch_item_ids
+
+logger = logging.getLogger(__name__)
 
 
 class BillOrderSerializer(serializers.Serializer):
@@ -89,6 +93,10 @@ class BillSerializer(serializers.ModelSerializer):
     # Staff only: whose bill this is (each phone has its own bill at a table).
     customer_phone = serializers.SerializerMethodField()
     customer_name = serializers.SerializerMethodField()
+    # ZATCA tax invoices / credit notes covering this bill's orders, as
+    # printable receipts (simplified only on the customer's phone). Empty
+    # while ZATCA is off.
+    invoices = serializers.SerializerMethodField()
 
     class Meta:
         model = Bill
@@ -98,7 +106,7 @@ class BillSerializer(serializers.ModelSerializer):
             "total_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
             "amount_paid", "amount_outstanding",
             "payment_request_cancelled_by_add",
-            "orders", "pay_requested_at", "paid_at", "closed_at", "created_at", "updated_at",
+            "orders", "invoices", "pay_requested_at", "paid_at", "closed_at", "created_at", "updated_at",
         ]
         read_only_fields = fields
 
@@ -142,6 +150,20 @@ class BillSerializer(serializers.ModelSerializer):
         if self.context.get("public") or not bill.customer_id:
             return None
         return bill.customer.name or None
+
+    def get_invoices(self, bill):
+        # Only the customer's own phone gets its tax invoice inline (one bill
+        # per response). Staff lists stay flat in queries; the POS prints
+        # from /api/zatca/receipts/ instead.
+        if not self.context.get("public"):
+            return []
+        from zatca.receipts import for_orders
+        try:
+            return for_orders([order.pk for order in bill.orders.all()], public=True)
+        except Exception:
+            # Never let invoicing break the customer's bill screen.
+            logger.exception("ZATCA invoices unavailable for bill %s", bill.pk)
+            return []
 
     def get_needs_review(self, bill):
         return any(payment.needs_review for payment in bill.moyasar_payments.all())

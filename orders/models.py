@@ -267,6 +267,42 @@ class Payment(BaseModel):
         return f"{self.amount} via {self.method}"
 
 
+class OrderRefund(models.Model):
+    """
+    Money given back for some of a paid order's lines (or part of their
+    quantity), without cancelling the order. Cumulative refunds are mirrored
+    on Order.refunded_amount. When the order was tax-invoiced, each refund
+    gets its own ZATCA credit note for exactly these lines (zatca/pos.py).
+
+    Not a BaseModel: a refund is a financial record and is never deleted.
+    """
+
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="refunds")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    method = models.CharField(max_length=8, choices=PaymentMethod.choices)
+    reason = models.CharField(max_length=255)
+    refunded_by = models.ForeignKey(Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"Refund {self.amount} on order {self.order_id}"
+
+
+class OrderRefundLine(models.Model):
+    refund = models.ForeignKey(OrderRefund, on_delete=models.CASCADE, related_name="lines")
+    item = models.ForeignKey(OrderItem, on_delete=models.PROTECT, related_name="refund_lines")
+    quantity = models.PositiveIntegerField()
+    # The price charged (VAT inclusive), frozen like the order line's own.
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        ordering = ["id"]
+
+
 class OrderHistory(BaseModel):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="history")
     actor = models.ForeignKey(Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="order_events")

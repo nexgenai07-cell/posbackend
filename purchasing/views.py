@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.http import HttpResponse
-from django.db.models import Prefetch, Q
+from django.db.models import F, OuterRef, Prefetch, Q, Subquery, Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -15,9 +15,10 @@ from inventory.models import InventoryItem, StockMovement, StockMovementReason
 from inventory.services import adjust_stock
 from reports.filters import branch_datetime_bounds, parse_date_range
 
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier
+from . import vat as purchase_vat
+from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument, SupplierDocumentKind
 from .services import apply_purchase_stock, reverse_purchase_stock
-from .serializers import PurchaseSerializer, SupplierSerializer
+from .serializers import PurchaseSerializer, SupplierDocumentSerializer, SupplierSerializer
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
@@ -64,6 +65,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         Prefetch("items", queryset=PurchaseItem.objects.select_related("inventory_item").prefetch_related(
             Prefetch("stock_movements", queryset=StockMovement.objects.order_by("id"), to_attr="movements_by_id"),
         )),
+        "supplier_documents",
     )
     serializer_class = PurchaseSerializer
 
@@ -73,7 +75,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         return [IsOwnerOrManager()]
 
     def get_queryset(self):
-        from common.filters import choice_filter, fk_filter
+        from common.filters import choice_filter, fk_filter, ordering_filter
         from reports.filters import branch_datetime_bounds, parse_date_range
         qs = super().get_queryset()
         params = self.request.query_params
@@ -96,7 +98,19 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
                 qs = qs.filter(ordered_at__gte=start)
             if to_date:
                 qs = qs.filter(ordered_at__lt=end)
-        return qs
+        # The admin pages this list on the server, so it is sorted here too.
+        line_total = Subquery(
+            PurchaseItem.objects.filter(purchase=OuterRef("pk")).values("purchase")
+            .annotate(total=Sum(F("quantity") * F("unit_cost"))).values("total")[:1]
+        )
+        return ordering_filter(
+            qs, params,
+            allowed={
+                "supplier": "supplier__name_en", "status": "status", "ordered_at": "ordered_at",
+                "received_at": "received_at", "total": line_total,
+            },
+            default=["-ordered_at"],
+        )
 
     def update(self, request, *args, **kwargs):
         """
@@ -301,6 +315,18 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         if purchase.status == PurchaseStatus.RECEIVED:
             return Response({"error": "error.purchaseAlreadyReceived"}, status=status.HTTP_409_CONFLICT)
 
+        # Optional: the supplier's tax invoice, keyed in at the door. Checked
+        # before anything moves so a typo can't leave stock half-received.
+        invoice = None
+        invoice_data = request.data.get("supplier_invoice")
+        if invoice_data:
+            existing = next((d for d in purchase.supplier_documents.all()
+                             if d.kind == SupplierDocumentKind.INVOICE), None)
+            invoice = SupplierDocumentSerializer(existing, data=invoice_data, partial=existing is not None,
+                                                 context={"purchase": purchase})
+            if not invoice.is_valid():
+                return Response({"supplier_invoice": invoice.errors}, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic():
             purchase = Purchase.objects.select_for_update().get(pk=purchase.pk)
             if purchase.status == PurchaseStatus.RECEIVED:
@@ -309,6 +335,9 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             # Shared with the re-apply step of update() above, so receiving and
             # re-receiving-after-an-edit can never drift apart.
             apply_purchase_stock(purchase, actor=request.user)
+            if invoice is not None:
+                invoice.save(purchase=purchase, kind=SupplierDocumentKind.INVOICE,
+                             **({} if invoice.instance else {"created_by": request.user}))
 
             purchase.status = PurchaseStatus.RECEIVED
             purchase.received_at = timezone.now()
@@ -318,3 +347,183 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         # staleness lesson from Phase 8's SendToKitchenView bug.
         purchase = self.get_queryset().get(pk=purchase.pk)
         return Response(PurchaseSerializer(purchase).data)
+
+    # -- supplier tax documents (input VAT) ------------------------------------
+    # Recorded, checked and reported here; never sent to ZATCA — the supplier
+    # reports its own invoices and credit notes.
+
+    def _purchase_documents(self, purchase, kind):
+        return SupplierDocument.objects.filter(purchase=purchase, kind=kind)
+
+    @action(detail=True, methods=["get", "put", "delete"], url_path="supplier-invoice")
+    def supplier_invoice(self, request, pk=None):
+        """The supplier's tax invoice for this purchase (at most one).
+        PUT creates or replaces it; the QR is re-checked on every save."""
+        purchase = self.get_object()
+        invoice = self._purchase_documents(purchase, SupplierDocumentKind.INVOICE).first()
+        if request.method == "GET":
+            if invoice is None:
+                return Response(None)
+            return Response(SupplierDocumentSerializer(invoice, context={"purchase": purchase}).data)
+        if request.method == "DELETE":
+            if invoice is not None:
+                invoice.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = SupplierDocumentSerializer(invoice, data=request.data, context={"purchase": purchase})
+        serializer.is_valid(raise_exception=True)
+        extra = {} if invoice else {"purchase": purchase, "kind": SupplierDocumentKind.INVOICE,
+                                    "created_by": request.user}
+        document = serializer.save(**extra)
+        return Response(SupplierDocumentSerializer(document, context={"purchase": purchase}).data,
+                        status=status.HTTP_200_OK if invoice else status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "post"], url_path="supplier-credit-notes")
+    def supplier_credit_notes(self, request, pk=None):
+        """The supplier's credit notes for returns on this purchase. POST may
+        also take the goods back out of stock: `returned_lines: [{purchase_item,
+        quantity}]`, booked as an adjustment linked to this purchase (so a
+        later edit of the PO doesn't put them back)."""
+        purchase = self.get_object()
+        if request.method == "GET":
+            notes = self._purchase_documents(purchase, SupplierDocumentKind.CREDIT_NOTE)
+            return Response(SupplierDocumentSerializer(notes, many=True, context={"purchase": purchase}).data)
+
+        serializer = SupplierDocumentSerializer(data=request.data, context={"purchase": purchase})
+        serializer.is_valid(raise_exception=True)
+        if not serializer.validated_data.get("reason", "").strip():
+            return Response({"reason": ["error.supplierCreditReasonRequired"]}, status=status.HTTP_400_BAD_REQUEST)
+        returned = []
+        lines = {line.pk: line for line in purchase.items.all()}
+        for raw in request.data.get("returned_lines") or []:
+            try:
+                line, quantity = lines[int(raw["purchase_item"])], Decimal(str(raw["quantity"]))
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                return Response({"error": "error.supplierReturnLinesInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+            if quantity <= 0:
+                continue
+            if quantity > line.quantity:
+                return Response({"error": "error.supplierReturnTooMuch"}, status=status.HTTP_400_BAD_REQUEST)
+            returned.append((line, quantity))
+        if returned and purchase.status != PurchaseStatus.RECEIVED:
+            return Response({"error": "error.supplierReturnNotReceived"}, status=status.HTTP_409_CONFLICT)
+
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            with transaction.atomic():
+                note = serializer.save(purchase=purchase, kind=SupplierDocumentKind.CREDIT_NOTE,
+                                       created_by=request.user)
+                for line, quantity in returned:
+                    adjust_stock(line.inventory_item_id, -quantity, StockMovementReason.ADJUSTMENT,
+                                 purchase=purchase, purchase_item=line, unit_cost_snapshot=line.unit_cost)
+        except DjangoValidationError as exc:
+            return Response({"error": exc.messages[0]}, status=status.HTTP_409_CONFLICT)
+        return Response(SupplierDocumentSerializer(note, context={"purchase": purchase}).data,
+                        status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"supplier-credit-notes/(?P<document_id>\d+)")
+    def supplier_credit_note(self, request, pk=None, document_id=None):
+        """Correct or remove a keyed-in credit note. Removing it doesn't put
+        returned goods back: that's a stock adjustment, done on purpose."""
+        purchase = self.get_object()
+        note = self._purchase_documents(purchase, SupplierDocumentKind.CREDIT_NOTE).filter(pk=document_id).first()
+        if note is None:
+            return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == "DELETE":
+            note.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = SupplierDocumentSerializer(note, data=request.data, partial=True, context={"purchase": purchase})
+        serializer.is_valid(raise_exception=True)
+        note = serializer.save()
+        return Response(SupplierDocumentSerializer(note, context={"purchase": purchase}).data)
+
+    @action(detail=False, methods=["post"], url_path="qr-check")
+    def qr_check(self, request):
+        """POST {qr_text, supplier?, issue_date?, total?, vat?}: decode a
+        supplier QR without saving anything (the form's "Check QR" button)."""
+        supplier_vat = ""
+        supplier_id = request.data.get("supplier")
+        if supplier_id:
+            supplier = Supplier.objects.filter(pk=supplier_id).first()
+            supplier_vat = supplier.vat_number if supplier else ""
+        issue_date = None
+        if request.data.get("issue_date"):
+            from django.utils.dateparse import parse_date
+            try:
+                issue_date = parse_date(str(request.data["issue_date"]))
+            except ValueError:
+                issue_date = None
+
+        def amount(name):
+            value = request.data.get(name)
+            if value in (None, ""):
+                return None
+            try:
+                return Decimal(str(value))
+            except ArithmeticError:
+                return None
+
+        return Response(purchase_vat.check_qr(str(request.data.get("qr_text", "")), supplier_vat=supplier_vat,
+                                              issue_date=issue_date, total=amount("total"), vat=amount("vat")))
+
+    @action(detail=False, methods=["get"], url_path="input-vat")
+    def input_vat(self, request):
+        """
+        Input VAT for a period, by the supplier document's date: every
+        supplier invoice and credit note (credit notes reduce the VAT), with
+        flags for anything a person should look at, plus received purchases
+        in the period that have no supplier invoice yet. Purchases from
+        suppliers that aren't VAT-registered are listed but claim nothing.
+        """
+        from_date, to_date = parse_date_range(request)
+        branch = request.user.branch
+        documents = (SupplierDocument.objects.filter(purchase__branch=branch, issue_date__gte=from_date,
+                                                     issue_date__lte=to_date)
+                     .select_related("purchase__supplier")
+                     .prefetch_related("purchase__items")
+                     .order_by("issue_date", "id"))
+        zero = Decimal("0.00")
+        totals = {"net": zero, "vat": zero, "total": zero, "claimable_vat": zero}
+        rows = []
+        for document in documents:
+            supplier = document.purchase.supplier
+            sign = -1 if document.kind == SupplierDocumentKind.CREDIT_NOTE else 1
+            flags = purchase_vat.document_flags(document, supplier)
+            if not supplier.vat_registered:
+                flags.append(purchase_vat.NOT_REGISTERED)
+            elif not supplier.vat_number:
+                flags.append(purchase_vat.SUPPLIER_VAT)
+            if document.kind == SupplierDocumentKind.INVOICE:
+                subtotal = sum((line.quantity * line.unit_cost for line in document.purchase.items.all()),
+                               Decimal("0"))
+                if abs(subtotal - document.net) > Decimal("0.05"):
+                    flags.append(purchase_vat.NET_VS_PO)
+            claimable = purchase_vat.claimable_vat(document, supplier)
+            totals["net"] += sign * document.net
+            totals["vat"] += sign * document.vat
+            totals["total"] += sign * document.total
+            totals["claimable_vat"] += claimable
+            rows.append({
+                "id": document.pk, "kind": document.kind, "purchase": document.purchase_id,
+                "supplier": supplier.pk, "supplier_name_en": supplier.name_en, "supplier_name_ar": supplier.name_ar,
+                "supplier_vat_number": supplier.vat_number, "vat_registered": supplier.vat_registered,
+                "number": document.number, "issue_date": document.issue_date,
+                "net": sign * document.net, "vat": sign * document.vat, "total": sign * document.total,
+                "claimable_vat": claimable, "flags": flags,
+            })
+
+        start, end = branch_datetime_bounds(branch, from_date, to_date)
+        missing = []
+        for purchase in (Purchase.objects.filter(branch=branch, status=PurchaseStatus.RECEIVED,
+                                                 received_at__gte=start, received_at__lt=end)
+                         .exclude(supplier_documents__kind=SupplierDocumentKind.INVOICE)
+                         .select_related("supplier").prefetch_related("items").order_by("received_at")):
+            missing.append({
+                "purchase": purchase.pk, "supplier": purchase.supplier_id,
+                "supplier_name_en": purchase.supplier.name_en, "supplier_name_ar": purchase.supplier.name_ar,
+                "vat_registered": purchase.supplier.vat_registered, "received_at": purchase.received_at,
+                "subtotal": sum((line.quantity * line.unit_cost for line in purchase.items.all()), Decimal("0")),
+                "flags": [purchase_vat.NO_INVOICE] if purchase.supplier.vat_registered
+                else [purchase_vat.NO_INVOICE, purchase_vat.NOT_REGISTERED],
+            })
+        return Response({"from": from_date, "to": to_date, "rows": rows, "missing_invoices": missing,
+                         "totals": totals})

@@ -35,11 +35,15 @@ class CustomerViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         phone = params.get("phone")
         if phone:
             qs = qs.filter(phone=phone)
-        from common.filters import text_filter
+        from common.filters import ordering_filter, text_filter
         qs = text_filter(qs, params, "search", ["name", "phone"])
         # nulls_last: Postgres puts NULLs first on a DESC sort otherwise, which
         # would float every never-ordered customer to the top of the list.
-        return qs.order_by(F("last_order_at").desc(nulls_last=True), "-id")
+        return ordering_filter(
+            qs, params,
+            allowed={"name": "name", "phone": "phone", "last_order_at": "last_order_at", "created_at": "created_at"},
+            default=[F("last_order_at").desc(nulls_last=True)],
+        )
 
     def create(self, request, *args, **kwargs):
         """

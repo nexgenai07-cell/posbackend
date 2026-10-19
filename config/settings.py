@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     'reviews',
     'imports',
     'realtime',
+    'zatca',
 ]
 
 MIDDLEWARE = [
@@ -308,6 +309,14 @@ CLOUDINARY_API_SECRET = env('CLOUDINARY_API_SECRET', default='')
 # build the Moyasar callback_url the customer is redirected back to after
 # 3DS/STC Pay. Must be the public origin in production, not localhost.
 CUSTOMER_WEB_BASE_URL = env('CUSTOMER_WEB_BASE_URL', default='http://localhost:3000')
+
+# ZATCA e-invoicing (zatca/). Only machine-level values live here; the
+# business details, environment, certificates and counters are in the
+# database, managed from the admin's ZATCA pages. The key encrypts device
+# private keys and CSID secrets at rest (zatca/crypto.py) — blank keeps ZATCA
+# off. ZATCA_SDK_HOME is the Java SDK, used only as a test oracle and fallback signer.
+ZATCA_ENCRYPTION_KEY = env('ZATCA_ENCRYPTION_KEY', default='')
+ZATCA_SDK_HOME = env('ZATCA_SDK_HOME', default='')
 
 
 # Email

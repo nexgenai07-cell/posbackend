@@ -6,6 +6,7 @@ import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db import transaction
+from django.db.models import Count, OuterRef, Q, Subquery, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -242,6 +243,82 @@ def _sync_order_kitchen_status(order, actor):
     recompute_order_status_from_items(order, actor, event="kitchen_status_changed")
 
 
+def filtered_orders(request, qs=None):
+    """
+    The orders the list's query parameters select — shared by the list and
+    by OrderSummaryView, so the counts above the Orders screen always describe
+    exactly the orders its pages contain.
+    """
+    qs = (qs if qs is not None else Order.objects.all()).filter(branch=request.user.branch)
+    if request.user.role == StaffRole.WAITER:
+        qs = qs.filter(assigned_waiter=request.user)
+    params = request.query_params
+
+    status_param = params.get("status")
+    if status_param:
+        qs = qs.filter(status=status_param)
+
+    table_param = params.get("table")
+    if table_param:
+        qs = qs.filter(table_id=table_param)
+
+    customer_param = params.get("customer")
+    if customer_param:
+        qs = qs.filter(customer_id=customer_param)
+
+    waiter_param = params.get("waiter")
+    if waiter_param:
+        qs = qs.filter(assigned_waiter__isnull=True) if waiter_param.lower() == "unassigned" else qs.filter(assigned_waiter_id=waiter_param)
+    cashier_param = params.get("cashier")
+    if cashier_param:
+        qs = qs.filter(assigned_cashier_id=cashier_param)
+    search = params.get("search", "").strip()
+    if search:
+        # Short order number in any staff-typed form: ORD-00000020,
+        # ord-20, 00000020, #20 or 20.
+        order_id = resolve_order_code(search)
+        qs = qs.filter(pk=order_id) if order_id else qs.none()
+
+    if params.get("latest_per_table", "").lower() in ("1", "true", "yes"):
+        # Each table's most recent order only — what the POS table map needs
+        # to show, instead of every order the restaurant ever took.
+        latest = qs.filter(table=OuterRef("table")).order_by("-opened_at", "-pk").values("pk")[:1]
+        qs = qs.filter(table__isnull=False, pk=Subquery(latest))
+
+    return _filter_opened_between(qs, request)
+
+
+# Statuses the Orders screen counts as "pending": accepted but not yet cooking.
+PENDING_STATUSES = (OrderStatus.PENDING_CASHIER, OrderStatus.AWAITING_WAITER, OrderStatus.CONFIRMED, OrderStatus.SENT)
+
+
+class OrderSummaryView(APIView):
+    """
+    GET /api/orders/summary/ — with the same filters as GET /api/orders/,
+    the counts and takings for the whole selection. The list is paged, so
+    the screen cannot count them from the page it has.
+    """
+
+    permission_classes = [IsOrderStaff]
+
+    def get(self, request):
+        orders = filtered_orders(request)
+        counts = orders.aggregate(
+            total=Count("pk"),
+            pending=Count("pk", filter=Q(status__in=PENDING_STATUSES)),
+            preparing=Count("pk", filter=Q(status=OrderStatus.PREPARING)),
+            ready=Count("pk", filter=Q(status=OrderStatus.READY)),
+            served=Count("pk", filter=Q(status=OrderStatus.SERVED)),
+            paid=Count("pk", filter=Q(payment_status=PaymentStatus.PAID)),
+            cancelled=Count("pk", filter=Q(status=OrderStatus.CANCELLED)),
+        )
+        # Summed on its own: in the aggregate above the join to payments would
+        # count an order once per payment.
+        sales = Payment.objects.filter(order__in=orders.values("pk")).aggregate(total=Sum("amount"))["total"]
+        # Two decimals whatever the database returns (SQLite drops them).
+        return Response({**counts, "sales": str((sales or Decimal("0")).quantize(Decimal("0.01")))})
+
+
 class OrderListCreateView(ListModelMixin, GenericAPIView):
     """
     GET lists orders for the requester's branch, filterable by ?status=,
@@ -267,36 +344,7 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
         return super().get_permissions()
 
     def get_queryset(self):
-        qs = _order_queryset().filter(branch=self.request.user.branch)
-        if self.request.user.role == StaffRole.WAITER:
-            qs = qs.filter(assigned_waiter=self.request.user)
-
-        status_param = self.request.query_params.get("status")
-        if status_param:
-            qs = qs.filter(status=status_param)
-
-        table_param = self.request.query_params.get("table")
-        if table_param:
-            qs = qs.filter(table_id=table_param)
-
-        customer_param = self.request.query_params.get("customer")
-        if customer_param:
-            qs = qs.filter(customer_id=customer_param)
-
-        waiter_param = self.request.query_params.get("waiter")
-        if waiter_param:
-            qs = qs.filter(assigned_waiter__isnull=True) if waiter_param.lower() == "unassigned" else qs.filter(assigned_waiter_id=waiter_param)
-        cashier_param = self.request.query_params.get("cashier")
-        if cashier_param:
-            qs = qs.filter(assigned_cashier_id=cashier_param)
-        search = self.request.query_params.get("search", "").strip()
-        if search:
-            # Short order number in any staff-typed form: ORD-00000020,
-            # ord-20, 00000020, #20 or 20.
-            order_id = resolve_order_code(search)
-            qs = qs.filter(pk=order_id) if order_id else qs.none()
-
-        return _filter_opened_between(qs, self.request).order_by("-opened_at")
+        return filtered_orders(self.request, _order_queryset()).order_by("-opened_at", "-pk")
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -518,7 +566,8 @@ class CancelOrderView(APIView):
         return Response({
             "allowed": allowed,
             "total": sum((item.price_snapshot * item.quantity for item in live_items), Decimal("0")),
-            "refund": paid,
+            # Partial refunds already gave some back; cancelling returns the rest.
+            "refund": paid - (order.refunded_amount or Decimal("0")),
             "cooked_plates": sum(item.quantity for item in live_items if item.status in _COOKED_ITEM_STATUSES),
             "reason_required": is_admin and (order.status not in _BEFORE_KITCHEN or paid > 0),
         })
@@ -559,7 +608,7 @@ class CancelOrderView(APIView):
                 details={
                     "reason": reason,
                     "total": str(total),
-                    "refund": str(paid) if paid else "",
+                    "refund": str(paid - (order.refunded_amount or Decimal("0"))) if paid else "",
                     "waste_movements": wasted,
                     "actor_role": request.user.role,
                 },
@@ -575,6 +624,10 @@ class CancelOrderView(APIView):
             if conflict:
                 return conflict
             order.items.exclude(status=OrderItemStatus.VOIDED).update(status=OrderItemStatus.VOIDED)
+            if paid:
+                # An invoiced sale is reversed by a credit note, after commit.
+                from zatca import pos as zatca_pos
+                zatca_pos.order_cancelled(order.pk, actor=request.user)
             _notify_order_staff(order, "order:cancelled", request.user.pk)
             if kitchen_was_notified:
                 _notify_role_staff(order, "order:cancelled", {StaffRole.KITCHEN}, request.user.pk)
@@ -849,6 +902,10 @@ class OrderPaymentsView(APIView):
                 )
                 if conflict:
                     return conflict
+                # Paid in full: this payment completes the settlement, so the
+                # order gets its tax invoice — after commit, never in the way.
+                from zatca import pos as zatca_pos
+                zatca_pos.orders_paid([order.pk], actor=request.user)
             else:
                 _set_payment_status(
                     order,

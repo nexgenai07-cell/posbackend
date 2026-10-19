@@ -14,6 +14,14 @@ class IsOwnerOrManager(BasePermission):
         return _role(request) in (StaffRole.OWNER, StaffRole.MANAGER)
 
 
+class IsOwner(BasePermission):
+    """Owner-only actions: ZATCA settings, onboarding and go-live, where a
+    change binds the restaurant's VAT identity to a certificate."""
+
+    def has_permission(self, request, view):
+        return _role(request) == StaffRole.OWNER
+
+
 class IsPOSStaff(BasePermission):
     """POS order/payment/table mutation — matches AREA_ROLES for 'pos'."""
 

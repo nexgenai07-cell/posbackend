@@ -96,3 +96,37 @@ class ReceivedPurchaseReconciliationTests(TestCase):
         self.assertEqual(self.client.delete(url).status_code, 403)
         self.ingredient.refresh_from_db()
         self.assertEqual(self.ingredient.current_stock, Decimal("30.000"))
+
+
+class PurchaseListPagingTests(TestCase):
+    """The admin pages the purchase list on the server, sorted there too."""
+
+    def setUp(self):
+        self.branch = Branch.objects.create(name_en="Main", name_ar="Main")
+        owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
+        owner.set_pin("1234")
+        owner.save()
+        self.client = APIClient()
+        self.client.force_authenticate(user=owner)
+        item = InventoryItem.objects.create(branch=self.branch, name="Rice", unit="kg")
+        self.ids = {}
+        for name, cost in (("Bravo", "30"), ("Alpha", "50"), ("Charlie", "10")):
+            purchase = Purchase.objects.create(branch=self.branch, supplier=Supplier.objects.create(name_en=name, name_ar=""))
+            PurchaseItem.objects.create(purchase=purchase, inventory_item=item, quantity=2, unit_cost=Decimal(cost))
+            self.ids[name] = purchase.pk
+
+    def suppliers(self, query=""):
+        return [row["supplier_name"] for row in self.client.get(f"/api/purchases/{query}").json()["results"]]
+
+    def test_newest_first_by_default(self):
+        self.assertEqual(self.suppliers(), ["Charlie", "Alpha", "Bravo"])
+
+    def test_sorted_by_supplier_and_by_total(self):
+        self.assertEqual(self.suppliers("?ordering=supplier"), ["Alpha", "Bravo", "Charlie"])
+        self.assertEqual(self.suppliers("?ordering=-total"), ["Alpha", "Bravo", "Charlie"])
+        self.assertEqual(self.suppliers("?ordering=total"), ["Charlie", "Bravo", "Alpha"])
+
+    def test_sort_works_with_search_and_pages(self):
+        self.assertEqual(self.suppliers("?search=a&ordering=supplier"), ["Alpha", "Bravo", "Charlie"])
+        body = self.client.get("/api/purchases/?ordering=supplier&page_size=2&page=2").json()
+        self.assertEqual((body["count"], [row["supplier_name"] for row in body["results"]]), (3, ["Charlie"]))

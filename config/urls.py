@@ -47,4 +47,5 @@ urlpatterns = [
     path('api/', include('reports.urls')),
     path('api/', include('reviews.urls')),
     path('api/', include('imports.urls')),
+    path('api/', include('zatca.urls')),
 ]

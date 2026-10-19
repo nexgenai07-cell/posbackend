@@ -12,7 +12,7 @@ means no filter, "none" always means "the field is empty", and a blank value
 is always ignored rather than matching nothing.
 """
 
-from django.db.models import Q
+from django.db.models import F, Q
 
 
 def text_filter(queryset, params, param, fields):
@@ -85,3 +85,27 @@ def numeric_range_filter(queryset, params, field, min_param, max_param):
         except (TypeError, ValueError):
             continue
     return queryset
+
+
+def ordering_filter(queryset, params, allowed, default):
+    """
+    Sort by `?ordering=<name>` or `?ordering=-<name>` (descending).
+
+    A paginated list must be sorted by the server: sorting one downloaded page
+    in the browser only reorders those 25 rows. `allowed` maps each public
+    name to the field or expression it sorts on, so a client cannot sort on
+    an arbitrary column; anything else falls back to `default` (a list of
+    order_by() arguments). The primary key is always the last tie-breaker so
+    a row never shows up on two pages, or on none.
+    """
+    value = (params.get("ordering") or "").strip()
+    descending = value.startswith("-")
+    target = allowed.get(value.lstrip("-")) if value else None
+    if target is None:
+        return queryset.order_by(*default, "-pk")
+    if isinstance(target, str):
+        target = F(target)
+    return queryset.order_by(
+        target.desc(nulls_last=True) if descending else target.asc(nulls_last=True),
+        "-pk" if descending else "pk",
+    )

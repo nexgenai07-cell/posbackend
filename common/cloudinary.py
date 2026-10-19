@@ -38,6 +38,11 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif", "image/svg+xml")
 
+# Supplier tax invoices / credit notes (PDF), stored as Cloudinary "raw"
+# files in their own folder: never transformed, never shown as images.
+DOCUMENT_FOLDER = f"{UPLOAD_FOLDER}/supplier-documents"
+ALLOWED_DOCUMENT_TYPES = ("application/pdf",)
+
 
 class CloudinaryNotConfigured(RuntimeError):
     """One of the CLOUDINARY_* settings is blank — uploads are switched off."""
@@ -51,7 +56,7 @@ def is_configured():
     )
 
 
-def build_signature(folder=UPLOAD_FOLDER, timestamp=None):
+def build_signature(folder=UPLOAD_FOLDER, timestamp=None, *, document=False):
     """
     Everything the browser needs to upload one file, and nothing more.
 
@@ -66,6 +71,8 @@ def build_signature(folder=UPLOAD_FOLDER, timestamp=None):
     if not is_configured():
         raise CloudinaryNotConfigured("CLOUDINARY_* settings are not set")
 
+    if document:
+        folder = DOCUMENT_FOLDER
     timestamp = timestamp or int(time.time())
     signed_params = {"folder": folder, "timestamp": timestamp}
 
@@ -80,7 +87,8 @@ def build_signature(folder=UPLOAD_FOLDER, timestamp=None):
         # the API key is public by design — only the SECRET must stay here.
         "api_key": settings.CLOUDINARY_API_KEY,
         "cloud_name": settings.CLOUDINARY_CLOUD_NAME,
-        "upload_url": f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/image/upload",
+        "upload_url": f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/"
+                      + ("raw" if document else "image") + "/upload",
         "max_bytes": MAX_UPLOAD_BYTES,
-        "allowed_types": list(ALLOWED_IMAGE_TYPES),
+        "allowed_types": list(ALLOWED_DOCUMENT_TYPES if document else ALLOWED_IMAGE_TYPES),
     }
