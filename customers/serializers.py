@@ -17,8 +17,19 @@ class CustomerSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Customer
-        fields = ["id", "branch", "phone", "name", "last_order_at", "created_at", "updated_at"]
-        read_only_fields = ["id", "last_order_at", "created_at", "updated_at"]
+        fields = [
+            "id", "branch", "phone", "name", "last_order_at",
+            "marketing_consent", "consent_changed_at", "created_at", "updated_at",
+        ]
+        # Consent is read-only here on purpose: it changes through
+        # CustomerViewSet.consent(), which stamps consent_changed_at in the
+        # same write. A plain PATCH could otherwise move someone to
+        # "opted in" leaving no record of when, which is the one thing the
+        # field exists to answer.
+        read_only_fields = [
+            "id", "last_order_at", "marketing_consent", "consent_changed_at",
+            "created_at", "updated_at",
+        ]
 
     def validate_phone(self, value):
         return value.strip()

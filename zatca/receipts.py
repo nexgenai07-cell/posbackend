@@ -43,8 +43,11 @@ def payload(document, *, settings=None, public=False):
         "order_type": snapshot.get("order_type", ""),
         "table": snapshot.get("table", ""),
         "order_numbers": snapshot.get("order_numbers", []),
-        "items": [{key: item.get(key) for key in (
-            "name_en", "name_ar", "variant_en", "variant_ar", "quantity", "unit_price", "total")}
+        # `lines`: the item's invoice line(s) net of VAT; empty on documents
+        # issued before receipts stored them.
+        "items": [{**{key: item.get(key) for key in (
+            "name_en", "name_ar", "variant_en", "variant_ar", "quantity", "unit_price", "total")},
+            "lines": item.get("lines") or []}
             for item in snapshot.get("items", [])],
         "totals": snapshot.get("totals", {}),
         "payments": [{key: p.get(key) for key in ("method", "amount", "tip")} for p in snapshot.get("payments", [])],

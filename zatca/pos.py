@@ -216,7 +216,7 @@ def _credit(order, *, reason, quantities, source, refund=None):
         names[line["key"]] = line["name"]
         item = dict(order_items[index]) if index < len(order_items) else {
             "order_id": order.pk, "name_en": line["name"], "name_ar": line["name"], "variant_en": "", "variant_ar": ""}
-        item.update(quantity=quantity, unit_price=str(unit_gross), total=str(unit_gross * quantity))
+        item.update(key=line["key"], quantity=quantity, unit_price=str(unit_gross), total=str(unit_gross * quantity))
         items.append(item)
     if not sale_lines:
         return None
@@ -241,7 +241,7 @@ def _credit(order, *, reason, quantities, source, refund=None):
         note.receipt = {
             **{key: snapshot.get(key) for key in ("seller", "buyer", "order_type", "table")},
             "order_numbers": [order.order_number],
-            "items": items,
+            "items": _with_vat_lines(items, totals),
             "payments": [],
             "tip": "0.00",
             "totals": _totals(totals),
@@ -279,8 +279,9 @@ def debit_note(invoice, *, description, amount, reason, source="pos"):
         note.buyer = invoice.buyer
         note.receipt = {
             **{field: snapshot.get(field) for field in ("seller", "buyer", "order_type", "table", "order_numbers")},
-            "items": [{"name_en": description, "name_ar": description, "variant_en": "", "variant_ar": "",
-                       "quantity": 1, "unit_price": str(amount), "total": str(amount)}],
+            "items": _with_vat_lines([{"key": key, "name_en": description, "name_ar": description, "variant_en": "",
+                                       "variant_ar": "", "quantity": 1, "unit_price": str(amount),
+                                       "total": str(amount)}], totals),
             "payments": [],
             "tip": "0.00",
             "totals": _totals(totals),
@@ -424,6 +425,19 @@ def _totals(totals):
             "payable": str(totals.payable)}
 
 
+def _with_vat_lines(items, totals):
+    """Each receipt item with the invoice line(s) it became, net of VAT, as
+    the XML states them: a standard invoice prints the unit price excl. VAT,
+    the rate and the VAT per line. A dish whose net doesn't divide evenly is
+    two lines (e.g. 2 x 8.70 and 1 x 8.69 for 3 x 10.00), so it has two."""
+    by_key = {}
+    for line in totals.lines:
+        by_key.setdefault(line.key, []).append({
+            "quantity": line.quantity, "unit_net": str(line.unit_net), "net": str(line.net),
+            "rate": str(line.rate), "vat": str(line.vat), "total": str(line.total)})
+    return [{**item, "lines": by_key.get(item.get("key"), [])} for item in items]
+
+
 def _receipt(settings, orders, sale, totals, payments, buyer):
     tables = [order.table.label_en for order in orders if order.table_id]
     return {
@@ -433,12 +447,14 @@ def _receipt(settings, orders, sale, totals, payments, buyer):
             "other_id_scheme": settings.other_id_scheme,
             "address": {field: getattr(settings, field) for field in (
                 "street", "building_no", "additional_no", "district", "city", "postal_code", "country")},
+            # As it was when issued: a later logo change never alters a past invoice.
+            "logo_url": orders[0].branch.logo_url,
         },
         "buyer": buyer.snapshot() if buyer else None,
         "order_type": _order_type(orders[0]),
         "table": tables[0] if tables else "",
         "order_numbers": [order.order_number for order in orders],
-        "items": sale["items"],
+        "items": _with_vat_lines(sale["items"], totals),
         "sale_lines": sale["per_order"],
         "payments": payments,
         "tip": str(sum((Decimal(p["tip"]) for p in payments), _ZERO)),

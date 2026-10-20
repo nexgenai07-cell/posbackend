@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'customers',
     'reports',
     'reviews',
+    'marketing',
     'imports',
     'realtime',
     'zatca',
@@ -266,6 +267,34 @@ MOYASAR_API_BASE = env('MOYASAR_API_BASE', default='https://api.moyasar.com/v1')
 # field. Leave blank to skip the check — verification against the Moyasar API
 # is the real gate either way. See orders/moyasar.webhook_secret_matches().
 MOYASAR_WEBHOOK_SECRET = env('MOYASAR_WEBHOOK_SECRET', default='')
+
+# -- WhatsApp marketing (marketing/) -----------------------------------------
+#
+# Two sending paths, see marketing/senders.py. The manual one needs no
+# configuration at all: the backend renders a wa.me click-to-chat link per
+# recipient and a staff member taps it, so a restaurant can run campaigns on
+# day one with no Meta account, no approved templates and no per-message cost.
+#
+# The settings below switch on the automated path. They stay blank until the
+# restaurant has completed Meta Business verification and had a marketing
+# template approved; while they are blank POST /api/campaigns/{id}/send/
+# answers 409 error.whatsappNotConfigured instead of half-sending anything.
+#
+# WHATSAPP_ACCESS_TOKEN is backend-only and must never reach a browser - it is
+# read in marketing/senders.py and nowhere else, and no serializer exposes it.
+# GET /api/marketing/config/ reports only whether it is set, never its value.
+WHATSAPP_PHONE_NUMBER_ID = env('WHATSAPP_PHONE_NUMBER_ID', default='')
+WHATSAPP_ACCESS_TOKEN = env('WHATSAPP_ACCESS_TOKEN', default='')
+# The approved template a marketing message is wrapped in. Meta only allows
+# templates outside the 24-hour service window, which is every campaign
+# recipient, so the campaign body is passed as the template's single {{1}}
+# body parameter - the template itself must be built that way.
+WHATSAPP_TEMPLATE_NAME = env('WHATSAPP_TEMPLATE_NAME', default='')
+WHATSAPP_TEMPLATE_LANGUAGE = env('WHATSAPP_TEMPLATE_LANGUAGE', default='ar')
+WHATSAPP_API_VERSION = env('WHATSAPP_API_VERSION', default='v21.0')
+# Prefixed to a stored number that has no country code of its own, so
+# "0501234567" becomes a working wa.me link. 966 = Saudi Arabia.
+MARKETING_DEFAULT_COUNTRY_CODE = env('MARKETING_DEFAULT_COUNTRY_CODE', default='966')
 
 # "Fill with AI" in the Excel import (imports/ai.py): any OpenAI-compatible
 # chat endpoint (NVIDIA by default). A blank key turns the option off and the

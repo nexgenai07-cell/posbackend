@@ -1,11 +1,13 @@
 from django.db.models import F
+from django.utils import timezone
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from accounts.permissions import IsOwnerOrManager, IsPOSStaff
 from common.mixins import BranchScopedQuerysetMixin
 
-from .models import Customer
+from .models import Customer, MarketingConsent
 from .serializers import CustomerSerializer
 from .services import find_or_create_customer
 
@@ -35,8 +37,11 @@ class CustomerViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         phone = params.get("phone")
         if phone:
             qs = qs.filter(phone=phone)
-        from common.filters import ordering_filter, text_filter
+        from common.filters import choice_filter, ordering_filter, text_filter
         qs = text_filter(qs, params, "search", ["name", "phone"])
+        # Lets the marketing screens list "who has opted in" without
+        # downloading every customer and filtering in the browser.
+        qs = choice_filter(qs, params, "marketing_consent", allowed=MarketingConsent.values)
         # nulls_last: Postgres puts NULLs first on a DESC sort otherwise, which
         # would float every never-ordered customer to the top of the list.
         return ordering_filter(
@@ -68,3 +73,24 @@ class CustomerViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         # Phase 5 branch-scoping retrofit).
         serializer.save(branch=self.request.user.branch)
 
+    @action(detail=True, methods=["post"])
+    def consent(self, request, pk=None):
+        """
+        POST /api/customers/{id}/consent/  {"marketing_consent": "opted_in"}
+
+        Records whether this customer agreed to marketing messages, stamping
+        when it changed. Its own endpoint rather than a PATCH field so the
+        two always move together - "we had consent" is worth very little
+        without "since when", which is the question PDPL actually asks.
+        """
+        value = str(request.data.get("marketing_consent", "")).strip()
+        if value not in MarketingConsent.values:
+            return Response({"error": "error.invalidConsent"}, status=status.HTTP_400_BAD_REQUEST)
+
+        customer = self.get_object()
+        customer.marketing_consent = value
+        # UNKNOWN is "never asked", so it carries no date - setting one would
+        # claim a decision the customer never made.
+        customer.consent_changed_at = None if value == MarketingConsent.UNKNOWN else timezone.now()
+        customer.save(update_fields=["marketing_consent", "consent_changed_at", "updated_at"])
+        return Response(self.get_serializer(customer).data)

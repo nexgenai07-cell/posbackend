@@ -97,8 +97,12 @@ class TillPaymentTests(PosTestBase):
 
         [receipt] = self.receipts(order=order.pk)
         self.assertEqual(receipt["number"], invoice.number)
+        # 3 x 10.00 incl. VAT nets to 26.09, which no single unit price hits: two invoice lines.
         self.assertEqual(receipt["items"], [{"name_en": "Burger", "name_ar": "برجر", "variant_en": "", "variant_ar": "",
-                                             "quantity": 3, "unit_price": "10.00", "total": "30.00"}])
+                                             "quantity": 3, "unit_price": "10.00", "total": "30.00", "lines": [
+            {"quantity": 2, "unit_net": "8.70", "net": "17.40", "rate": "15.00", "vat": "2.61", "total": "20.01"},
+            {"quantity": 1, "unit_net": "8.69", "net": "8.69", "rate": "15.00", "vat": "1.30", "total": "9.99"},
+        ]}])
         self.assertEqual(receipt["totals"], {"net": "26.09", "vat": "3.91", "rate": "15.00", "inclusive": "30.00",
                                              "rounding": "0.00", "payable": "30.00"})
         self.assertEqual(receipt["payments"], [{"method": "cash", "amount": "30.00", "tip": "5.00"}])
@@ -241,6 +245,11 @@ class B2BTests(PosTestBase):
         self.assertEqual(receipt["buyer"]["legal_name"], self.company["legal_name"])
         self.assertEqual(receipt["qr"], "Q0xFQVJFRA==")  # ZATCA's QR from the cleared XML
         self.assertFalse(receipt["pending_clearance"])
+        # A tax invoice prints each line net of VAT, with its rate and VAT, matching the XML.
+        lines = receipt["items"][0]["lines"]
+        self.assertEqual([(l["quantity"], l["unit_net"], l["rate"], l["vat"]) for l in lines],
+                         [(2, "8.70", "15.00", "2.61"), (1, "8.69", "15.00", "1.30")])
+        self.assertIn('<cbc:PriceAmount currencyID="SAR">8.69</cbc:PriceAmount>', invoice.signed_xml)
         # Once invoiced, the buyer can't be changed any more.
         again = self.api.post(f"/api/zatca/orders/{order.pk}/buyer/", {"business_customer": None}, format="json")
         self.assertEqual(again.json()["error"], "error.zatcaAlreadyInvoiced")
