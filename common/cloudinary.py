@@ -43,6 +43,26 @@ ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif", "im
 DOCUMENT_FOLDER = f"{UPLOAD_FOLDER}/supplier-documents"
 ALLOWED_DOCUMENT_TYPES = ("application/pdf",)
 
+# Campaign media, posted to Facebook and Instagram. Narrower than product
+# images: neither network takes SVG, and a GIF would post as a still. Video
+# is MP4/MOV, the formats both accept. Cloudinary's free plan caps a video
+# upload at 100 MB; a paid plan allows more, hence the setting.
+CAMPAIGN_FOLDER = f"{UPLOAD_FOLDER}/campaigns"
+CAMPAIGN_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
+CAMPAIGN_VIDEO_TYPES = ("video/mp4", "video/quicktime")
+
+# kind -> (folder, Cloudinary resource type, size cap, allowed MIME types).
+# The folder is pinned per kind, so a signature for one can't be used to
+# drop a file in another's folder.
+KINDS = {
+    "image": (UPLOAD_FOLDER, "image", lambda: MAX_UPLOAD_BYTES, ALLOWED_IMAGE_TYPES),
+    "document": (DOCUMENT_FOLDER, "raw", lambda: MAX_UPLOAD_BYTES, ALLOWED_DOCUMENT_TYPES),
+    "campaign_image": (CAMPAIGN_FOLDER, "image", lambda: MAX_UPLOAD_BYTES, CAMPAIGN_IMAGE_TYPES),
+    "campaign_video": (
+        CAMPAIGN_FOLDER, "video", lambda: settings.CLOUDINARY_MAX_VIDEO_MB * 1024 * 1024, CAMPAIGN_VIDEO_TYPES,
+    ),
+}
+
 
 class CloudinaryNotConfigured(RuntimeError):
     """One of the CLOUDINARY_* settings is blank — uploads are switched off."""
@@ -56,7 +76,38 @@ def is_configured():
     )
 
 
-def build_signature(folder=UPLOAD_FOLDER, timestamp=None, *, document=False):
+def is_own_upload(url, resource_type):
+    """
+    Whether `url` is a file in this restaurant's Cloudinary account, of the
+    given resource type. Campaign media is posted to Facebook and Instagram
+    exactly as stored, so a URL pointing anywhere else is refused rather
+    than published under the restaurant's name.
+    """
+    if not settings.CLOUDINARY_CLOUD_NAME:
+        return False
+    prefix = f"https://res.cloudinary.com/{settings.CLOUDINARY_CLOUD_NAME}/{resource_type}/upload/"
+    return url.startswith(prefix) and len(url) > len(prefix)
+
+
+def transformed_url(url, transformation, extension=None):
+    """
+    A delivery URL for one of our uploads with a Cloudinary transformation
+    applied, e.g. ".../image/upload/c_limit,w_1440/v1/x.jpg". Cloudinary
+    builds the derived file on first request; nothing is stored here.
+
+    `extension` swaps the file's extension, which is how Cloudinary is asked
+    for a different format (".jpg" delivers a JPEG whatever was uploaded).
+    """
+    head, marker, tail = url.partition("/upload/")
+    if not marker:
+        return url
+    if extension:
+        stem, dot, _ = tail.rpartition(".")
+        tail = f"{stem if dot else tail}.{extension.lstrip('.')}"
+    return f"{head}/upload/{transformation}/{tail}"
+
+
+def build_signature(folder=UPLOAD_FOLDER, timestamp=None, *, document=False, kind="image"):
     """
     Everything the browser needs to upload one file, and nothing more.
 
@@ -72,7 +123,10 @@ def build_signature(folder=UPLOAD_FOLDER, timestamp=None, *, document=False):
         raise CloudinaryNotConfigured("CLOUDINARY_* settings are not set")
 
     if document:
-        folder = DOCUMENT_FOLDER
+        kind = "document"
+    kind_folder, resource_type, max_bytes, allowed_types = KINDS[kind]
+    if kind != "image":
+        folder = kind_folder
     timestamp = timestamp or int(time.time())
     signed_params = {"folder": folder, "timestamp": timestamp}
 
@@ -87,8 +141,7 @@ def build_signature(folder=UPLOAD_FOLDER, timestamp=None, *, document=False):
         # the API key is public by design — only the SECRET must stay here.
         "api_key": settings.CLOUDINARY_API_KEY,
         "cloud_name": settings.CLOUDINARY_CLOUD_NAME,
-        "upload_url": f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/"
-                      + ("raw" if document else "image") + "/upload",
-        "max_bytes": MAX_UPLOAD_BYTES,
-        "allowed_types": list(ALLOWED_DOCUMENT_TYPES if document else ALLOWED_IMAGE_TYPES),
+        "upload_url": f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/{resource_type}/upload",
+        "max_bytes": max_bytes(),
+        "allowed_types": list(allowed_types),
     }

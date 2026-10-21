@@ -296,6 +296,29 @@ WHATSAPP_API_VERSION = env('WHATSAPP_API_VERSION', default='v21.0')
 # "0501234567" becomes a working wa.me link. 966 = Saudi Arabia.
 MARKETING_DEFAULT_COUNTRY_CODE = env('MARKETING_DEFAULT_COUNTRY_CODE', default='966')
 
+# -- Facebook & Instagram posting (marketing/social.py, marketing/meta.py) ---
+#
+# Each restaurant connects its own Page from the admin (Marketing > Social
+# accounts); the Page id and token live in the database, not here. Only the
+# platform-wide values are settings:
+#
+# SOCIAL_TOKEN_ENCRYPTION_KEY encrypts those Page tokens at rest - a Fernet
+# key, or several comma-separated to rotate (common/crypto.py). Blank means
+# no restaurant can connect an account yet; nothing else is affected.
+SOCIAL_TOKEN_ENCRYPTION_KEY = env('SOCIAL_TOKEN_ENCRYPTION_KEY', default='')
+# The Meta app's secret, used only to sign Graph calls (appsecret_proof).
+# Backend-only, like every secret here. Blank skips the signature, which
+# works unless the app has "Require App Secret" switched on.
+META_APP_SECRET = env('META_APP_SECRET', default='')
+META_GRAPH_API_VERSION = env('META_GRAPH_API_VERSION', default='v23.0')
+# "Connect with Facebook" (marketing/social.py oauth_*). Needs the app id,
+# META_APP_SECRET, and the admin's callback URL exactly as registered under
+# Facebook Login > Settings > Valid OAuth redirect URIs, e.g.
+# https://admin.example.com/admin/marketing/accounts/facebook-callback
+# Any of the three blank = the button is hidden and pasting a token remains.
+META_APP_ID = env('META_APP_ID', default='')
+META_OAUTH_REDIRECT_URI = env('META_OAUTH_REDIRECT_URI', default='')
+
 # "Fill with AI" in the Excel import (imports/ai.py): any OpenAI-compatible
 # chat endpoint (NVIDIA by default). A blank key turns the option off and the
 # endpoint answers 503 imports.aiNotConfigured instead of failing obscurely.
@@ -303,6 +326,9 @@ AI_API_KEY = env('AI_API_KEY', default='')
 AI_BASE_URL = env('AI_BASE_URL', default='https://integrate.api.nvidia.com/v1')
 AI_MODEL = env('AI_MODEL', default='nvidia/nemotron-3-super-120b-a12b')
 AI_DRAFTS_PER_DAY = env.int('AI_DRAFTS_PER_DAY', default=20)
+# "Write with AI" on campaigns (marketing/ai.py), counted separately: one
+# short call each, so a higher allowance costs little.
+AI_CAMPAIGN_DRAFTS_PER_DAY = env.int('AI_CAMPAIGN_DRAFTS_PER_DAY', default=30)
 # Recipe calls run this many at a time (one per dish).
 AI_PARALLEL = env.int('AI_PARALLEL', default=6)
 # Extra request fields that turn the model's reasoning off for the quick menu
@@ -333,6 +359,9 @@ BILL_CURRENCY = 'SAR'
 CLOUDINARY_CLOUD_NAME = env('CLOUDINARY_CLOUD_NAME', default='')
 CLOUDINARY_API_KEY = env('CLOUDINARY_API_KEY', default='')
 CLOUDINARY_API_SECRET = env('CLOUDINARY_API_SECRET', default='')
+# Largest campaign video the admin will upload, in MB. 100 is the free
+# plan's per-file cap; raise it only if the Cloudinary plan allows more.
+CLOUDINARY_MAX_VIDEO_MB = env.int('CLOUDINARY_MAX_VIDEO_MB', default=100)
 
 # Absolute origin of the customer-facing QR web app (burger_web). Used to
 # build the Moyasar callback_url the customer is redirected back to after

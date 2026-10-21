@@ -191,13 +191,19 @@ def _clean(rows, sheet, given):
     return cleaned, estimated
 
 
-def _ask(client, name, schema, messages, extra_body=None):
-    """(parsed JSON object, (prompt tokens, completion tokens)) for one call."""
+def client(timeout=300):
+    """The configured chat endpoint. Also used by marketing/ai.py."""
+    return OpenAI(base_url=settings.AI_BASE_URL, api_key=settings.AI_API_KEY, timeout=timeout, max_retries=1)
+
+
+def ask(chat, name, schema, messages, extra_body=None, temperature=0.2):
+    """(parsed JSON object, (prompt tokens, completion tokens)) for one call,
+    or AiDraftError with an imports.ai* code. Also used by marketing/ai.py."""
     try:
-        response = client.chat.completions.create(
+        response = chat.chat.completions.create(
             model=settings.AI_MODEL,
             max_tokens=16000,
-            temperature=0.2,
+            temperature=temperature,
             response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": True}},
             messages=messages,
             extra_body=extra_body or None,
@@ -225,12 +231,12 @@ def draft(restaurant, text):
     {"summary", "failed_recipes": [dish], sheet key: [(row dict, [estimated keys])]}.
     A dish whose recipe call fails is reported in failed_recipes rather than
     losing the rest of the draft."""
-    client = OpenAI(base_url=settings.AI_BASE_URL, api_key=settings.AI_API_KEY, timeout=300, max_retries=1)
+    chat = client()
     units = restaurant.lists()["Units"]
     current = _current_data(restaurant.branch)
     stock_sheet, menu_sheet, _ = restaurant.sheets
 
-    body, tokens = _ask(client, "restaurant_menu", menu_schema(restaurant, units), [
+    body, tokens = ask(chat, "restaurant_menu", menu_schema(restaurant, units), [
         {"role": "system", "content": _menu_instructions(restaurant)},
         {"role": "user", "content": f"Current restaurant data (JSON):\n{json.dumps(current, ensure_ascii=False)}\n\nThe admin's request:\n{text}"},
     ], extra_body=settings.AI_FAST_EXTRA_BODY)
@@ -247,7 +253,7 @@ def draft(restaurant, text):
     dishes = list(dict.fromkeys(name.strip() for name in body.get("recipe_dishes") or [] if isinstance(name, str) and name.strip()))
 
     def recipe(dish):
-        return _ask(client, "recipe", recipe_schema(units), [
+        return ask(chat, "recipe", recipe_schema(units), [
             {"role": "system", "content": f"{RECIPE_PROMPT}\n\nThe restaurant's stock items (name and stock unit):\n{stock_list}"},
             {"role": "user", "content": f"Dish: {dish}\n\nThe admin's request, for context:\n{text}"},
         ])

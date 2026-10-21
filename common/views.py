@@ -35,7 +35,10 @@ class UploadSignatureView(APIView):
                 {"error": "error.uploadsNotConfigured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
         try:
-            payload = cloudinary.build_signature(document=request.data.get("kind") == "document")
+            # Anything unrecognised is an ordinary image upload, which is
+            # what every caller asked for before kinds existed.
+            kind = request.data.get("kind")
+            payload = cloudinary.build_signature(kind=kind if kind in cloudinary.KINDS else "image")
         except cloudinary.CloudinaryNotConfigured:
             return Response(
                 {"error": "error.uploadsNotConfigured"}, status=status.HTTP_503_SERVICE_UNAVAILABLE

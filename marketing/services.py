@@ -159,15 +159,39 @@ def _tidy(text):
     return "\n".join(lines).strip()
 
 
+# Between the message and the media link: a blank line, so WhatsApp shows
+# the link (and its preview card) apart from the text.
+MEDIA_LINK_SEPARATOR = "\n\n"
+
+
+def with_media_link(text, media_url):
+    """
+    The message with the campaign's image or video link after it.
+
+    A wa.me link can only carry text, so this is how a WhatsApp campaign
+    shows its media: WhatsApp turns the link into a preview. Added after
+    placeholders are filled, so a {{name}} can never end up inside the URL.
+    """
+    if not media_url:
+        return text
+    return f"{text}{MEDIA_LINK_SEPARATOR}{media_url}" if text else media_url
+
+
+def media_link_length(media_url):
+    """How many characters with_media_link() adds to a message."""
+    return len(MEDIA_LINK_SEPARATOR) + len(media_url) if media_url else 0
+
+
 def preview_message(campaign, customer=None):
     """The campaign's message as one real customer would receive it."""
-    return render_message(
+    text = render_message(
         message_template(campaign),
         customer_name=getattr(customer, "name", "") or "",
         phone=getattr(customer, "phone", "") or "",
         restaurant=campaign.branch.name_ar or campaign.branch.name_en,
         fallback_name=campaign.fallback_name,
     )
+    return with_media_link(text, campaign.media_url)
 
 
 # -- phone numbers -----------------------------------------------------------
@@ -241,12 +265,15 @@ def build_recipients(campaign, now=None):
             customer=customer,
             phone=customer.phone,
             name=customer.name or "",
-            message=render_message(
-                template,
-                customer_name=customer.name,
-                phone=customer.phone,
-                restaurant=restaurant,
-                fallback_name=campaign.fallback_name,
+            message=with_media_link(
+                render_message(
+                    template,
+                    customer_name=customer.name,
+                    phone=customer.phone,
+                    restaurant=restaurant,
+                    fallback_name=campaign.fallback_name,
+                ),
+                campaign.media_url,
             ),
             status=RecipientStatus.PENDING,
         ))
