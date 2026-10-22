@@ -1098,25 +1098,36 @@ class OrderCustomerView(APIView):
 
     permission_classes = [IsPOSStaff]
 
+    @transaction.atomic
     def post(self, request, pk):
         order = _get_order_or_404(pk, request.user.branch)
+        if order.table_id:
+            Table.objects.select_for_update().get(pk=order.table_id)
+        order = Order.objects.select_for_update().get(pk=order.pk)
         guard = _closed_order_response(order)
         if guard:
             return guard
-
         customer_id = request.data.get("customer")
-        if customer_id in (None, ""):
-            order.customer = None
-        else:
-            customer = get_object_or_404(Customer, pk=customer_id, branch=request.user.branch)
-            order.customer = customer
-            # The same timestamp the field name promises; a customer's history
-            # is read from orders anyway, this is just the cheap "when did we
-            # last see them" column.
+        customer = None if customer_id in (None, "") else get_object_or_404(
+            Customer, pk=customer_id, branch=request.user.branch)
+        if order.table_id and order.bill_id:
+            from .models import Bill, BillStatus
+            bill = Bill.objects.select_for_update().get(pk=order.bill_id)
+            # Linking a POS visit is allowed; moving an active customer's
+            # financial record to another person is not.
+            if bill.status == BillStatus.CLOSED or (bill.customer_id and bill.customer_id != getattr(customer, "pk", None)):
+                return Response({"error": "error.tableOccupied"}, status=status.HTTP_409_CONFLICT)
+            if customer and not bill.customer_id:
+                if Bill.objects.filter(table_id=order.table_id).exclude(status=BillStatus.CLOSED).exclude(pk=bill.pk).exists():
+                    return Response({"error": "error.tableOccupied"}, status=status.HTTP_409_CONFLICT)
+                bill.customer = customer
+                bill.save(update_fields=["customer", "updated_at"])
+                bill.orders.update(customer=customer)
+        order.customer = customer
+        order.save(update_fields=["customer", "updated_at"])
+        if customer:
             customer.last_order_at = timezone.now()
             customer.save(update_fields=["last_order_at", "updated_at"])
-
-        order.save(update_fields=["customer", "updated_at"])
         return Response(OrderSerializer(order).data)
 
 
@@ -1214,6 +1225,12 @@ class PublicOrderCreateView(APIView):
                     return Response({"error": "error.idempotencyKeyConflict"}, status=status.HTTP_409_CONFLICT)
                 order = previous.order
                 return Response(PublicOrderSerializer(order).data, status=status.HTTP_200_OK)
+
+            if table:
+                from .billing import table_customer_access
+                _, _, can_order = table_customer_access(table, phone)
+                if not can_order:
+                    return Response({"error": "error.tableOccupied"}, status=status.HTTP_409_CONFLICT)
 
             customer, _ = find_or_create_customer(branch, submitted_phone, request.data.get("name", ""))
             try:

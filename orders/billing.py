@@ -131,6 +131,21 @@ def get_or_create_open_bill(table, customer=None):
     return Bill.objects.create(branch=table.branch, table=table, customer=customer), True
 
 
+def table_customer_access(table, phone=""):
+    """Public QR access. Existing legacy owners may continue their own bill.
+
+    Creation callers must hold the table row lock before checking this.
+    Paid bills still occupy the table until staff explicitly releases it.
+    """
+    from customers.services import phones_match
+
+    bills = list(Bill.objects.filter(table=table).exclude(status=BillStatus.CLOSED)
+                 .select_related("customer").order_by("-id"))
+    own = next((bill for bill in bills
+                if bill.customer_id and phones_match(bill.customer.phone, phone)), None)
+    return bool(bills), own, not bills or own is not None
+
+
 def customer_bills_for_table(table, phone):
     """Unfinished bills at this table that belong to `phone` (newest first)."""
     from customers.services import phones_match

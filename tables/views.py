@@ -170,15 +170,14 @@ class TableBySessionView(APIView):
         if not token:
             raise Http404
         table = get_object_or_404(Table, session_token=token)
-        # Each phone has its own bill at a table, so the order and bill are
-        # only returned for the phone that owns them (?phone=). The table token
-        # alone never reveals another party's order.
+        # Only the matching customer may see the active bill or order.
+        # Occupancy itself is public; the customer number is never disclosed.
         bill = order = None
         phone = str(request.query_params.get("phone", "")).strip()
+        from orders.billing import table_customer_access
+        occupied, own_bill, can_order = table_customer_access(table, phone)
         if phone:
-            from orders.billing import customer_bills_for_table
-            bills = customer_bills_for_table(table, phone)
-            bill = bills[0] if bills else None
+            bill = own_bill
             if bill:
                 order = (
                     Order.objects.filter(table=table, bill=bill)
@@ -189,6 +188,9 @@ class TableBySessionView(APIView):
                 )
         return Response({
             "table": TableSerializer(table).data,
+            "occupied": occupied,
+            "can_order": can_order if phone else None,
+            "bill_status": own_bill.status if own_bill else None,
             "bill_id": bill.pk if bill else None,
             "open_order": PublicOrderSerializer(order).data if order else None,
         })

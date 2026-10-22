@@ -48,18 +48,86 @@ class PerPhoneBillTestCase(CustomerSessionTestCase):
 
 
 class SeparateBillPerPhoneTests(PerPhoneBillTestCase):
-    def test_two_phones_at_one_table_get_separate_orders_and_bills(self):
+    def test_second_number_is_blocked_without_changing_existing_bill(self):
         table = self.new_table()
-        a = self.qr(table, phone=PHONE_A).json()
-        b = self.qr(table, phone=PHONE_B, items=[{"product": self.burger.pk}]).json()
-        self.assertNotEqual(a["id"], b["id"])
-        self.assertNotEqual(a["bill_id"], b["bill_id"])
-        bill_a = self.bill_for(table, PHONE_A).json()
-        self.assertEqual([order["id"] for order in bill_a["orders"]], [a["id"]])
-        self.assertEqual(bill_a["total"], "10.00")
-        bill_b = self.bill_for(table, "+966502222222").json()
-        self.assertEqual([order["id"] for order in bill_b["orders"]], [b["id"]])
-        self.assertEqual(bill_b["total"], "25.00")
+        first = self.qr(table, phone=PHONE_A).json()
+        response = self.qr(table, phone=PHONE_B)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"error": "error.tableOccupied"})
+        self.assertEqual(Bill.objects.filter(table=table).count(), 1)
+        self.assertEqual(self.bill_for(table, PHONE_A).json()["total"], "10.00")
+        again = self.qr(table, phone="+966501111111")
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["bill_id"], first["bill_id"])
+
+    def test_scan_does_not_claim_table_and_status_does_not_expose_phone(self):
+        table = self.new_table()
+        url = f"/api/tables/by-session/{table.session_token}/"
+        self.assertFalse(self.public.get(url).json()["occupied"])
+        first = self.qr(table, phone=PHONE_A).json()
+        public = self.public.get(url).json()
+        self.assertTrue(public["occupied"])
+        self.assertIsNone(public["can_order"])
+        self.assertNotIn(PHONE_A, str(public))
+        other = self.public.get(url, {"phone": PHONE_B}).json()
+        self.assertFalse(other["can_order"])
+        self.assertIsNone(other["bill_id"])
+        own = self.public.get(url, {"phone": "+966501111111"}).json()
+        self.assertTrue(own["can_order"])
+        self.assertEqual(own["bill_status"], "open")
+        self.assertEqual(own["bill_id"], first["bill_id"])
+
+    def test_paid_and_payment_requested_still_occupy_until_release(self):
+        table = self.new_table()
+        first = self.qr(table, phone=PHONE_A).json()
+        self.dispatch_and_serve(first["id"])
+        response = self.public.post("/api/bills/request-pay/", {
+            "session_token": table.session_token, "method": "cash", "phone": PHONE_A,
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.qr(table, phone=PHONE_B).status_code, 409)
+        self.assertEqual(self.cashier_client.post(f"/api/bills/{first['bill_id']}/mark-paid/",
+                         {"method": "cash"}, format="json").status_code, 200)
+        self.assertEqual(self.qr(table, phone=PHONE_B).status_code, 409)
+        own = self.public.get(f"/api/tables/by-session/{table.session_token}/", {"phone": PHONE_A}).json()
+        self.assertEqual(own["bill_status"], "paid")
+        self.assertEqual(self.cashier_client.post(f"/api/bills/{first['bill_id']}/release-table/").status_code, 200)
+        self.assertFalse(self.public.get(f"/api/tables/by-session/{table.session_token}/").json()["occupied"])
+        self.assertEqual(self.qr(table, phone=PHONE_B).status_code, 201)
+
+    def test_staff_links_pos_bill_for_qr_without_opening_a_second_bill(self):
+        from customers.models import Customer
+        table = self.new_table()
+        staff = self.cashier_client.post("/api/orders/", {"table": table.pk}, format="json")
+        self.assertEqual(staff.status_code, 201)
+        order_id = staff.json()["id"]
+        customer = Customer.objects.create(branch=self.branch, phone=PHONE_A)
+        response = self.cashier_client.post(f"/api/orders/{order_id}/customer/", {"customer": customer.pk}, format="json")
+        self.assertEqual(response.status_code, 200)
+        qr = self.qr(table, phone=PHONE_A)
+        self.assertEqual(qr.status_code, 200)
+        self.assertEqual(qr.json()["id"], order_id)
+        self.assertEqual(Bill.objects.filter(table=table).count(), 1)
+        self.assertEqual(self.qr(table, phone=PHONE_B).status_code, 409)
+
+    def test_legacy_multiple_bills_are_preserved_and_new_numbers_blocked(self):
+        from customers.models import Customer
+        table = self.new_table()
+        first = self.qr(table, phone=PHONE_A).json()
+        other = Customer.objects.create(branch=self.branch, phone=PHONE_B)
+        legacy = Bill.objects.create(branch=self.branch, table=table, customer=other)
+        response = self.qr(table, phone=PHONE_B)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["bill_id"], legacy.pk)
+        self.assertEqual(self.qr(table, phone="0503333333").status_code, 409)
+        self.assertEqual(self.qr(table, phone=PHONE_A).json()["bill_id"], first["bill_id"])
+        self.assertEqual(Bill.objects.filter(table=table).count(), 2)
+
+    def test_unclaimed_pos_bill_blocks_qr(self):
+        table = self.new_table()
+        Bill.objects.create(branch=self.branch, table=table)
+        self.assertEqual(self.qr(table, phone=PHONE_A).status_code, 409)
+        self.assertEqual(Bill.objects.filter(table=table).count(), 1)
 
     def test_phone_is_required_and_other_phones_bill_is_never_returned(self):
         table = self.new_table()
