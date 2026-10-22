@@ -1,3 +1,4 @@
+from common.pagination import ListMetadataMixin
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -13,7 +14,7 @@ from .models import Category, Deal, Product, ProductVariant
 from .serializers import CategorySerializer, DealSerializer, ProductSerializer, ProductVariantSerializer
 from .services import current_price, is_available_today
 
-class CategoryViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
+class CategoryViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """Read is any authenticated staff; write is owner/manager only. Queryset
     scoped to the requester's branch."""
 
@@ -21,17 +22,18 @@ class CategoryViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = CategorySerializer
 
     def get_queryset(self):
-        from django.db.models import Count
+        from django.db.models import Count, Q
         from common.filters import text_filter
-        qs = super().get_queryset()
+        qs = super().get_queryset().annotate(product_count=Count("products", filter=Q(products__is_deleted=False), distinct=True))
         params = self.request.query_params
         qs = text_filter(qs, params, "search", ["name_en", "name_ar"])
         has_products = (params.get("has_products") or "").strip().lower()
         if has_products in ("true", "1", "yes"):
-            qs = qs.annotate(product_count=Count("products")).filter(product_count__gt=0)
+            qs = qs.filter(product_count__gt=0)
         elif has_products in ("false", "0", "no"):
-            qs = qs.annotate(product_count=Count("products")).filter(product_count=0)
-        return qs
+            qs = qs.filter(product_count=0)
+        from common.filters import ordering_filter
+        return ordering_filter(qs, params, {"name": "name_ar" if params.get("language") == "ar" else "name_en", "products": "product_count", "order": "sort_order"}, ["sort_order"])
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
@@ -46,7 +48,7 @@ class CategoryViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
+class ProductViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """Read is any authenticated staff (POS/KDS need the menu too); write is
     owner/manager only. Queryset scoped to the requester's branch."""
 
@@ -60,9 +62,9 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     )
 
     def get_queryset(self):
-        from django.db.models import Exists, OuterRef
+        from django.db.models import Exists, OuterRef, Count, Q
         from common.filters import text_filter, numeric_range_filter
-        qs = super().get_queryset()
+        qs = super().get_queryset().annotate(recipe_count=Count("recipe_items", filter=Q(recipe_items__is_deleted=False), distinct=True))
         params = self.request.query_params
         category_id = params.get("category")
         available = params.get("available")
@@ -70,7 +72,7 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(category_id=category_id)
         if available is not None:
             qs = qs.filter(is_available=available.lower() in ("1", "true", "yes"))
-        qs = text_filter(qs, params, "search", ["name_en", "name_ar", "description_en", "description_ar"])
+        qs = text_filter(qs, params, "search", ["name_en", "name_ar", "description_en", "description_ar", "category__name_en", "category__name_ar"])
         badge = (params.get("badge") or "").strip()
         if badge == "none":
             qs = qs.filter(badge="")
@@ -84,10 +86,27 @@ class ProductViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         elif has_recipe in ("false", "0", "no"):
             from inventory.models import RecipeItem
             qs = qs.exclude(Exists(RecipeItem.objects.filter(product=OuterRef("pk"))))
-        return qs
+        if params.get("has_deal") == "true":
+            qs = qs.filter(deal__isnull=False)
+        from common.filters import ordering_filter
+        language = "ar" if params.get("language") == "ar" else "en"
+        return ordering_filter(qs, params, {"name": f"name_{language}", "category": f"category__name_{language}", "price": "price", "available": "is_available", "ingredients": "recipe_count", "cost": "cost_price"}, ["name_en"])
+
+    def list_metadata(self, qs):
+        return {"with_recipe": sum(product.recipe_count > 0 for product in qs) if isinstance(qs, list) else qs.filter(recipe_count__gt=0).count()}
+
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
+        ordering = request.query_params.get("ordering", "")
+        if ordering.lstrip("-") == "margin":
+            from .costing import recipe_cost
+            def margin(product):
+                cost = recipe_cost(product) if product.recipe_count else product.cost_price
+                return (product.price - cost) / product.price if product.price else 0
+            # Recipe/unit-aware margin has no stored sortable column. Compute
+            # on the server before slicing, reusing prefetched recipe lines.
+            queryset = sorted(queryset, key=lambda product: (margin(product), product.pk), reverse=ordering.startswith("-"))
         page = self.paginate_queryset(queryset)
         products = list(page if page is not None else queryset)
         items, requirements = stock_requirements(products)

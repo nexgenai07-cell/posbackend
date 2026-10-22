@@ -1,3 +1,4 @@
+from common.pagination import ListMetadataMixin
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import F
@@ -23,7 +24,7 @@ from .serializers import (
 from .services import adjust_stock
 
 
-class InventoryItemViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
+class InventoryItemViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """Inventory quantities and mutations are restricted to owner/manager."""
 
     queryset = InventoryItem.objects.select_related("supplier")
@@ -31,7 +32,8 @@ class InventoryItemViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         from common.filters import text_filter, choice_filter, fk_filter
-        qs = super().get_queryset()
+        from django.db.models import Count, Q
+        qs = super().get_queryset().annotate(recipe_usage=Count("recipe_items", filter=Q(recipe_items__product__is_deleted=False, recipe_items__is_deleted=False), distinct=True))
         params = self.request.query_params
         qs = text_filter(qs, params, "search", ["name"])
         qs = fk_filter(qs, params, "supplier", field="supplier_id")
@@ -43,7 +45,15 @@ class InventoryItemViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(current_stock__gt=0, current_stock__lte=F("par_level"))
         elif stock_status == "ok":
             qs = qs.filter(current_stock__gt=F("par_level"))
-        return qs
+        from common.filters import ordering_filter
+        return ordering_filter(qs, params, {"name": "name", "unit": "unit", "stock": "current_stock", "par": "par_level", "cost": "cost_per_unit", "value": F("current_stock") * F("cost_per_unit"), "usage": "recipe_usage"}, ["name"])
+
+    def list_metadata(self, qs):
+        from django.db.models import Sum
+        return {"low_stock": qs.filter(current_stock__lte=F("par_level")).count(),
+                "stock_value": qs.aggregate(value=Sum(F("current_stock") * F("cost_per_unit")))["value"] or 0,
+                "units": list(InventoryItem.objects.filter(branch=self.request.user.branch).order_by("unit").values_list("unit", flat=True).distinct())}
+
 
     def get_permissions(self):
         return [IsOwnerOrManager()]
@@ -172,8 +182,12 @@ class RecipeListView(ListAPIView):
     permission_classes = [IsOwnerOrManager]
 
     def get_queryset(self):
+        product_ids = self.request.query_params.get("products", "")
+        qs = RecipeItem.objects.filter(product__branch=self.request.user.branch, product__is_deleted=False)
+        if product_ids:
+            qs = qs.filter(product_id__in=[int(value) for value in product_ids.split(",") if value.isdigit()])
         return (
-            RecipeItem.objects.filter(product__branch=self.request.user.branch)
+            qs
             .select_related("product", "inventory_item")
             .order_by("product_id", "id")
         )

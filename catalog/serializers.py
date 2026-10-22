@@ -9,6 +9,7 @@ from .models import Category, Deal, DealWindow, Product, ProductVariant, Weekday
 
 
 class CategorySerializer(serializers.ModelSerializer):
+    product_count = serializers.IntegerField(read_only=True, default=0)
     # Neither language is unconditionally required — see require_bilingual_pair
     # below, which only requires whichever one the admin UI has active.
     name_en = serializers.CharField(required=False, allow_blank=True)
@@ -16,7 +17,7 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ["id", "branch", "name_en", "name_ar", "sort_order", "created_at", "updated_at"]
+        fields = ["id", "branch", "name_en", "name_ar", "sort_order", "created_at", "updated_at", "product_count"]
         read_only_fields = ["id", "created_at", "updated_at"]
 
     def validate(self, attrs):
@@ -148,6 +149,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
 
 class ProductSerializer(serializers.ModelSerializer):
+    recipe_count = serializers.IntegerField(read_only=True, default=0)
     # Neither language is unconditionally required — see require_bilingual_pair
     # in validate(), which only requires whichever one the admin UI has active.
     name_en = serializers.CharField(required=False, allow_blank=True)
@@ -186,6 +188,7 @@ class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = [
+            "recipe_count",
             "id", "branch", "category", "name_en", "name_ar",
             "description_en", "description_ar", "price", "cost_price",
             "image", "is_available", "is_orderable", "available_quantity", "badge", "days", "deal",

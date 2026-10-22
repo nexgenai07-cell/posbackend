@@ -1,3 +1,5 @@
+from django.db.models import Value
+from django.db.models import F
 from decimal import Decimal
 from collections import defaultdict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -138,9 +140,29 @@ class RecentOrdersView(BaseReportView):
         orders = (
             orders.select_related("table", "customer", "staff")
             .prefetch_related("items", "payments", "history")
-            .order_by("-opened_at")[:limit]
+            .order_by("-opened_at", "-pk")
         )
-        return Response(OrderSerializer(orders, many=True).data)
+        if "page" in params or "page_size" in params:
+            from common.pagination import DefaultPagination
+            from common.filters import ordering_filter
+            from django.db.models import OuterRef, Subquery, Sum, DecimalField, IntegerField, CharField
+            from django.db.models.functions import Coalesce
+            from orders.models import OrderItem
+            items = OrderItem.objects.filter(order_id=OuterRef("pk")).exclude(status="voided").values("order_id")
+            amounts = items.annotate(value=Sum(F("price_snapshot") * F("quantity"))).values("value")
+            quantities = items.annotate(value=Sum("quantity")).values("value")
+            method = Payment.objects.filter(order_id=OuterRef("pk")).order_by("method").values("method")[:1]
+            orders = orders.annotate(report_method=Coalesce(Subquery(method, output_field=CharField()), Value("unpaid")), report_total=Coalesce(Subquery(amounts, output_field=DecimalField()), Decimal("0")),
+                                     report_items=Coalesce(Subquery(quantities, output_field=IntegerField()), 0))
+            total = orders.aggregate(value=Sum("report_total"))["value"] or 0
+            orders = ordering_filter(orders, params,
+                {"order": "pk", "date": "opened_at", "table": "table__label_en", "status": "status", "source": "source", "total": "report_total", "items": "report_items", "payment": "report_method"}, ["-opened_at"])
+            pager = DefaultPagination()
+            page = pager.paginate_queryset(orders, request, view=self)
+            response = pager.get_paginated_response(OrderSerializer(page, many=True).data)
+            response.data["metadata"] = {"total_spend": total}
+            return response
+        return Response(OrderSerializer(orders[:limit], many=True).data)
 
 
 class SalesOverviewView(BaseReportView):

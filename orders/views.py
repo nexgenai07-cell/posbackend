@@ -1,3 +1,4 @@
+from common.pagination import ListMetadataMixin
 from decimal import Decimal
 from datetime import datetime, time, timedelta
 import hashlib
@@ -319,7 +320,7 @@ class OrderSummaryView(APIView):
         return Response({**counts, "sales": str((sales or Decimal("0")).quantize(Decimal("0.01")))})
 
 
-class OrderListCreateView(ListModelMixin, GenericAPIView):
+class OrderListCreateView(ListMetadataMixin, ListModelMixin, GenericAPIView):
     """
     GET lists orders for the requester's branch, filterable by ?status=,
     ?table=, and ?from=/?to= (date range on opened_at, YYYY-MM-DD) — added
@@ -344,7 +345,19 @@ class OrderListCreateView(ListModelMixin, GenericAPIView):
         return super().get_permissions()
 
     def get_queryset(self):
-        return filtered_orders(self.request, _order_queryset()).order_by("-opened_at", "-pk")
+        from django.db.models import OuterRef, Subquery, Sum, DecimalField
+        from django.db.models.functions import Coalesce
+        from common.filters import ordering_filter
+        payments = Payment.objects.filter(order_id=OuterRef("pk")).values("order_id").annotate(total=Sum("amount")).values("total")
+        qs = filtered_orders(self.request, _order_queryset()).annotate(history_date=Coalesce("closed_at", "opened_at"), collected=Coalesce(Subquery(payments, output_field=DecimalField()), Decimal("0")))
+        return ordering_filter(qs, self.request.query_params,
+            {"order": "pk", "date": "history_date", "status": "status", "total": "collected", "source": "source"}, ["-opened_at"])
+
+    def list_metadata(self, qs):
+        from django.db.models import Sum
+        paid = qs.filter(payment_status=PaymentStatus.PAID)
+        amount = Payment.objects.filter(order__in=paid.values("pk")).aggregate(total=Sum("amount"))["total"]
+        return {"paid_count": paid.count(), "total_spend": amount or 0}
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)

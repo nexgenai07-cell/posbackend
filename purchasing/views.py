@@ -39,7 +39,8 @@ class SupplierViewSet(viewsets.ModelViewSet):
             qs = qs.exclude(contact_info="").exclude(contact_info__isnull=True)
         elif has_contact in ("false", "0", "no"):
             qs = qs.filter(contact_info__in=["", None])
-        return qs
+        from common.filters import ordering_filter
+        return ordering_filter(qs, params, {"name": "name_ar" if params.get("language") == "ar" else "name_en", "contact": "contact_info"}, ["name_en"])
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):

@@ -1,3 +1,4 @@
+from common.pagination import ListMetadataMixin
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
@@ -21,7 +22,7 @@ from .serializers import TableSerializer
 from .services import parse_qr_payload
 
 
-class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
+class TableViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """
     CRUD (adding/renaming/removing physical tables) is owner/manager only —
     the admin Tables page. open/close/needs-bill are POS actions, so any
@@ -59,7 +60,11 @@ class TableViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         status_filter = params.get("status")
         if status_filter in {choice for choice, _label in TableStatus.choices}:
             queryset = queryset.filter(status=status_filter)
-        return queryset
+        from common.filters import ordering_filter
+        return ordering_filter(queryset, params, {"label": "label_ar" if params.get("language") == "ar" else "label_en", "status": "status", "seats": "seats"}, ["label_en"])
+
+    def list_metadata(self, qs):
+        return {"in_use": qs.exclude(status=TableStatus.EMPTY).count()}
 
     def get_permissions(self):
         # active_sessions is a read: it exposes exactly what list/retrieve

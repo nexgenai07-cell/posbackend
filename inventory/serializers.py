@@ -9,13 +9,14 @@ MANUAL_STOCK_REASONS = [StockMovementReason.WASTE, StockMovementReason.ADJUSTMEN
 
 
 class InventoryItemSerializer(serializers.ModelSerializer):
+    recipe_usage = serializers.IntegerField(read_only=True, default=0)
     name = serializers.CharField(error_messages={"blank": "error.nameRequired", "required": "error.nameRequired"})
 
     class Meta:
         model = InventoryItem
         fields = [
             "id", "branch", "name", "unit", "current_stock", "par_level",
-            "cost_per_unit", "supplier", "created_at", "updated_at",
+            "cost_per_unit", "supplier", "created_at", "updated_at", "recipe_usage",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 

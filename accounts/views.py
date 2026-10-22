@@ -179,7 +179,8 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             qs, params, "role", field="role",
             allowed=["owner", "manager", "cashier", "waiter", "kitchen"]
         )
-        return qs
+        from common.filters import ordering_filter
+        return ordering_filter(qs, params, {"name": "name", "role": "role"}, ["name"])
 
     @action(detail=True, methods=["get"], url_path="shifts", permission_classes=[IsAuthenticated])
     def shifts(self, request, pk=None):

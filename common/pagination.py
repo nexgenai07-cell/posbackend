@@ -19,3 +19,17 @@ class DefaultPagination(PageNumberPagination):
     page_size = 25
     page_size_query_param = "page_size"
     max_page_size = 200
+
+
+class ListMetadataMixin:
+    """Attach full-selection statistics without downloading all rows."""
+
+    def paginate_queryset(self, queryset):
+        page = super().paginate_queryset(queryset)
+        self._list_metadata = self.list_metadata(queryset) if hasattr(self, "list_metadata") else {}
+        return page
+
+    def get_paginated_response(self, data):
+        response = super().get_paginated_response(data)
+        response.data["metadata"] = getattr(self, "_list_metadata", {})
+        return response
