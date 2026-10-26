@@ -88,6 +88,7 @@ class TablesApiTestCase(TestCase):
         )
         cls.owner = make_staff(cls.riyadh, "Amir", StaffRole.OWNER, "1111")
         cls.cashier = make_staff(cls.riyadh, "Junaid", StaffRole.CASHIER, "3333")
+        cls.waiter = make_staff(cls.riyadh, "Bilal", StaffRole.WAITER, "4444")
         cls.jeddah_owner = make_staff(cls.jeddah, "Faisal", StaffRole.OWNER, "5555")
 
         # open() mints the session token / QR payload — never hand-written.
@@ -276,7 +277,8 @@ class PublicQrOrderTests(TablesApiTestCase):
             response = self.client.post(self.url, payload, format="json")
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
             if key == "location_timestamp":
-                self.assertEqual(self.error_code(response), "error.locationStale")
+                # Raised against the field (common/geofence.py), so it is keyed by it.
+                self.assertEqual(response.json()["location_timestamp"], "error.locationStale")
         from orders.models import Order
         self.assertFalse(Order.objects.filter(table=self.open_table).exists())
 
@@ -1234,3 +1236,48 @@ class KitchenTicketDetailTests(TablesApiTestCase):
         self.assertNotIn(order.pk, ids("type=qr"))
         self.assertIn(order.pk, ids(f"search={order.pk}"))
         self.assertEqual(ids("type=bogus"), [])
+
+
+class TableLabelValidationTests(TablesApiTestCase):
+    """Table labels are normalised on save and duplicates are caught ignoring case and spaces."""
+
+    def create(self, label_en="", label_ar=""):
+        return self.client.post(
+            "/api/tables/",
+            {"branch": self.riyadh.id, "label_en": label_en, "label_ar": label_ar, "seats": 4},
+            format="json",
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.auth_as(self.owner, "1111")
+
+    def test_english_label_is_stored_upper_case_with_collapsed_spaces(self):
+        response = self.create("  garden   7 ")
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()["label_en"], "GARDEN 7")
+
+    def test_duplicate_label_rejected_regardless_of_case_or_spacing(self):
+        for label in ("Table 4", "table 4", "TABLE4", "  table   4 "):
+            response = self.create(label)
+            self.assertEqual(response.status_code, 400, label)
+            self.assertEqual(response.json()["label_en"], ["error.tableLabelExists"])
+
+    def test_duplicate_arabic_label_rejected_ignoring_spaces(self):
+        response = self.create(label_ar="طاولة  ٤")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["label_ar"], ["error.tableLabelExists"])
+
+    def test_same_label_allowed_in_another_branch(self):
+        response = self.create("Table 9")
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def test_editing_a_table_keeps_its_own_label(self):
+        response = self.client.patch(f"/api/tables/{self.empty_table.id}/", {"label_en": "table 4", "seats": 6}, format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["label_en"], "TABLE 4")
+
+    def test_renaming_into_an_existing_label_rejected(self):
+        response = self.client.patch(f"/api/tables/{self.empty_table.id}/", {"label_en": "table3"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["label_en"], ["error.tableLabelExists"])

@@ -65,6 +65,15 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 
 class AddOrderItemSerializer(serializers.Serializer):
+    """
+    Adds a line to an order. With context {"merge_pending": True} the same
+    dish (product, portion, note and price) tapped again goes into the line
+    already waiting to be sent — its quantity grows — instead of a second row.
+    Only a PENDING line is ever merged into: once a line is in the kitchen its
+    quantity is fixed, and the next one is a new kitchen ticket. After save(),
+    `added_quantity` is how many this call added (the line may hold more).
+    """
+
     product = serializers.PrimaryKeyRelatedField(
         queryset=Product.objects.all(),
         error_messages={"required": "error.productRequired", "does_not_exist": "error.productRequired"},
@@ -98,18 +107,41 @@ class AddOrderItemSerializer(serializers.Serializer):
             if not variant.is_active:
                 raise serializers.ValidationError({"variant": "error.variantUnavailable"})
 
+        self._merge_into = self._pending_line(product, variant, attrs.get("notes", "")) if product else None
         if product:
             # Stock is checked against the SELECTED portion: a 2 KG order needs
             # twice the ingredients, so the base recipe passing proves nothing.
-            available, _reason = check_product_stock(product, quantity, variant=variant)
+            # A merged line is checked for its new total, not just the delta.
+            total = quantity + (self._merge_into.quantity if self._merge_into else 0)
+            available, _reason = check_product_stock(product, total, variant=variant)
             if not available:
                 raise ConflictCode("error.productUnavailable")
         return attrs
+
+    def _pending_line(self, product, variant, notes):
+        if not self.context.get("merge_pending"):
+            return None
+        return (
+            OrderItem.objects.select_for_update()
+            .filter(
+                order=self.context["order"], product=product, variant=variant,
+                status=OrderItemStatus.PENDING, notes=(notes or "").strip(),
+                price_snapshot=current_price(product, variant),
+            )
+            .order_by("id")
+            .first()
+        )
 
     def create(self, validated_data):
         order = self.context["order"]
         product = validated_data["product"]
         variant = validated_data.get("variant")
+        self.added_quantity = validated_data["quantity"]
+        line = getattr(self, "_merge_into", None)
+        if line is not None:
+            line.quantity += validated_data["quantity"]
+            line.save(update_fields=["quantity", "updated_at"])
+            return line
         return OrderItem.objects.create(
             order=order,
             product=product,
@@ -127,7 +159,7 @@ class AddOrderItemSerializer(serializers.Serializer):
             # window is open.
             price_snapshot=current_price(product, variant),
             quantity=validated_data["quantity"],
-            notes=validated_data.get("notes", ""),
+            notes=(validated_data.get("notes", "") or "").strip(),
         )
 
 

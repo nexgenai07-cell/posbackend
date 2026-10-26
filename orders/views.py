@@ -228,11 +228,12 @@ def _notify_order_staff(order, event_name, actor_id=None, staff_ids=None, **extr
         publish_staff_event(staff_id, event_name, _order_event_payload(order, actor_id, staff_id, event_id=event_id, **extra))
 
 
-def _item_notice(item):
+def _item_notice(item, quantity=None):
+    """`quantity`: how many were just added, when that differs from the line's total (a merged tap)."""
     name = item.name_en_snapshot
     if item.variant_name_en_snapshot:
         name = f"{name} ({item.variant_name_en_snapshot})"
-    return {"id": item.pk, "name": name, "quantity": item.quantity}
+    return {"id": item.pk, "name": name, "quantity": item.quantity if quantity is None else quantity}
 
 
 def _additional_batch_ready_items(order):
@@ -682,13 +683,18 @@ class OrderItemsView(APIView):
             # after assignment and branch checks have passed.
             if _locked_bill_for_order(order, actor=request.user):
                 return _bill_locked_response()
-            serializer = AddOrderItemSerializer(data=request.data, context={"order": order})
+            # Before the order reaches the kitchen the new line stays pending,
+            # so the same dish tapped again just grows that line. Once the
+            # order is cooking, each addition is fired as its own kitchen line.
+            dispatched = order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED)
+            serializer = AddOrderItemSerializer(data=request.data, context={"order": order, "merge_pending": not dispatched})
             serializer.is_valid(raise_exception=True)
             item = serializer.save()
+            added = serializer.added_quantity
             if order.table_id:
                 order.table.open()
-            details = {"item_id": item.pk, "item_ids": [item.pk], "product_id": item.product_id, "quantity": item.quantity,
-                       "items": [_item_notice(item)],
+            details = {"item_id": item.pk, "item_ids": [item.pk], "product_id": item.product_id, "quantity": added,
+                       "items": [_item_notice(item, added)],
                        "actor_role": request.user.role}
             if request.user.role == StaffRole.WAITER:
                 if order.status == OrderStatus.OPEN:
@@ -1273,15 +1279,19 @@ class PublicOrderCreateView(APIView):
                 order.customer = customer
                 order.save(update_fields=["customer", "updated_at"])
 
-            added_items = []
+            # Customer lines always wait for the cashier (pending), so the same
+            # dish again — in this cart or a later round — grows that line.
+            added_items = {}
             for line in items_data:
-                item_serializer = AddOrderItemSerializer(data=line, context={"order": order})
+                item_serializer = AddOrderItemSerializer(data=line, context={"order": order, "merge_pending": True})
                 item_serializer.is_valid(raise_exception=True)
-                added_items.append(item_serializer.save())
+                item = item_serializer.save()
+                previous = added_items.get(item.pk, (item, 0))[1]
+                added_items[item.pk] = (item, previous + item_serializer.added_quantity)
 
             details = {
-                "item_ids": [item.pk for item in added_items],
-                "items": [_item_notice(item) for item in added_items],
+                "item_ids": list(added_items),
+                "items": [_item_notice(item, quantity) for item, quantity in added_items.values()],
                 "actor_role": "customer",
             }
             dispatched_order = order.status in (OrderStatus.SENT, OrderStatus.PREPARING, OrderStatus.READY, OrderStatus.SERVED)

@@ -1,8 +1,21 @@
+from django.db.models import Value
+from django.db.models.functions import Replace, Upper
 from rest_framework import serializers
 
 from common.validators import reject_branch_mismatch, require_bilingual_pair
 
 from .models import Table
+
+
+def normalize_label(value, uppercase=False):
+    """Trim and collapse inner whitespace runs to one space ("table   1 " -> "table 1")."""
+    value = " ".join((value or "").split())
+    return value.upper() if uppercase else value
+
+
+def label_key(value):
+    """Comparison key for duplicates: case- and space-insensitive, so "Table 1", "TABLE1" and "table  1" all collide."""
+    return "".join((value or "").split()).upper()
 
 
 class TableSerializer(serializers.ModelSerializer):
@@ -27,14 +40,24 @@ class TableSerializer(serializers.ModelSerializer):
         reject_branch_mismatch(self.context.get("request"), branch)
         require_bilingual_pair(attrs, self.instance, "label")
 
-        # Same convention as catalog's name_en uniqueness check: only the
-        # English label is checked, matching the old mock (single-language,
-        # no bilingual labels) and catalog's own name_en-only precedent.
-        label_en = attrs.get("label_en", getattr(self.instance, "label_en", None))
-        if label_en and branch:
-            qs = Table.objects.filter(branch=branch, label_en__iexact=label_en.strip())
+        # English labels are stored upper-case so "table 1" and "TABLE 1" never
+        # render as two different-looking tables; Arabic has no case.
+        if "label_en" in attrs:
+            attrs["label_en"] = normalize_label(attrs["label_en"], uppercase=True)
+        if "label_ar" in attrs:
+            attrs["label_ar"] = normalize_label(attrs["label_ar"])
+
+        # Duplicates are checked per language, ignoring case and all spaces, so
+        # neither "Table 1" vs "table1" nor an Arabic re-entry slips through.
+        if branch:
+            others = Table.objects.filter(branch=branch)
             if self.instance:
-                qs = qs.exclude(pk=self.instance.pk)
-            if qs.exists():
-                raise serializers.ValidationError({"label_en": "error.tableLabelExists"})
+                others = others.exclude(pk=self.instance.pk)
+            for field in ("label_en", "label_ar"):
+                key = label_key(attrs.get(field, getattr(self.instance, field, None)))
+                if not key:
+                    continue
+                stripped = Upper(Replace(field, Value(" "), Value("")))
+                if others.annotate(_key=stripped).filter(_key=key).exists():
+                    raise serializers.ValidationError({field: "error.tableLabelExists"})
         return attrs

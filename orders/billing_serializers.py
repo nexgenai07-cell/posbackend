@@ -77,6 +77,8 @@ class BillSerializer(serializers.ModelSerializer):
     """
 
     table_label = serializers.SerializerMethodField()
+    # Printed slips show both languages, so the Arabic label travels too.
+    table_label_ar = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
     total_halalas = serializers.SerializerMethodField()
     currency = serializers.SerializerMethodField()
@@ -101,7 +103,7 @@ class BillSerializer(serializers.ModelSerializer):
     class Meta:
         model = Bill
         fields = [
-            "id", "bill_code", "branch", "table", "table_label", "customer", "customer_phone", "customer_name", "status",
+            "id", "bill_code", "branch", "table", "table_label", "table_label_ar", "customer", "customer_phone", "customer_name", "status",
             "requested_method", "paid_method", "total", "total_halalas", "currency",
             "total_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
             "amount_paid", "amount_outstanding",
@@ -112,6 +114,9 @@ class BillSerializer(serializers.ModelSerializer):
 
     def get_table_label(self, bill):
         return bill.table.label_en if bill.table_id else None
+
+    def get_table_label_ar(self, bill):
+        return bill.table.label_ar if bill.table_id else None
 
     def get_total(self, bill):
         return str(bill_total(bill))

@@ -411,6 +411,7 @@ def settle_from_moyasar(payload, expected_table=None):
 class BillListView(ListAPIView):
     """
     GET /api/bills/?status=pay_requested
+    GET /api/bills/?table=<id>      one table's bills (the table detail panel)
 
     The cashier's settlement queue. Exists because WebSocket notifications are
     lossy across a page reload — this is what the screen renders on mount.
@@ -423,6 +424,11 @@ class BillListView(ListAPIView):
     def get_queryset(self):
         queryset = _bill_queryset().filter(branch=self.request.user.branch)
         requested = self.request.query_params.getlist("status")
+        table = str(self.request.query_params.get("table", "")).strip()
+        if table:
+            if not table.isdigit():
+                return queryset.none()
+            queryset = queryset.filter(table_id=int(table))
         if requested:
             queryset = queryset.filter(status__in=requested)
         else:

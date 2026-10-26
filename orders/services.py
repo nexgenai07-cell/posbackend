@@ -33,15 +33,17 @@ def get_or_create_open_order(table, staff=None, customer=None, source=OrderSourc
     staff) and the public QR endpoint (customer). The caller must already hold
     a select_for_update() lock on `table` inside a transaction.
 
-    Customer (QR) path: every phone number has its own bill at the table, and
-    one order on it. The same phone keeps adding to that same order — even
+    Customer (QR) path: one party (phone number) per table until staff release
+    it — another number is refused upstream (table_customer_access) — and one
+    order on its bill. The same phone keeps adding to that same order — even
     after paying, before the table is released (the order reopens and only
     the new lines are owed). Orders on any other bill, including a previous
     seating's leftovers, are never picked up.
 
     Staff (POS) path: the table's latest live order, whoever it belongs to,
-    so the floor can add a round to it; otherwise a new staff order on the
-    table's customer-less bill.
+    so the floor can add a round to it; else the seated party's unreleased
+    (e.g. paid) bill, reopened; otherwise a new staff order on the table's
+    customer-less bill.
     """
     from .billing import attach_order_to_bill
     from .models import BillStatus
@@ -85,6 +87,22 @@ def get_or_create_open_order(table, staff=None, customer=None, source=OrderSourc
             from .billing import reopen_for_additional_items
             reopen_for_additional_items(order.bill, actor=staff)
         return order, False
+    # No live order, but a party may still be seated on a paid bill that has
+    # not been released. A staff addition is that party's, so it reopens
+    # their bill/order instead of starting a second bill on the same table.
+    from .models import Bill
+    seated = (
+        Bill.objects.select_for_update()
+        .filter(table=table, customer__isnull=False)
+        .exclude(status=BillStatus.CLOSED)
+        .select_related("customer")
+        .order_by("-id")
+        .first()
+    )
+    if seated is not None:
+        return get_or_create_open_order(
+            table, staff=staff, customer=seated.customer, source=source, reopen_requested=reopen_requested,
+        )
     bill = _open_bill_for(table, None, staff, reopen_requested)
     if bill.status == BillStatus.PAY_REQUESTED:
         raise BillLocked(bill)

@@ -186,6 +186,15 @@ class BillTotalTests(BillingTestBase):
         self.assertEqual(response.data["total"], "51.00")
         self.assertEqual(response.data["id"], self.bill.pk)
 
+    def test_bill_response_carries_both_table_labels(self):
+        # Printed bill slips show English and Arabic together.
+        self.table.label_ar = "طاولة ١"
+        self.table.save(update_fields=["label_ar"])
+        response = self.client.get(f"/api/bills/by-session/{self.table.session_token}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["table_label"], "T1")
+        self.assertEqual(response.data["table_label_ar"], "طاولة ١")
+
     def test_total_spans_multiple_orders(self):
         second = self._order(self.bill, OrderStatus.SERVED)
         self._item(second, quantity=1, price=Decimal("10.05"))
@@ -778,6 +787,14 @@ class BillScopingTests(BillingTestBase):
     def test_queue_filters_by_status(self):
         response = self.as_staff(self.cashier).get("/api/bills/?status=pay_requested")
         self.assertEqual(response.data["results"], [])
+
+    def test_queue_filters_by_table(self):
+        other_table = Table.objects.create(branch=self.branch, label_en="T2", label_ar="T2")
+        Bill.objects.create(branch=self.branch, table=other_table)
+        client = self.as_staff(self.cashier)
+        ids = [row["id"] for row in client.get(f"/api/bills/?table={self.table.pk}").data["results"]]
+        self.assertEqual(ids, [self.bill.pk])
+        self.assertEqual(client.get("/api/bills/?table=abc").data["results"], [])
 
     def test_waiter_cannot_read_the_queue(self):
         self.assertEqual(self.as_staff(self.waiter).get("/api/bills/").status_code, 403)

@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.http import Http404
 from rest_framework import status
@@ -9,8 +11,12 @@ from rest_framework.exceptions import (
     NotFound,
     PermissionDenied,
     Throttled,
+    ValidationError,
 )
-from rest_framework.views import exception_handler as drf_exception_handler
+from rest_framework.response import Response
+from rest_framework.views import exception_handler as drf_exception_handler, set_rollback
+
+logger = logging.getLogger(__name__)
 
 # Framework-level exceptions (auth/permission/404/etc.) don't go through a
 # serializer, so they'd otherwise surface DRF's default English "detail"
@@ -26,6 +32,32 @@ _CODE_MAP = {
     MethodNotAllowed: "error.methodNotAllowed",
     Throttled: "error.tooManyRequests",
 }
+
+
+# DRF's own field messages ("This field is required.", "Ensure this field has
+# no more than 100 characters.") are English text, not codes, so the apps
+# can't translate them and fell back to "Something went wrong". Each carries
+# a machine `code`; map it to one of ours. Our own "error.*" messages pass
+# through untouched.
+_FIELD_CODE_MAP = {
+    "required": "error.fieldRequired",
+    "blank": "error.fieldRequired",
+    "null": "error.fieldRequired",
+    "max_length": "error.fieldTooLong",
+    "min_length": "error.fieldTooShort",
+    "unique": "error.alreadyExists",
+}
+
+
+def _coded(detail):
+    if isinstance(detail, dict):
+        return {key: _coded(value) for key, value in detail.items()}
+    if isinstance(detail, list):
+        return [_coded(value) for value in detail]
+    text = str(detail)
+    if text.startswith("error."):
+        return text
+    return _FIELD_CODE_MAP.get(getattr(detail, "code", ""), "error.fieldInvalid")
 
 
 class ConflictCode(APIException):
@@ -52,7 +84,16 @@ def error_code_exception_handler(exc, context):
 
     response = drf_exception_handler(exc, context)
     if response is None:
-        return None
+        # Not an API error: a bug or an outage behind the view. Log it with the
+        # traceback, roll back, and answer in the API's own shape so the apps
+        # can say "server error" instead of choking on an HTML 500 page.
+        logger.exception("Unhandled error in %s", getattr(context.get("view"), "__class__", type(None)).__name__)
+        set_rollback()
+        return Response({"error": "error.serverError"}, status=500)
+
+    if isinstance(exc, ValidationError):
+        response.data = _coded(exc.detail)
+        return response
 
     if isinstance(exc, ConflictCode):
         response.data = {"error": exc.error_code}
