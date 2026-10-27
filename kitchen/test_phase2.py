@@ -291,7 +291,7 @@ class ClockInTests(Phase2TestCase):
 
     def test_the_setting_is_read_by_anyone_and_changed_by_a_manager(self):
         url = "/api/kitchen-stations/settings/"
-        self.assertEqual(self.bbq_client.get(url).json(), {"kitchen_requires_clock_in": False})
+        self.assertEqual(self.bbq_client.get(url).json(), {"kitchen_requires_clock_in": False, "mine_includes_general": False})
         self.assertEqual(self.bbq_client.patch(url, {"kitchen_requires_clock_in": True}, format="json").status_code, 403)
         response = self.manager_client.patch(url, {"kitchen_requires_clock_in": True}, format="json")
         self.assertEqual(response.status_code, 200, response.content)

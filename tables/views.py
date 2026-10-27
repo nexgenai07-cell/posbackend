@@ -13,7 +13,7 @@ from common.mixins import BranchScopedQuerysetMixin
 
 # Imported here (views), not in tables/models.py, to keep the model layer's
 # dependency one-directional (orders depends on tables, not the reverse).
-from orders.billing import close_bills_for_released_table
+from orders.billing import close_bills_for_released_table, discard_empty_orders
 from orders.models import Order, OrderStatus
 from orders.serializers import PublicOrderSerializer
 
@@ -81,12 +81,14 @@ class TableViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelV
 
     def destroy(self, request, *args, **kwargs):
         table = self.get_object()
-        has_open_order = Order.objects.filter(table=table).exclude(
-            status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED]
-        ).exists()
-        if table.status != TableStatus.EMPTY or has_open_order:
-            return Response({"error": "error.tableNotEmpty"}, status=status.HTTP_409_CONFLICT)
-        table.delete()
+        with transaction.atomic():
+            table = Table.objects.select_for_update().get(pk=table.pk)
+            # An order with nothing on it (POS screen opened, every line
+            # removed) is not a reason to keep the table — see discard_empty_orders.
+            if table.status != TableStatus.EMPTY or discard_empty_orders(table, request.user):
+                transaction.set_rollback(True)
+                return Response({"error": "error.tableNotEmpty"}, status=status.HTTP_409_CONFLICT)
+            table.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"], url_path="open")
@@ -101,12 +103,11 @@ class TableViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.ModelV
             table = get_object_or_404(
                 Table.objects.select_for_update().filter(branch=request.user.branch), pk=pk
             )
-            open_orders = list(
-                Order.objects.filter(table=table)
-                .exclude(status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED])
-                .order_by("opened_at")
-            )
+            # Empty orders (nothing to cook, nothing paid) are discarded rather
+            # than blocking Release; only orders that still owe something do.
+            open_orders = discard_empty_orders(table, request.user)
             if open_orders:
+                transaction.set_rollback(True)
                 # Name the blockers: a leftover from an earlier day is hidden
                 # by the Orders page's default "today" filter, so staff
                 # couldn't otherwise find what to cancel.

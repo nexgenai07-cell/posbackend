@@ -460,6 +460,60 @@ def close_bills_for_released_table(table, actor):
         logger.info("Bill %s closed by table release (staff %s)", bill.pk, getattr(actor, "pk", None))
 
 
+def _is_empty_order(order):
+    """Nothing to cook and nothing paid: every line was removed (or none was
+    ever added — opening the POS order screen creates the order up front)."""
+    return (
+        not order.items.exclude(status=OrderItemStatus.VOIDED).exists()
+        and not order.payments.exists()
+    )
+
+
+def live_table_orders(table):
+    """The table's orders that are not paid/closed/cancelled, oldest first."""
+    return list(
+        Order.objects.select_for_update().filter(table=table)
+        .exclude(status__in=[OrderStatus.PAID, OrderStatus.CLOSED, OrderStatus.CANCELLED])
+        .order_by("opened_at")
+    )
+
+
+def discard_empty_orders(table, actor):
+    """
+    Cancel the table's live orders that hold nothing (see _is_empty_order)
+    and return the live orders that remain. An empty order owes nothing, so
+    it must not keep the table occupied or block Release / delete. The caller
+    must hold the table lock.
+    """
+    remaining = []
+    for order in live_table_orders(table):
+        if not _is_empty_order(order):
+            remaining.append(order)
+            continue
+        # No cancelled_at: nothing was ordered, so this is not a cancellation
+        # for the cancelled-orders report (it filters on cancelled_at).
+        transition_order(order, OrderStatus.CANCELLED, actor, "empty_order_discarded",
+                         extra_fields={"cancelled_by": actor, "cancelled_from_status": order.status})
+    return remaining
+
+
+def free_table_if_nothing_on_it(table):
+    """
+    The last line came off the table's order: nothing is left to cook or pay,
+    so the table is no longer occupied. The empty order and its bill stay, so
+    the POS screen still showing it can keep adding to it (which re-occupies
+    the table); Release later discards them. The caller must hold the table lock.
+    """
+    from tables.models import TableStatus
+
+    if table.status == TableStatus.EMPTY:
+        return
+    if all(_is_empty_order(order) for order in live_table_orders(table)) and not (
+        Order.objects.filter(table=table, status=OrderStatus.PAID).exclude(bill__status=BillStatus.CLOSED).exists()
+    ):
+        table.close()
+
+
 # -- the one way a bill becomes paid ----------------------------------------
 
 SETTLED = "settled"

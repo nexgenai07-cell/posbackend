@@ -1158,6 +1158,63 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
 
 
 
+class EmptyPosOrderTableTests(TablesApiTestCase):
+    """The POS order screen creates the table's order on open; a line added
+    then removed must not leave the table occupied or block Release/delete."""
+
+    def setUp(self):
+        super().setUp()
+        self.table = Table.objects.create(branch=self.riyadh, label_en="Table 20", label_ar="طاولة ٢٠")
+        self.auth_as(self.owner, "1111")
+
+    def add_then_remove(self):
+        order_id = self.client.post("/api/orders/", {"table": self.table.id}, format="json").json()["id"]
+        item = self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1}, format="json")
+        self.assertEqual(item.status_code, status.HTTP_201_CREATED, item.content)
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, "occupied")
+        removed = self.client.patch(f"/api/orders/{order_id}/items/{item.json()['id']}/", {"quantity": 0}, format="json")
+        self.assertEqual(removed.status_code, status.HTTP_204_NO_CONTENT)
+        return order_id
+
+    def test_removing_the_last_line_frees_the_table_and_adding_again_reoccupies_it(self):
+        order_id = self.add_then_remove()
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, "empty")
+        # The screen still holds the same order and can keep using it.
+        again = self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1}, format="json")
+        self.assertEqual(again.status_code, status.HTTP_201_CREATED, again.content)
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, "occupied")
+
+    def test_release_discards_an_empty_order_instead_of_refusing(self):
+        from orders.models import Order
+
+        order_id = self.add_then_remove()
+        self.table.open()  # e.g. marked occupied by hand before the fix
+        response = self.client.post(f"/api/tables/{self.table.id}/close/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(response.json()["status"], "empty")
+        order = Order.objects.get(pk=order_id)
+        self.assertEqual(order.status, "cancelled")
+        # Nothing was ordered, so it is not a cancellation for the report.
+        self.assertIsNone(order.cancelled_at)
+
+    def test_release_still_refuses_an_order_with_items(self):
+        order_id = self.client.post("/api/orders/", {"table": self.table.id}, format="json").json()["id"]
+        self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1}, format="json")
+        response = self.client.post(f"/api/tables/{self.table.id}/close/")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, "occupied")
+
+    def test_a_table_with_only_an_empty_order_can_be_deleted(self):
+        self.client.post("/api/orders/", {"table": self.table.id}, format="json")
+        response = self.client.delete(f"/api/tables/{self.table.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.content)
+        self.assertFalse(Table.objects.filter(pk=self.table.id).exists())
+
+
 class KitchenTicketDetailTests(TablesApiTestCase):
     """What a KDS ticket carries: where it came from, the portion ordered,
     the recipe scaled for that portion, and a date-filtered kitchen log."""

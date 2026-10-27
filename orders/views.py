@@ -50,6 +50,7 @@ from .serializers import (
     RecordPaymentSerializer,
     additional_batch_item_ids,
 )
+from .billing import free_table_if_nothing_on_it
 from .services import BillLocked, get_or_create_open_order
 from .codes import resolve_order_code
 from .workflow import (
@@ -774,6 +775,11 @@ class OrderItemDetailView(APIView):
 
     def patch(self, request, pk, item_id):
         with transaction.atomic():
+            # Table before order, as OrderItemsView.post locks them: removing
+            # the last line may free the table (free_table_if_nothing_on_it).
+            table_id = Order.objects.filter(pk=pk, branch=request.user.branch).values_list("table_id", flat=True).first()
+            if table_id:
+                Table.objects.select_for_update().get(pk=table_id, branch=request.user.branch)
             order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
             return self._patch_locked(request, order, item_id)
 
@@ -817,6 +823,8 @@ class OrderItemDetailView(APIView):
                     queue_order_for_cashier(order, request.user, "order_revised")
                 if emptied:
                     _notify_role_staff(order, "order:empty", {StaffRole.CASHIER, StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                    if order.table_id:
+                        free_table_if_nothing_on_it(order.table)
                 return Response(status=status.HTTP_204_NO_CONTENT)
             available, _reason = check_product_stock(item.product, quantity)
             if not is_available_today(item.product):
