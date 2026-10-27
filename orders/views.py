@@ -122,7 +122,10 @@ def _order_queryset():
     )
     return Order.objects.select_related(
         "table", "customer", "staff", "assigned_cashier", "assigned_waiter", "waiter_confirmed_by"
-    ).prefetch_related(Prefetch("items", queryset=items), "payments", "history")
+    ).prefetch_related(
+        Prefetch("items", queryset=items), "payments",
+        Prefetch("history", queryset=OrderHistory.objects.select_related("actor")),
+    )
 
 
 def _filter_opened_between(qs, request):
@@ -796,7 +799,7 @@ class OrderItemDetailView(APIView):
             except (TypeError, ValueError):
                 return Response({"error": "error.quantityInvalid"}, status=status.HTTP_400_BAD_REQUEST)
             if quantity <= 0:
-                details = {"item_id": item.pk, "product_id": item.product_id, **before}
+                details = {"item_id": item.pk, "product_id": item.product_id, "items": [_item_notice(item)], **before}
                 item.delete()
                 emptied = not order.items.exclude(status=OrderItemStatus.VOIDED).exists()
                 if request.user.role == StaffRole.WAITER:
@@ -830,6 +833,7 @@ class OrderItemDetailView(APIView):
         details = {
             "item_id": item.pk,
             "product_id": item.product_id,
+            "items": [_item_notice(item)],
             "before": before,
             "after": {"quantity": item.quantity, "notes": item.notes},
         }
@@ -1207,7 +1211,7 @@ class OrderItemStatusView(APIView):
             order,
             request.user,
             "kitchen_item_status_changed",
-            details={"item_id": item.pk, "from": previous_item_status, "to": new_status,
+            details={"item_id": item.pk, "items": [_item_notice(item)], "from": previous_item_status, "to": new_status,
                      **({"reclassified_sale_movements_as_waste": reclassified_waste} if new_status == OrderItemStatus.VOIDED else {})},
         )
         getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
@@ -1261,6 +1265,7 @@ class OrderItemStationView(APIView):
             # Once in the kitchen, which chef cooks it is the kitchen lead's call.
             if item.status == OrderItemStatus.FIRED and not can_run_kitchen(request.user):
                 return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
+            previous_name = item.station.name if item.station_id else None
             previous = move_line(item, station, request.user)
             notice = _item_notice(item)
             record_order_event(order, request.user, "item_station_moved", details={
@@ -1268,6 +1273,9 @@ class OrderItemStationView(APIView):
                 "items": [notice],
                 "from": previous,
                 "to": item.station_id,
+                # None is General.
+                "from_name": previous_name,
+                "to_name": station.name if station else None,
                 "actor_role": request.user.role,
             })
             if item.status == OrderItemStatus.FIRED and previous != item.station_id:

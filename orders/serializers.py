@@ -29,10 +29,13 @@ def additional_batch_item_ids(order):
 
 class OrderHistorySerializer(serializers.ModelSerializer):
     order_number = serializers.CharField(source="order.order_number", read_only=True)
+    # Who did it, by name, so the log reads without a staff lookup (and still
+    # reads for someone who has since left). Null actor: the customer or the system.
+    actor_name = serializers.CharField(source="actor.name", read_only=True, default=None)
 
     class Meta:
         model = OrderHistory
-        fields = ["id", "order", "order_number", "actor", "event", "from_status", "to_status", "details", "created_at"]
+        fields = ["id", "order", "order_number", "actor", "actor_name", "event", "from_status", "to_status", "details", "created_at"]
         read_only_fields = fields
 
 

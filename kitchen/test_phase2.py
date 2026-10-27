@@ -266,6 +266,29 @@ class ExpoTests(Phase2TestCase):
         bbq_order, fryer_order = self.fire(self.kebab), self.fire(self.fries)
         self.assertLessEqual({bbq_order, fryer_order}, self.ticket_order_ids(self.head_client))
 
+    def test_a_head_chef_can_also_cook_at_a_station(self):
+        # The head chef is BBQ's only chef.
+        self.head_chef.stations.set([self.bbq])
+        self.bbq_chef.stations.clear()
+        self.second_bbq_chef.stations.clear()
+        bbq_order, fryer_order, general_order = self.fire(self.kebab), self.fire(self.fries), self.fire(self.burger)
+
+        # "My stations": BBQ and General only, like any chef.
+        mine = self.ticket_order_ids(self.head_client, stations="mine")
+        self.assertIn(bbq_order, mine)
+        self.assertIn(general_order, mine)
+        self.assertNotIn(fryer_order, mine)
+        # BBQ counts as staffed, so its lines stay off the Fryer chef's screen.
+        self.assertNotIn(bbq_order, self.ticket_order_ids(self.fryer_client))
+        # The default is still every station.
+        self.assertIn(fryer_order, self.ticket_order_ids(self.head_client))
+
+        # Cooks their own line, and still runs the pass.
+        self.cook(self.head_client, bbq_order, self.kebab)
+        self.assertEqual(self.line(bbq_order, self.kebab).started_by_id, self.head_chef.pk)
+        self.assertTrue(self.expo(self.head_client)[bbq_order]["all_ready"])
+        self.assertEqual(self.head_client.post(f"/api/orders/{bbq_order}/handover/").status_code, 200)
+
     def test_the_pass_is_for_the_head_chef_and_managers_only(self):
         self.assertEqual(self.bbq_client.get("/api/kds/tickets/", {"scope": "expo"}).status_code, 403)
         self.expo(self.head_client)
