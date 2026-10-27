@@ -4,13 +4,14 @@ from datetime import datetime, time, timedelta
 import hashlib
 import json
 import uuid
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db import transaction
-from django.db.models import Count, OuterRef, Q, Subquery, Sum
+from django.db.models import Count, OuterRef, Prefetch, Q, Subquery, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.utils.dateparse import parse_date
+from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import status
 from rest_framework.generics import GenericAPIView, ListAPIView, RetrieveAPIView
 from rest_framework.mixins import ListModelMixin
@@ -20,7 +21,9 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 
 from accounts.models import Staff, StaffRole
-from accounts.permissions import IsCashierStaff, IsKitchenStaff, IsOrderStaff, IsPOSStaff, IsWaiterStaff
+from accounts.permissions import (
+    IsCashierStaff, IsKitchenLead, IsKitchenStaff, IsOrderStaff, IsPOSStaff, IsStationRouter, IsWaiterStaff,
+)
 from catalog.services import is_available_today
 from common.geofence import validate_branch_location
 from common.throttles import FailedLookupLimiter
@@ -28,7 +31,8 @@ from customers.models import Customer
 from customers.services import find_or_create_customer
 from inventory.services import ProductStockUnavailable, check_product_stock, deduct_stock_for_order_items
 from inventory.models import StockMovement, StockMovementReason
-from kitchen.routing import fire_items, kitchen_recipient_ids, station_scope
+from kitchen.models import KitchenStation
+from kitchen.routing import can_run_kitchen, fire_items, kitchen_recipient_ids, move_line, station_scope
 from tables.models import Table
 from tables.services import parse_qr_payload
 
@@ -111,9 +115,14 @@ def _locked_bill_for_order(order, actor=None):
 
 
 def _order_queryset():
+    # The lines carry what OrderItemSerializer.route_station reads, so the
+    # cashier's "goes to BBQ" costs no query per line.
+    items = OrderItem.objects.select_related(
+        "station", "started_by", "product__station", "product__category__station",
+    )
     return Order.objects.select_related(
         "table", "customer", "staff", "assigned_cashier", "assigned_waiter", "waiter_confirmed_by"
-    ).prefetch_related("items", "payments", "history")
+    ).prefetch_related(Prefetch("items", queryset=items), "payments", "history")
 
 
 def _filter_opened_between(qs, request):
@@ -986,19 +995,31 @@ class KitchenTicketsView(ListAPIView):
     ?table=<id>, ?type=dine_in|takeaway|qr|web and ?search=<order number>.
 
     ?stations= picks whose lines count (kitchen/routing.station_scope): a
-    kitchen chef defaults to `mine`, owners and managers to `all`. Each line
-    says its station and `is_mine`, so the other stations' lines of the same
-    order can be shown greyed."""
+    kitchen chef defaults to `mine`, head chefs, owners and managers to
+    `all`. Each line says its station and `is_mine`, so the other stations'
+    lines of the same order can be shown greyed.
+
+    ?scope=expo is the head chef's pass: every station's lines still in the
+    kitchen (ready ones included) and `all_ready` once the order can be
+    handed to its waiter (OrderHandoverView). Head chefs, owners and
+    managers only; ?stations= does not apply."""
 
     serializer_class = KitchenTicketOrderSerializer
     permission_classes = [IsKitchenStaff]
 
+    def get_permissions(self):
+        if self._scope() == "expo":
+            return [IsKitchenLead()]
+        return super().get_permissions()
+
     def _scope(self):
-        return "history" if self.request.query_params.get("scope") == "history" else "live"
+        scope = self.request.query_params.get("scope")
+        return scope if scope in ("history", "expo") else "live"
 
     def _stations(self):
         if not hasattr(self, "_station_scope"):
-            self._station_scope = station_scope(self.request.user, self.request.query_params.get("stations"))
+            raw = "all" if self._scope() == "expo" else self.request.query_params.get("stations")
+            self._station_scope = station_scope(self.request.user, raw)
         return self._station_scope
 
     def get_serializer_context(self):
@@ -1007,7 +1028,7 @@ class KitchenTicketsView(ListAPIView):
     def get_queryset(self):
         qs = Order.objects.select_related("table", "assigned_waiter").prefetch_related(
             "history", "items__variant", "items__product__recipe_items__inventory_item",
-            "items__station", "items__started_by",
+            "items__station", "items__started_by", "items__station_moved_by",
         ).filter(branch=self.request.user.branch)
         # ?stations=mine|all|<ids>[,general] — only orders with a line at one
         # of these stations. The station condition sits in the same filter()
@@ -1037,6 +1058,52 @@ class KitchenTicketsView(ListAPIView):
             order_id = resolve_order_code(search)
             qs = qs.filter(pk=order_id) if order_id else qs.none()
         return _filter_opened_between(qs, self.request)
+
+
+class KitchenPrintView(APIView):
+    """
+    POST {"stations": "3,5,general", "since": <ISO time>} — a station's
+    printer screen takes the lines it should print: fired or being made,
+    at those stations (kitchen/routing.station_scope, so `all` works for a
+    one-printer kitchen), fired at or after `since` (when the screen turned
+    auto-print on, so switching it on never prints the whole backlog), and
+    not printed yet. They are marked printed in the same transaction, so of
+    two screens at one station only one gets each line.
+
+    Returns the tickets to print — each order with only the claimed lines.
+    """
+
+    permission_classes = [IsKitchenStaff]
+
+    def post(self, request):
+        raw = (request.data.get("stations") or "").strip()
+        if not raw or raw.lower() == "mine":
+            return Response({"error": "error.stationRequired"}, status=status.HTTP_400_BAD_REQUEST)
+        since = parse_datetime(str(request.data.get("since") or ""))
+        if since is None:
+            return Response({"error": "error.dateInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+        if timezone.is_naive(since):
+            since = timezone.make_aware(since)
+        scope = station_scope(request.user, raw)
+        with transaction.atomic():
+            lines = OrderItem.objects.select_for_update().filter(
+                order__branch=request.user.branch,
+                status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING),
+                fired_at__gte=since, printed_at__isnull=True,
+            )
+            item_q = scope.item_q(prefix="")
+            if item_q is not None:
+                lines = lines.filter(item_q)
+            claimed = {item.pk: item.order_id for item in lines}
+            if claimed:
+                OrderItem.objects.filter(pk__in=claimed).update(printed_at=timezone.now())
+        orders = Order.objects.filter(pk__in=set(claimed.values())).select_related(
+            "table", "assigned_waiter",
+        ).prefetch_related(
+            "items__variant", "items__product__recipe_items__inventory_item", "items__station", "items__started_by",
+        ).order_by("opened_at", "pk")
+        context = {"request": request, "stations": scope, "only_item_ids": set(claimed)}
+        return Response({"results": KitchenTicketOrderSerializer(orders, many=True, context=context).data})
 
 
 _KDS_ITEM_TRANSITIONS = {
@@ -1074,7 +1141,8 @@ class OrderItemStatusView(APIView):
         if request.user.role == StaffRole.WAITER:
             if new_status != OrderItemStatus.SERVED or order.assigned_waiter_id != request.user.pk:
                 return Response({"error": "error.orderNotAssignedToWaiter"}, status=status.HTTP_403_FORBIDDEN)
-        elif request.user.role == StaffRole.KITCHEN and new_status == OrderItemStatus.SERVED:
+        elif (request.user.role == StaffRole.KITCHEN and new_status == OrderItemStatus.SERVED
+              and not can_run_kitchen(request.user)):
             return Response({"error": "error.statusInvalid"}, status=status.HTTP_403_FORBIDDEN)
         if order.status in TERMINAL_ORDER_STATUSES:
             return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
@@ -1084,6 +1152,14 @@ class OrderItemStatusView(APIView):
         # the same order are still cooking; the parent is recomputed below.
         if new_status == OrderItemStatus.SERVED and item.status != OrderItemStatus.READY:
             return Response({"error": "error.itemNotReady"}, status=status.HTTP_409_CONFLICT)
+        # Two chefs of one station pressing Start on the same line: the second
+        # is told who already has it, so nobody makes it twice.
+        if new_status == OrderItemStatus.PREPARING and item.status != OrderItemStatus.FIRED and item.started_by_id:
+            return Response({
+                "error": "error.itemAlreadyStarted",
+                "started_by": item.started_by_id,
+                "started_by_name": item.started_by.name,
+            }, status=status.HTTP_409_CONFLICT)
         if item.status not in _KDS_ITEM_TRANSITIONS or new_status not in _KDS_ITEM_TRANSITIONS[item.status]:
             return Response({"error": "error.itemAlreadyFinal"}, status=status.HTTP_409_CONFLICT)
 
@@ -1109,7 +1185,8 @@ class OrderItemStatusView(APIView):
         update_fields = ["status", "updated_at"]
         if new_status == OrderItemStatus.PREPARING and item.started_by_id is None:
             item.started_by = request.user
-            update_fields.append("started_by")
+            item.started_at = timezone.now()
+            update_fields += ["started_by", "started_at"]
         if new_status == OrderItemStatus.READY and item.ready_at is None:
             item.ready_at = timezone.now()
             update_fields.append("ready_at")
@@ -1134,6 +1211,94 @@ class OrderItemStatusView(APIView):
                                 items=[_item_notice(ready) for ready in ready_items])
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         return Response(OrderItemSerializer(item).data)
+
+
+_MOVABLE_ITEM_STATUSES = (OrderItemStatus.PENDING, OrderItemStatus.FIRED)
+
+
+class OrderItemStationView(APIView):
+    """
+    POST {"station": <id> | null} — send one line to another kitchen station
+    (null = General), e.g. the BBQ chef is off today. The cashier does it
+    while reviewing; a head chef, owner or manager also once it is in the
+    kitchen. Only until a chef has started it: a line being cooked stays
+    where it is. A pending line keeps the chosen station when it is fired.
+    """
+
+    permission_classes = [IsStationRouter]
+
+    def post(self, request, pk, item_id):
+        if "station" not in request.data:
+            return Response({"error": "error.stationRequired"}, status=status.HTTP_400_BAD_REQUEST)
+        station = None
+        station_id = request.data.get("station")
+        if station_id not in (None, ""):
+            if str(station_id).isdigit():
+                station = KitchenStation.objects.filter(
+                    pk=station_id, branch=request.user.branch, is_active=True,
+                ).first()
+            if station is None:
+                return Response({"error": "error.stationNotFound"}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
+            item = get_object_or_404(OrderItem.objects.select_for_update(), pk=item_id, order=order)
+            if order.status in TERMINAL_ORDER_STATUSES:
+                return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
+            if item.status not in _MOVABLE_ITEM_STATUSES:
+                return Response({"error": "error.itemAlreadyStarted"}, status=status.HTTP_409_CONFLICT)
+            # Once in the kitchen, which chef cooks it is the kitchen lead's call.
+            if item.status == OrderItemStatus.FIRED and not can_run_kitchen(request.user):
+                return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
+            previous = move_line(item, station, request.user)
+            notice = _item_notice(item)
+            record_order_event(order, request.user, "item_station_moved", details={
+                "item_id": item.pk,
+                "items": [notice],
+                "from": previous,
+                "to": item.station_id,
+                "actor_role": request.user.role,
+            })
+            if item.status == OrderItemStatus.FIRED and previous != item.station_id:
+                # The old station drops it, the new one gets it as new work.
+                _notify_kitchen(order, "order:changed", request.user.pk, [SimpleNamespace(station_id=previous)],
+                                change_id=item.pk)
+                _notify_kitchen(order, "order:kitchen_new", request.user.pk, [item], items=[notice])
+        return Response(OrderItemSerializer(item).data)
+
+
+class OrderHandoverView(APIView):
+    """
+    The pass: once every line the kitchen has for an order is ready, the
+    head chef hands it to the waiter — the ready lines become served and the
+    order's status follows. Refused while any station is still cooking.
+    """
+
+    permission_classes = [IsKitchenLead]
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
+            if order.status in TERMINAL_ORDER_STATUSES:
+                return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
+            lines = list(order.items.select_for_update().filter(status__in=_KITCHEN_LINE_STATUSES))
+            ready = [item for item in lines if item.status == OrderItemStatus.READY]
+            if not ready or len(ready) != len(lines):
+                return Response({"error": "error.orderNotReady"}, status=status.HTTP_409_CONFLICT)
+            for item in ready:
+                item.status = OrderItemStatus.SERVED
+                item.save(update_fields=["status", "updated_at"])
+            notices = [_item_notice(item) for item in ready]
+            record_order_event(order, request.user, "kitchen_handover", details={
+                "item_ids": [item.pk for item in ready],
+                "items": notices,
+                "actor_role": request.user.role,
+            })
+            getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
+            _sync_order_kitchen_status(order, request.user)
+            _notify_kitchen(order, "order:changed", request.user.pk, ready)
+            _notify_order_staff(order, "order:handed_over", request.user.pk, items=notices)
+            _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+        return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
 
 
 class OrderCustomerView(APIView):

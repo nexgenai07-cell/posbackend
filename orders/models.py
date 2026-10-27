@@ -249,10 +249,22 @@ class OrderItem(BaseModel):
     station = models.ForeignKey(
         "kitchen.KitchenStation", on_delete=models.SET_NULL, null=True, blank=True, related_name="order_items",
     )
-    # The chef who started making this line (fired -> preparing).
+    # The chef who started making this line (fired -> preparing), and when —
+    # the other chefs of the station see "<name> is making this".
     started_by = models.ForeignKey(
         Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="started_order_items",
     )
+    started_at = models.DateTimeField(null=True, blank=True)
+    # Set when a cashier or head chef sent this line to a station by hand
+    # (kitchen/routing.move_line) instead of its dish's own. Firing keeps a
+    # moved line's station; moving it to General is station=None with this set.
+    station_moved_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="moved_order_items",
+    )
+    # When a station's printer screen printed this line's kitchen slip
+    # (KitchenPrintView). Claimed once, so two screens at one station never
+    # print it twice; cleared when the line moves to another station.
+    printed_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.quantity}x {self.name_en_snapshot}"

@@ -23,6 +23,11 @@ class Branch(BaseModel):
     max_clock_ins_per_day = models.PositiveSmallIntegerField(default=1)
     max_clock_outs_per_day = models.PositiveSmallIntegerField(default=1)
     late_threshold_minutes = models.PositiveSmallIntegerField(default=15)
+    # Kitchen stations: when on, a station counts as staffed only while one
+    # of its chefs is clocked in — otherwise its lines show on every kitchen
+    # screen (kitchen/routing.py). Off, every active chef counts, clocked in
+    # or not, for restaurants that don't use attendance.
+    kitchen_requires_clock_in = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name_en

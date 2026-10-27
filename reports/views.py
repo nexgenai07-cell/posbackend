@@ -1200,3 +1200,158 @@ class BusinessSummaryView(BaseReportView):
             "low_stock": low_stock,
             "attention": attention_items(dishes, [row["name"] for row in low_stock], waste, cancelled),
         })
+
+
+def _avg_minutes(seconds):
+    """Mean of a list of durations in seconds, in minutes to one decimal — None when nothing was timed."""
+    return round(sum(seconds) / len(seconds) / 60, 1) if seconds else None
+
+
+class _Timings:
+    """Durations of a group of kitchen lines. Each average says how many
+    lines it is over (`*_lines`): a line started before Start was recorded
+    has a total time but no separate wait and cook times."""
+
+    def __init__(self):
+        self.lines = 0
+        self.portions = 0
+        self.voided = 0
+        self.wait, self.cook, self.total = [], [], []
+
+    def add(self, item):
+        self.lines += 1
+        self.portions += item.quantity
+        if item.status == OrderItemStatus.VOIDED:
+            self.voided += 1
+            return
+        if item.started_at and item.started_at >= item.fired_at:
+            self.wait.append((item.started_at - item.fired_at).total_seconds())
+        if item.ready_at and item.started_at and item.ready_at >= item.started_at:
+            self.cook.append((item.ready_at - item.started_at).total_seconds())
+        if item.ready_at and item.ready_at >= item.fired_at:
+            self.total.append((item.ready_at - item.fired_at).total_seconds())
+
+    def data(self):
+        return {
+            "lines": self.lines,
+            "portions": self.portions,
+            "voided": self.voided,
+            "avg_wait_min": _avg_minutes(self.wait), "wait_lines": len(self.wait),
+            "avg_cook_min": _avg_minutes(self.cook), "cook_lines": len(self.cook),
+            "avg_total_min": _avg_minutes(self.total), "total_lines": len(self.total),
+        }
+
+
+class KitchenStationsReportView(BaseReportView):
+    """
+    How long each kitchen station takes, from the times every line carries:
+    fired_at (reached the kitchen) -> started_at (a chef pressed Start) ->
+    ready_at. `wait` is fired -> started, `cook` started -> ready, `total`
+    fired -> ready; voided lines are counted but never timed.
+
+    Lines belong to the branch-local day and hour they were FIRED. Station is
+    the line's own snapshot (OrderItem.station), so moving a dish later does
+    not rewrite history; null is General. Optional ?station=<id>|general.
+
+    Returns per station (with its 3 slowest dishes), per day x station, per
+    hour x station, and per chef (who pressed Start).
+    """
+
+    SLOWEST = 3
+
+    def get(self, request):
+        from kitchen.models import KitchenStation
+
+        branch = request.user.branch
+        from_date, to_date = self.get_range(request)
+        start, end = self.bounds(request, from_date, to_date)
+        tz = branch_zone(branch)
+        items = OrderItem.objects.filter(
+            order__branch=branch, fired_at__gte=start, fired_at__lt=end,
+        ).select_related("started_by")
+        station_param = (request.query_params.get("station") or "").strip().lower()
+        if station_param == "general":
+            items = items.filter(station__isnull=True)
+        elif station_param.isdigit():
+            items = items.filter(station_id=int(station_param))
+
+        stations = {
+            station.pk: station
+            for station in KitchenStation.all_objects.filter(branch=branch)
+        }
+        by_station = defaultdict(_Timings)
+        by_dish = defaultdict(lambda: defaultdict(_Timings))
+        dish_names = {}
+        by_day = defaultdict(_Timings)
+        by_hour = defaultdict(_Timings)
+        by_chef = defaultdict(_Timings)
+        chef_names = {}
+        everything = _Timings()
+        for item in items:
+            local = item.fired_at.astimezone(tz)
+            everything.add(item)
+            by_station[item.station_id].add(item)
+            dish = (item.product_id, item.variant_name_en_snapshot)
+            dish_names[dish] = item
+            by_dish[item.station_id][dish].add(item)
+            by_day[(local.date().isoformat(), item.station_id)].add(item)
+            by_hour[(local.hour, item.station_id)].add(item)
+            if item.started_by_id:
+                chef_names[item.started_by_id] = item.started_by.name
+                by_chef[item.started_by_id].add(item)
+
+        def station_fields(station_id):
+            station = stations.get(station_id)
+            return {
+                "station_id": station_id,
+                "name_en": station.name_en if station else None,
+                "name_ar": station.name_ar if station else None,
+            }
+
+        def station_key(station_id):
+            # Stations in their screen order, General last.
+            station = stations.get(station_id)
+            return (station is None, station.sort_order if station else 0, station_id or 0)
+
+        station_rows = []
+        for station_id in sorted(by_station, key=station_key):
+            dishes = [
+                {
+                    "product_id": key[0],
+                    "name_en": dish_names[key].name_en_snapshot,
+                    "name_ar": dish_names[key].name_ar_snapshot,
+                    "variant_name_en": dish_names[key].variant_name_en_snapshot,
+                    "variant_name_ar": dish_names[key].variant_name_ar_snapshot,
+                    **timings.data(),
+                }
+                for key, timings in by_dish[station_id].items()
+                if timings.total
+            ]
+            dishes.sort(key=lambda row: row["avg_total_min"], reverse=True)
+            station_rows.append({
+                **station_fields(station_id), **by_station[station_id].data(),
+                "slowest_dishes": dishes[:self.SLOWEST],
+            })
+
+        return Response({
+            "from": from_date,
+            "to": to_date,
+            "totals": everything.data(),
+            "stations": station_rows,
+            # Newest day first; within a day, stations in screen order.
+            "days": [
+                {"day": day, **station_fields(station_id), **by_day[(day, station_id)].data()}
+                for day, station_id in sorted(
+                    sorted(by_day, key=lambda key: station_key(key[1])), key=lambda key: key[0], reverse=True,
+                )
+            ],
+            "hours": [
+                {"hour": hour, **station_fields(station_id), **by_hour[(hour, station_id)].data()}
+                for hour, station_id in sorted(by_hour, key=lambda key: (key[0], station_key(key[1])))
+            ],
+            "chefs": sorted(
+                ({"staff_id": staff_id, "name": chef_names[staff_id], **timings.data()}
+                 for staff_id, timings in by_chef.items()),
+                key=lambda row: (-row["lines"], row["name"]),
+            ),
+        })

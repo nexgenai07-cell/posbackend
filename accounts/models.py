@@ -35,6 +35,10 @@ class Staff(BaseModel):
     # The kitchen stations a kitchen chef works at; their screen shows these
     # stations' lines plus General. Ignored for every other role.
     stations = models.ManyToManyField("kitchen.KitchenStation", blank=True, related_name="chefs")
+    # Head chef / expo: a kitchen chef who sees every station by default,
+    # moves lines between stations and hands finished orders to the waiter.
+    # Owners and managers can always do all of this. Ignored for other roles.
+    is_head_chef = models.BooleanField(default=False)
 
     # Not a Django auth user, but DRF's permission plumbing (and anything
     # checking request.user) expects these two attributes to exist.

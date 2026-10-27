@@ -1,6 +1,7 @@
 # Kitchen Stations — Plan
 
-> Status: **Phase 1 code ho gaya** — backend (`kitchen` app, routing, KDS `?stations=`, notifications, bulk-station, import, tests) aur admin (station picker, category/product/staff forms, `/admin/kitchen-stations`, menu column + bulk set, KDS chips + greyed lines, setup checklist, en/ar). Migrations abhi chalni hain. Phase 2/3 baaqi.
+> Status: **Phase 1 code ho gaya** — backend (`kitchen` app, routing, KDS `?stations=`, notifications, bulk-station, import, tests) aur admin (station picker, category/product/staff forms, `/admin/kitchen-stations`, menu column + bulk set, KDS chips + greyed lines, setup checklist, en/ar).
+> **Phase 2 code ho gaya** — §5 dekhein. **Phase 3 code ho gaya** — §6 dekhein. Migrations (`accounts 0007`, `branches 0007`, `orders 0015`, `orders 0016`) abhi chalni hain.
 > Repos: `restaurant-backend`, `restaurant-admin`. `burger_web` (customer site) mein koi change nahi — customer ko ek hi order dikhta rahega.
 
 ---
@@ -163,10 +164,49 @@ Sab bilingual (en/ar locales), aur errors proper codes ke saath (`error.stationN
 - **Koi chef login nahi** fallback: station ka koi chef us waqt online/on-shift nahi (attendance clock-in pehle se hai — `accounts` shifts) → lines General mein bhi.
 - **Expo / head chef view:** saari stations ek saath, order "sab ready" hone par waiter ko handover.
 
+### 5.1 Kya bana (code)
+
+| Hissa | Backend | Admin |
+|---|---|---|
+| Start / claim | `OrderItem.started_at` naya; Start par `started_by` + `started_at`. Dusra chef Start dabaye → 409 `error.itemAlreadyStarted` + `started_by_name`. Ready koi bhi chef us station ka kar sakta hai (break cover). | KDS line par "Ahmed is making this" / "You're making this"; error toast mein naam. |
+| Cashier override | `POST /api/orders/<id>/items/<item>/station/` `{station: id\|null}`. `OrderItem.station_moved_by` — fire hote waqt moved line apna station rakhti hai (station band ho gaya to General). Pending line: cashier/owner/manager/head chef. Fired (kisi ne start nahi kiya): sirf head chef/owner/manager. Preparing ke baad → 409. History event `item_station_moved`. Purane + naye station ke chefs ko notification. | Cashier screen (`OrdersPage`) par "Kitchen stations" panel: har waiting line kahan jayegi (dropdown) + "Moved" tag. Head chef KDS par fired line ka "Cook at: …" dropdown. Order item API ab `route_station` bhejti hai (fire se pehle bhi). |
+| Clock-in fallback | `Branch.kitchen_requires_clock_in` (default **off**). On ho to station "staffed" tab hi jab us ka koi chef clocked-in ho (`Shift.clock_out` null) — warna lines sab ko. Screens aur notifications dono isi rule par. Setup checklist assignment hi dekhta hai, clock-in nahi. `GET/PATCH /api/kitchen-stations/settings/`. | Kitchen stations page par toggle "Only clocked-in chefs count"; chef ke naam ke saath "(not clocked in)". KDS "mine" hint ab on-duty dekhta hai. |
+| Expo / head chef | `Staff.is_head_chef` (sirf kitchen role). Head chef = default `all`, har line ki notification, line move, handover. `GET /api/kds/tickets/?scope=expo` (head chef/owner/manager) — har station ki fired/preparing/ready lines + `all_ready`. `POST /api/orders/<id>/handover/` — sab ready ho to ready lines served, waiter ko `order:handed_over`; warna 409 `error.orderNotReady`. | Staff form par "Head chef / expo" tick. KDS par "Expo / pass" tab: ready orders pehle, har line ka station + status, "Hand over to waiter" button. |
+
+Tests: `kitchen/test_phase2.py` (claim, move, clock-in, expo).
+
+### 5.2 Phase 2 ke faisle (default jo liye — badalna ho to batayein)
+
+| # | Sawal | Liya gaya default |
+|---|---|---|
+| 7 | "Online" ka matlab? | Attendance clock-in (websocket presence nahi). Branch setting se on/off, default off — jo restaurant attendance use nahi karte un ka Phase 1 behaviour nahi badalta. |
+| 8 | Expo alag role ya flag? | Kitchen staff par **flag** `is_head_chef` — naya role nahi (har jagah permissions badalni padtin). |
+| 9 | Handover ka matlab? | Ready lines → **served** (khana kitchen se nikal gaya), waiter ko notification. |
+| 10 | Kitchen mein pahunchi line kaun move kare? | Head chef / owner / manager. Cashier sirf bhejne se pehle. Start ho chuki line kabhi nahi. |
+| 11 | Head chef ka naya flag kab lagu? | Agli login par (login payload se aata hai). |
+
 ## 6. Phase 3 — Hardware aur reports
 
 - **Station printers:** har station ka apna kitchen printer — fire hote hi us station ki lines us printer par.
 - **Reports:** har station ka average prep time (`fired_at` → `ready_at`), har chef ki lines, rush hours mein kaun sa station slow.
+
+### 6.1 Kya bana (code)
+
+| Hissa | Backend | Admin |
+|---|---|---|
+| Station printers | Printing browser se hi hoti hai (cloud server restaurant ke printer tak nahi pahunchta), is liye **station screen auto-print**. `OrderItem.printed_at` naya. `POST /api/kds/print/` `{stations: "3,general" \| "all", since}` — us station ki fired/preparing lines jo `since` ke baad aayin aur abhi print nahi huin, ek transaction mein "printed" mark karke wapas deta hai — do screens ek station par hon to bhi har line ek hi baar print. Line dusre station par move ho to `printed_at` saaf, naya station print kare. | KDS par "Station printer — auto-print on this screen": stations chuno (All / har station / General). On karte hi us waqt se aane wali lines print; har 15 sec aur har `order:kitchen_new` par check. Kai slips ek print job mein, har ek alag cut. Setting is device ki hai (browser storage). Chrome `--kiosk-printing` se dialog nahi aata. |
+| Reports | `GET /api/reports/kitchen-stations/` (`?preset=` / `?from=&to=`, `?station=<id>\|general`). Line us din/ghante ki jab fire hui (branch timezone). Har station: lines, portions, voided, avg **wait** (fired→Start), **cook** (Start→Ready), **total** (fired→Ready) — har average ke saath kitni lines par hai — aur 3 sabse slow dishes. Saath mein din-ba-din × station, ghanta × station, aur chef-wise (jis ne Start dabaya). | `/admin/reports/kitchen-stations` (Reports overview par link "How long did each station take?"): KPI tiles, station table, din-ba-din table, chef table, busiest hours, CSV export (din-ba-din). |
+
+Tests: `kitchen/test_phase3.py` (print claim, report).
+
+### 6.2 Phase 3 ke faisle
+
+| # | Sawal | Liya gaya |
+|---|---|---|
+| 12 | Printer kaise? | Station screen auto-print (aap ne chuna). Local print agent nahi. |
+| 13 | Auto-print on karte waqt purani lines? | Print nahi — sirf on karne ke baad aane wali. |
+| 14 | General lines kaun print kare? | Jis screen par "General" ya "All" tick ho; koi na kare to screen warning deti hai. |
+| 15 | Phase 2 se pehle ki lines? | Sirf total time (Start ka waqt record nahi tha) — report yeh khud likhti hai. |
 
 ---
 

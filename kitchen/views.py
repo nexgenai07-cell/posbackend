@@ -11,8 +11,8 @@ from accounts.permissions import IsOwnerOrManager
 from common.mixins import BranchScopedQuerysetMixin
 
 from .models import KitchenStation
-from .routing import unstaffed_station_ids
-from .serializers import KitchenStationSerializer
+from .routing import on_duty_chefs, unstaffed_station_ids
+from .serializers import KitchenSettingsSerializer, KitchenStationSerializer
 
 
 def station_counts(branch):
@@ -50,7 +50,7 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     )
 
     def get_permissions(self):
-        if self.action in ("list", "retrieve"):
+        if self.action in ("list", "retrieve", "kitchen_settings"):
             return [IsAuthenticated()]
         return [IsOwnerOrManager()]
 
@@ -68,6 +68,7 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         user = getattr(self.request, "user", None)
         if user is not None and user.is_authenticated and getattr(user, "branch_id", None):
             context["counts"] = station_counts(user.branch)
+            context["on_duty"] = set(on_duty_chefs(user.branch_id).values_list("pk", flat=True))
         return context
 
     def perform_create(self, serializer):
@@ -86,7 +87,8 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
 
         branch = request.user.branch
         stations = KitchenStation.objects.filter(branch=branch)
-        unstaffed = unstaffed_station_ids(branch)
+        # Who works where at all — clocked in or not, that is set-up, not a shift.
+        unstaffed = unstaffed_station_ids(branch, on_duty=False)
         products = Product.objects.filter(branch=branch)
         kitchen_staff = Staff.objects.filter(branch=branch, role=StaffRole.KITCHEN, is_active=True)
         return Response({
@@ -101,3 +103,16 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             "kitchen_staff_count": kitchen_staff.count(),
             "kitchen_staff_without_station": kitchen_staff.filter(stations__isnull=True).count(),
         })
+
+    @action(detail=False, methods=["get", "patch"], url_path="settings")
+    def kitchen_settings(self, request):
+        """The branch's kitchen routing settings — read by any staff (the
+        kitchen screen says whether clock-in counts), changed by owner/manager."""
+        if request.method == "PATCH":
+            if not IsOwnerOrManager().has_permission(request, self):
+                self.permission_denied(request)
+            serializer = KitchenSettingsSerializer(request.user.branch, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+        return Response(KitchenSettingsSerializer(request.user.branch).data)

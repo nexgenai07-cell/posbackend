@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from accounts.models import StaffRole
+from branches.models import Branch
 from common.validators import require_bilingual_pair
 
 from .models import KitchenStation
@@ -32,8 +33,12 @@ class KitchenStationSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "branch", "created_at", "updated_at"]
 
     def get_chefs(self, station):
+        # `on_duty`: counts toward the station being staffed right now
+        # (kitchen/routing.on_duty_chefs) — always true unless the branch
+        # requires kitchen chefs to be clocked in.
+        on_duty = self.context.get("on_duty", set())
         return [
-            {"id": chef.pk, "name": chef.name}
+            {"id": chef.pk, "name": chef.name, "on_duty": chef.pk in on_duty, "is_head_chef": chef.is_head_chef}
             for chef in station.chefs.all()
             if chef.is_active and chef.role == StaffRole.KITCHEN
         ]
@@ -78,3 +83,12 @@ def validate_station_branch(station, request):
     if station is not None and request is not None and station.branch_id != request.user.branch_id:
         raise serializers.ValidationError("error.stationBranchMismatch")
     return station
+
+
+class KitchenSettingsSerializer(serializers.ModelSerializer):
+    """Branch-wide kitchen routing: whether a station's chefs must be
+    clocked in for it to count as staffed (kitchen/routing.on_duty_chefs)."""
+
+    class Meta:
+        model = Branch
+        fields = ["kitchen_requires_clock_in"]

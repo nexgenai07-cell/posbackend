@@ -36,9 +36,41 @@ class OrderHistorySerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+def route_station(item):
+    """
+    The station a line goes to, as the cashier needs to see it before it is
+    sent: once fired, the station it was sent to; before that, the one it was
+    moved to by hand, else its dish's (the same rule as
+    kitchen/routing.stations_for_products). None is General.
+    """
+    if item.fired_at is not None or item.station_moved_by_id is not None:
+        return item.station
+    product = item.product
+    if product.station_id and product.station.is_active:
+        return product.station
+    category = product.category
+    if category is not None and category.station_id and category.station.is_active:
+        return category.station
+    return None
+
+
 class OrderItemSerializer(serializers.ModelSerializer):
     is_new = serializers.SerializerMethodField()
     is_additional_batch = serializers.SerializerMethodField()
+    # Where the line is (or will be) cooked — see route_station — and whether
+    # someone sent it there by hand instead of its dish's own station.
+    route_station = serializers.SerializerMethodField()
+    station_moved = serializers.SerializerMethodField()
+    started_by_name = serializers.CharField(source="started_by.name", default=None, read_only=True)
+
+    def get_route_station(self, item):
+        station = route_station(item)
+        if station is None:
+            return None
+        return {"id": station.pk, "name_en": station.name_en, "name_ar": station.name_ar}
+
+    def get_station_moved(self, item):
+        return item.station_moved_by_id is not None
 
     def get_is_new(self, item):
         return bool(getattr(item, "_is_additional_batch", False) and item.status not in (OrderItemStatus.SERVED, OrderItemStatus.VOIDED))
@@ -52,6 +84,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at", "station",
+            "route_station", "station_moved", "started_by", "started_by_name", "started_at",
             "created_at", "updated_at", "is_new", "is_additional_batch",
         ]
         # Snapshot fields are write-once at creation (see AddOrderItemSerializer)
@@ -60,7 +93,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
-            "price_snapshot", "status", "fired_at", "ready_at", "station", "created_at", "updated_at",
+            "price_snapshot", "status", "fired_at", "ready_at", "station",
+            "started_by", "started_at", "created_at", "updated_at",
         ]
 
 
@@ -232,6 +266,7 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
     station_name_ar = serializers.CharField(source="station.name_ar", default=None, read_only=True)
     is_mine = serializers.SerializerMethodField()
     started_by_name = serializers.CharField(source="started_by.name", default=None, read_only=True)
+    station_moved = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
@@ -240,9 +275,13 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "quantity", "status", "notes", "fired_at", "ready_at",
             "recipe_multiplier", "recipe",
-            "station", "station_name_en", "station_name_ar", "is_mine", "started_by", "started_by_name",
+            "station", "station_name_en", "station_name_ar", "is_mine", "station_moved",
+            "started_by", "started_by_name", "started_at",
         ]
         read_only_fields = fields
+
+    def get_station_moved(self, item):
+        return item.station_moved_by_id is not None
 
     def get_is_mine(self, item):
         scope = self.context.get("stations")
@@ -270,20 +309,41 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
     table_label_en = serializers.CharField(source="table.label_en", default=None, read_only=True)
     table_label_ar = serializers.CharField(source="table.label_ar", default=None, read_only=True)
     assigned_waiter_name = serializers.CharField(source="assigned_waiter.name", default=None, read_only=True)
+    # The expo's cue: every line the kitchen has for this order is ready, so
+    # it can go to the waiter (OrderHandoverView). False outside ?scope=expo.
+    all_ready = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = [
             "id", "order_number", "order_code", "source", "table", "table_label_en", "table_label_ar",
             "assigned_waiter", "assigned_waiter_name",
-            "status", "items", "opened_at", "waiter_confirmed_at", "closed_at",
+            "status", "items", "all_ready", "opened_at", "waiter_confirmed_at", "closed_at",
         ]
         read_only_fields = fields
+
+    def _expo_lines(self, order):
+        in_kitchen = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
+        return [item for item in sorted(order.items.all(), key=lambda item: item.pk) if item.status in in_kitchen]
+
+    def get_all_ready(self, order):
+        if self.context.get("scope") != "expo":
+            return False
+        lines = self._expo_lines(order)
+        return bool(lines) and all(item.status == OrderItemStatus.READY for item in lines)
 
     def get_items(self, order):
         # Filtered in Python over the prefetched lines so the recipe/variant
         # prefetch in KitchenTicketsView is actually used (a .filter() here
         # would re-query every order).
+        only = self.context.get("only_item_ids")
+        if only is not None:
+            # A printer screen's claim: exactly the lines it just took.
+            lines = [item for item in sorted(order.items.all(), key=lambda item: item.pk) if item.pk in only]
+            return KitchenTicketItemSerializer(lines, many=True, context=self.context).data
+        if self.context.get("scope") == "expo":
+            # The pass: every station's lines still in the kitchen, ready ones too.
+            return KitchenTicketItemSerializer(self._expo_lines(order), many=True, context=self.context).data
         lines = sorted(order.items.all(), key=lambda item: item.pk)
         if self.context.get("scope") == "history":
             # The kitchen log: everything that was ever fired, in any outcome.

@@ -50,7 +50,10 @@ class StaffSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Staff
-        fields = ["id", "branch", "name", "role", "pin", "is_active", "stations", "created_at", "updated_at"]
+        fields = [
+            "id", "branch", "name", "role", "pin", "is_active", "stations", "is_head_chef",
+            "created_at", "updated_at",
+        ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
     def validate(self, attrs):
@@ -74,9 +77,15 @@ class StaffSerializer(serializers.ModelSerializer):
         elif stations is not None:
             staff.stations.set(stations)
 
+    def _kitchen_only(self, validated_data, role):
+        # Head chef is a kitchen title; anyone else is saved without it.
+        if role != StaffRole.KITCHEN:
+            validated_data["is_head_chef"] = False
+
     def create(self, validated_data):
         pin = validated_data.pop("pin")
         stations = validated_data.pop("stations", None)
+        self._kitchen_only(validated_data, validated_data.get("role"))
         with transaction.atomic():
             staff = Staff(**validated_data)
             staff.set_pin(pin)
@@ -87,6 +96,7 @@ class StaffSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         pin = validated_data.pop("pin", None)
         stations = validated_data.pop("stations", None)
+        self._kitchen_only(validated_data, validated_data.get("role", instance.role))
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         if pin:

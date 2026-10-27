@@ -36,6 +36,24 @@ class IsKitchenStaff(BasePermission):
         return _role(request) in (StaffRole.OWNER, StaffRole.MANAGER, StaffRole.KITCHEN)
 
 
+class IsKitchenLead(BasePermission):
+    """Expo screen and handover: owner, manager, or a kitchen head chef."""
+
+    def has_permission(self, request, view):
+        role = _role(request)
+        if role in (StaffRole.OWNER, StaffRole.MANAGER):
+            return True
+        return role == StaffRole.KITCHEN and getattr(request.user, "is_head_chef", False)
+
+
+class IsStationRouter(BasePermission):
+    """Moving an order line to another kitchen station: the cashier (while
+    reviewing or assigning), the owner, the manager, or a head chef."""
+
+    def has_permission(self, request, view):
+        return IsCashierStaff().has_permission(request, view) or IsKitchenLead().has_permission(request, view)
+
+
 class IsWaiterStaff(BasePermission):
     """Waiter workflow actions, with managers allowed to resolve exceptions."""
 

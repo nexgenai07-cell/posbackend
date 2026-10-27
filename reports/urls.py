@@ -6,6 +6,7 @@ from .views import (
     DashboardSummaryView,
     FinancialSummaryView,
     IngredientCostView,
+    KitchenStationsReportView,
     MarginsView,
     OrderDetailsView,
     PeakHoursView,
@@ -35,5 +36,6 @@ urlpatterns = [
     path("reports/table-turnover/", TableTurnoverView.as_view(), name="report-table-turnover"),
     path("reports/wastage/", WastageView.as_view(), name="report-wastage"),
     path("reports/repeat-customers/", RepeatCustomersView.as_view(), name="report-repeat-customers"),
+    path("reports/kitchen-stations/", KitchenStationsReportView.as_view(), name="report-kitchen-stations"),
     path("reports/staff-attendance/", StaffAttendanceView.as_view(), name="report-staff-attendance"),
 ]

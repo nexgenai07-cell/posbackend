@@ -6,8 +6,12 @@ Routing happens once, when a line is fired: the line takes its dish's station
 Changing a dish's station later never moves lines already in the kitchen.
 
 A line with no station is General — every kitchen screen sees it. So does a
-line whose station has no active chef: nothing ever waits on a screen nobody
-is looking at.
+line whose station has no chef on duty: nothing ever waits on a screen nobody
+is looking at. "On duty" is every active kitchen chef, or — when the branch
+sets kitchen_requires_clock_in — only those clocked in right now.
+
+A cashier or head chef may move a line to another station by hand
+(move_line); firing then keeps that station instead of the dish's own.
 """
 
 from collections import defaultdict
@@ -16,6 +20,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from accounts.models import Staff, StaffRole
+from branches.models import Branch
 
 from .models import KitchenStation
 
@@ -49,7 +54,8 @@ def station_for(product):
 
 def fire_items(items, now=None):
     """
-    pending -> fired for `items`, routing each to its station. Every place
+    pending -> fired for `items`, routing each to its station — the dish's,
+    unless someone moved the line by hand before it was sent. Every place
     that sends lines to the kitchen goes through here, so none of them can
     forget the station.
 
@@ -65,11 +71,18 @@ def fire_items(items, now=None):
         return items
     now = now or timezone.now()
     stations = stations_for_products(item.product_id for item in items)
+    # A line moved by hand keeps its station — unless that station has since
+    # been switched off, when it goes to General like any other line would.
+    moved_to = {item.station_id for item in items if item.station_moved_by_id and item.station_id}
+    switched_off = set(KitchenStation.objects.filter(pk__in=moved_to, is_active=False).values_list("pk", flat=True))
     by_station = defaultdict(list)
     for item in items:
         item.status = OrderItemStatus.FIRED
         item.fired_at = now
-        item.station_id = stations.get(item.product_id)
+        if item.station_moved_by_id is None:
+            item.station_id = stations.get(item.product_id)
+        elif item.station_id in switched_off:
+            item.station_id = None
         by_station[item.station_id].append(item.pk)
     for station_id, pks in by_station.items():
         OrderItem.objects.filter(pk__in=pks).update(
@@ -81,13 +94,37 @@ def fire_items(items, now=None):
     return items
 
 
-def unstaffed_station_ids(branch):
-    """Stations no active kitchen chef works at — their lines show as General."""
+def can_run_kitchen(staff):
+    """Owners, managers and head chefs: they see every station by default,
+    move lines between stations and hand finished orders over."""
+    if staff.role in (StaffRole.OWNER, StaffRole.MANAGER):
+        return True
+    return staff.role == StaffRole.KITCHEN and staff.is_head_chef
+
+
+def requires_clock_in(branch_id):
+    return Branch.objects.filter(pk=branch_id, kitchen_requires_clock_in=True).exists()
+
+
+def on_duty_chefs(branch_id):
+    """Kitchen chefs a station counts as staffed by: every active one, or
+    only those clocked in when the branch says so."""
+    chefs = Staff.objects.filter(branch_id=branch_id, role=StaffRole.KITCHEN, is_active=True)
+    if requires_clock_in(branch_id):
+        chefs = chefs.filter(shifts__clock_out__isnull=True, shifts__is_deleted=False).distinct()
+    return chefs
+
+
+def unstaffed_station_ids(branch, on_duty=True):
+    """Stations with no chef on duty — their lines show on every kitchen
+    screen. `on_duty=False` asks only whether anyone works there at all (the
+    setup checklist), clocked in or not."""
+    chefs = on_duty_chefs(branch.pk) if on_duty else Staff.objects.filter(
+        branch=branch, role=StaffRole.KITCHEN, is_active=True,
+    )
     return set(
         KitchenStation.objects.filter(branch=branch)
-        .annotate(chef_count=Count(
-            "chefs", filter=Q(chefs__role=StaffRole.KITCHEN, chefs__is_active=True, chefs__is_deleted=False),
-        ))
+        .annotate(chef_count=Count("chefs", filter=Q(chefs__in=chefs.values("pk"))))
         .filter(chef_count=0)
         .values_list("pk", flat=True)
     )
@@ -127,11 +164,12 @@ def station_scope(staff, raw):
       all      every line
       1,4,general   those stations (and General when listed)
 
-    With no value a kitchen chef gets `mine`; owners and managers get `all`.
+    With no value a kitchen chef gets `mine`; head chefs, owners and
+    managers get `all`.
     """
     raw = (raw or "").strip().lower()
     if not raw:
-        raw = "mine" if staff.role == StaffRole.KITCHEN else "all"
+        raw = "all" if can_run_kitchen(staff) else "mine"
     if raw == "all":
         return StationScope(everything=True)
     if raw == "mine":
@@ -149,15 +187,18 @@ def station_scope(staff, raw):
 
 def kitchen_recipient_ids(branch_id, lines):
     """
-    Kitchen staff who should hear about `lines`: each station's own chefs,
-    and every kitchen chef when any line is General or its station has no
-    chef. Empty `lines` also means every kitchen chef.
+    Kitchen staff who should hear about `lines`: each station's chefs on
+    duty, and every kitchen chef when any line is General or its station has
+    no chef on duty. Empty `lines` also means every kitchen chef. Head chefs
+    hear about every line, whatever its station.
     """
-    kitchen = list(
-        Staff.objects.filter(branch_id=branch_id, role=StaffRole.KITCHEN, is_active=True)
-        .prefetch_related("stations")
+    everyone = set(
+        Staff.objects.filter(branch_id=branch_id, role=StaffRole.KITCHEN, is_active=True).values_list("pk", flat=True)
     )
-    everyone = {chef.pk for chef in kitchen}
+    head_chefs = set(
+        Staff.objects.filter(pk__in=everyone, is_head_chef=True).values_list("pk", flat=True)
+    )
+    kitchen = list(on_duty_chefs(branch_id).prefetch_related("stations"))
     station_ids = {line.station_id for line in lines}
     if not station_ids or None in station_ids:
         return everyone
@@ -171,4 +212,22 @@ def kitchen_recipient_ids(branch_id, lines):
         if not chefs:
             return everyone
         recipients |= chefs
-    return recipients
+    return recipients | head_chefs
+
+
+def move_line(item, station, actor):
+    """
+    Send one line to `station` (None = General) by hand — the cashier
+    before it is sent, or a head chef while nobody has started it. Returns
+    the station id it was at. The caller records and announces the move.
+    """
+    previous = item.station_id
+    item.station = station
+    item.station_moved_by = actor
+    update_fields = ["station", "station_moved_by", "updated_at"]
+    if previous != item.station_id and item.printed_at is not None:
+        # The new station's printer has not printed it yet.
+        item.printed_at = None
+        update_fields.append("printed_at")
+    item.save(update_fields=update_fields)
+    return previous
