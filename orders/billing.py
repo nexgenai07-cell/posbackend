@@ -461,12 +461,34 @@ def close_bills_for_released_table(table, actor):
 
 
 def _is_empty_order(order):
-    """Nothing to cook and nothing paid: every line was removed (or none was
-    ever added — opening the POS order screen creates the order up front)."""
+    """Nothing to cook and nothing paid: every line was removed."""
     return (
         not order.items.exclude(status=OrderItemStatus.VOIDED).exists()
         and not order.payments.exists()
     )
+
+
+def delete_if_draft(order):
+    """
+    Delete a staff order that never became anything: no customer, never past
+    cashier review, no line ever (not even a voided one), no payment. That is
+    a POS ticket whose every line was taken off again — keeping it would leave
+    an order number with nothing in it. Its bill goes too when nothing else is
+    on it. Returns True if deleted. The caller must hold the order lock.
+    """
+    if (
+        order.customer_id is not None
+        or order.status not in (OrderStatus.OPEN, OrderStatus.PENDING_CASHIER)
+        or order.items.exists()
+        or order.payments.exists()
+        or order.refunds.exists()
+    ):
+        return False
+    bill_id = order.bill_id
+    order.delete()
+    if bill_id:
+        Bill.objects.filter(pk=bill_id, orders__isnull=True, moyasar_payments__isnull=True).delete()
+    return True
 
 
 def live_table_orders(table):
@@ -480,15 +502,19 @@ def live_table_orders(table):
 
 def discard_empty_orders(table, actor):
     """
-    Cancel the table's live orders that hold nothing (see _is_empty_order)
+    Remove the table's live orders that hold nothing (see _is_empty_order)
     and return the live orders that remain. An empty order owes nothing, so
-    it must not keep the table occupied or block Release / delete. The caller
-    must hold the table lock.
+    it must not keep the table occupied or block Release / delete. A draft is
+    deleted (delete_if_draft); anything else empty — e.g. a customer's QR
+    order whose lines were all removed — is cancelled, keeping its record.
+    The caller must hold the table lock.
     """
     remaining = []
     for order in live_table_orders(table):
         if not _is_empty_order(order):
             remaining.append(order)
+            continue
+        if delete_if_draft(order):
             continue
         # No cancelled_at: nothing was ordered, so this is not a cancellation
         # for the cancelled-orders report (it filters on cancelled_at).
@@ -500,9 +526,8 @@ def discard_empty_orders(table, actor):
 def free_table_if_nothing_on_it(table):
     """
     The last line came off the table's order: nothing is left to cook or pay,
-    so the table is no longer occupied. The empty order and its bill stay, so
-    the POS screen still showing it can keep adding to it (which re-occupies
-    the table); Release later discards them. The caller must hold the table lock.
+    so the table is no longer occupied; adding again re-occupies it. The
+    caller must hold the table lock.
     """
     from tables.models import TableStatus
 

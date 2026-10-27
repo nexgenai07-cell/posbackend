@@ -1159,8 +1159,8 @@ class RestaurantOrderWorkflowTests(TablesApiTestCase):
 
 
 class EmptyPosOrderTableTests(TablesApiTestCase):
-    """The POS order screen creates the table's order on open; a line added
-    then removed must not leave the table occupied or block Release/delete."""
+    """A POS ticket whose every line is taken off again must not leave an
+    empty order number behind, keep the table occupied, or block Release/delete."""
 
     def setUp(self):
         super().setUp()
@@ -1177,28 +1177,63 @@ class EmptyPosOrderTableTests(TablesApiTestCase):
         self.assertEqual(removed.status_code, status.HTTP_204_NO_CONTENT)
         return order_id
 
-    def test_removing_the_last_line_frees_the_table_and_adding_again_reoccupies_it(self):
+    def test_removing_the_last_line_deletes_the_draft_order_and_frees_the_table(self):
+        from orders.models import Bill, Order
+
         order_id = self.add_then_remove()
+        self.assertFalse(Order.objects.filter(pk=order_id).exists())
+        self.assertFalse(Bill.objects.filter(table=self.table).exists())
         self.table.refresh_from_db()
         self.assertEqual(self.table.status, "empty")
-        # The screen still holds the same order and can keep using it.
-        again = self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1}, format="json")
-        self.assertEqual(again.status_code, status.HTTP_201_CREATED, again.content)
+        self.assertEqual(self.client.get(f"/api/tables/{self.table.id}/open-order/").status_code, status.HTTP_404_NOT_FOUND)
+        # The next tap starts a fresh order and occupies the table again.
+        fresh = self.client.post("/api/orders/", {"table": self.table.id}, format="json")
+        self.assertEqual(fresh.status_code, status.HTTP_201_CREATED)
+        self.client.post(f"/api/orders/{fresh.json()['id']}/items/", {"product": self.product.id, "quantity": 1}, format="json")
         self.table.refresh_from_db()
         self.assertEqual(self.table.status, "occupied")
 
-    def test_release_discards_an_empty_order_instead_of_refusing(self):
+    def test_removing_one_of_two_lines_keeps_the_order(self):
         from orders.models import Order
 
-        order_id = self.add_then_remove()
-        self.table.open()  # e.g. marked occupied by hand before the fix
-        response = self.client.post(f"/api/tables/{self.table.id}/close/")
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
-        self.assertEqual(response.json()["status"], "empty")
-        order = Order.objects.get(pk=order_id)
+        order_id = self.client.post("/api/orders/", {"table": self.table.id}, format="json").json()["id"]
+        first = self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1}, format="json").json()
+        self.client.post(f"/api/orders/{order_id}/items/", {"product": self.product.id, "quantity": 1, "notes": "no onion"}, format="json")
+        self.client.patch(f"/api/orders/{order_id}/items/{first['id']}/", {"quantity": 0}, format="json")
+        self.assertTrue(Order.objects.filter(pk=order_id).exists())
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, "occupied")
+
+    def test_cashier_emptying_a_customer_qr_order_keeps_its_record(self):
+        from orders.models import Order
+
+        self.table.open()
+        body = self.post_qr({
+            "session_token": self.table.session_token,
+            "phone": "0770000077",
+            "items": [{"product": self.product.id, "quantity": 1}],
+        }).json()
+        self.auth_as(self.cashier, "3333")
+        removed = self.client.patch(f"/api/orders/{body['id']}/items/{body['items'][0]['id']}/", {"quantity": 0}, format="json")
+        self.assertEqual(removed.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertTrue(Order.objects.filter(pk=body["id"]).exists())
+        # Release then cancels it (nothing owed) instead of refusing.
+        released = self.client.post(f"/api/tables/{self.table.id}/close/")
+        self.assertEqual(released.status_code, status.HTTP_200_OK, released.content)
+        order = Order.objects.get(pk=body["id"])
         self.assertEqual(order.status, "cancelled")
         # Nothing was ordered, so it is not a cancellation for the report.
         self.assertIsNone(order.cancelled_at)
+
+    def test_release_drops_an_order_that_never_got_a_line(self):
+        from orders.models import Order
+
+        order_id = self.client.post("/api/orders/", {"table": self.table.id}, format="json").json()["id"]
+        self.table.open()
+        response = self.client.post(f"/api/tables/{self.table.id}/close/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(response.json()["status"], "empty")
+        self.assertFalse(Order.objects.filter(pk=order_id).exists())
 
     def test_release_still_refuses_an_order_with_items(self):
         order_id = self.client.post("/api/orders/", {"table": self.table.id}, format="json").json()["id"]

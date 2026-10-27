@@ -50,7 +50,7 @@ from .serializers import (
     RecordPaymentSerializer,
     additional_batch_item_ids,
 )
-from .billing import free_table_if_nothing_on_it
+from .billing import delete_if_draft, free_table_if_nothing_on_it
 from .services import BillLocked, get_or_create_open_order
 from .codes import resolve_order_code
 from .workflow import (
@@ -818,6 +818,18 @@ class OrderItemDetailView(APIView):
                     else:
                         _notify_order_staff(order, "order:changed", request.user.pk, {order.assigned_cashier_id} - {None}, change_id=item_id)
                         _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                elif emptied and order.customer_id is None and order.status in (OrderStatus.OPEN, OrderStatus.PENDING_CASHIER):
+                    # Staff took every line off their own ticket before it went
+                    # anywhere: drop the order rather than leave an empty number.
+                    # Payload first — it reads the order, which is gone after.
+                    _notify_role_staff(order, "order:admin_update", {StaffRole.CASHIER, StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
+                    table = order.table
+                    if delete_if_draft(order):
+                        if table:
+                            free_table_if_nothing_on_it(table)
+                        return Response(status=status.HTTP_204_NO_CONTENT)
+                    record_order_event(order, request.user, "item_removed", details=details)
+                    queue_order_for_cashier(order, request.user, "order_revised")
                 else:
                     record_order_event(order, request.user, "item_removed", details=details)
                     queue_order_for_cashier(order, request.user, "order_revised")
