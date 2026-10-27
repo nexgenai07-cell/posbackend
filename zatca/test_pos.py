@@ -344,6 +344,17 @@ class ReceiptTests(PosTestBase):
         second = self.api.post(f"/api/zatca/receipts/{receipt['id']}/printed/").json()
         self.assertEqual((first["copy"], second["copy"], second["print_count"]), (False, True, 2))
 
+    def test_one_document_by_its_id_for_the_invoices_page(self):
+        order = self.served_order()
+        self.pay(order, "30.00")
+        invoice = self.invoice_of(order)
+        [receipt] = self.receipts(document=invoice.pk)
+        self.assertEqual((receipt["id"], receipt["number"]), (invoice.pk, invoice.number))
+        other_branch = Branch.objects.create(name_en="Other", name_ar="Other")
+        elsewhere = APIClient()
+        elsewhere.force_authenticate(user=make_staff(other_branch, "Other cashier", StaffRole.CASHIER))
+        self.assertEqual(elsewhere.get("/api/zatca/receipts/", {"document": invoice.pk}).status_code, 404)
+
     def test_public_receipt_never_shows_a_company_invoice(self):
         order = self.served_order()
         company = B2BTests.company

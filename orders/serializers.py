@@ -323,8 +323,12 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def _expo_lines(self, order):
-        in_kitchen = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
-        return [item for item in sorted(order.items.all(), key=lambda item: item.pk) if item.status in in_kitchen]
+        """Still at the pass: cooking, or ready and not yet handed to the waiter."""
+        cooking = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING)
+        return [
+            item for item in sorted(order.items.all(), key=lambda item: item.pk)
+            if item.status in cooking or (item.status == OrderItemStatus.READY and item.handed_over_at is None)
+        ]
 
     def get_all_ready(self, order):
         if self.context.get("scope") != "expo":

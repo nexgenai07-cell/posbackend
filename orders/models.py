@@ -265,6 +265,10 @@ class OrderItem(BaseModel):
     # (KitchenPrintView). Claimed once, so two screens at one station never
     # print it twice; cleared when the line moves to another station.
     printed_at = models.DateTimeField(null=True, blank=True)
+    # When the head chef handed this ready line to the waiter at the pass
+    # (OrderHandoverView). The line stays READY — the waiter still marks it
+    # served at the table — it only leaves the expo screen.
+    handed_over_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.quantity}x {self.name_en_snapshot}"

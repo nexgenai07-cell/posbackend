@@ -231,6 +231,11 @@ def _notify_role_staff(order, event_name, roles, actor_id=None, **extra):
 
 
 _KITCHEN_LINE_STATUSES = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
+# What is still at the pass: cooking, or ready and not yet handed to the waiter.
+_EXPO_LINE_Q = (
+    Q(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING))
+    | Q(status=OrderItemStatus.READY, handed_over_at__isnull=True)
+)
 
 
 def _notify_kitchen(order, event_name, actor_id=None, lines=None, **extra):
@@ -1037,6 +1042,13 @@ class KitchenTicketsView(ListAPIView):
         if self._scope() == "history":
             line_q = Q(items__fired_at__isnull=False)
             qs = qs.filter(line_q & station_q if station_q else line_q).distinct().order_by("-opened_at")
+        elif self._scope() == "expo":
+            # Only orders with something still at the pass (one filter() call,
+            # so both conditions hold for the same line).
+            qs = qs.filter(
+                Q(items__status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING))
+                | Q(items__status=OrderItemStatus.READY, items__handed_over_at__isnull=True)
+            ).distinct()
         else:
             line_q = Q(items__status__in=_KITCHEN_LINE_STATUSES)
             qs = qs.filter(line_q & station_q if station_q else line_q).distinct()
@@ -1269,8 +1281,10 @@ class OrderItemStationView(APIView):
 class OrderHandoverView(APIView):
     """
     The pass: once every line the kitchen has for an order is ready, the
-    head chef hands it to the waiter — the ready lines become served and the
-    order's status follows. Refused while any station is still cooking.
+    head chef hands it to the waiter. The lines stay READY — serving is still
+    the waiter's step at the table (OrderItemStatusView) — they are stamped
+    handed_over_at, leave the expo screen, and the waiter is told to pick
+    them up. Refused while any station is still cooking.
     """
 
     permission_classes = [IsKitchenLead]
@@ -1280,21 +1294,20 @@ class OrderHandoverView(APIView):
             order = get_object_or_404(Order.objects.select_for_update().filter(branch=request.user.branch), pk=pk)
             if order.status in TERMINAL_ORDER_STATUSES:
                 return Response({"error": "error.orderClosed"}, status=status.HTTP_409_CONFLICT)
-            lines = list(order.items.select_for_update().filter(status__in=_KITCHEN_LINE_STATUSES))
+            lines = list(order.items.select_for_update().filter(_EXPO_LINE_Q))
             ready = [item for item in lines if item.status == OrderItemStatus.READY]
             if not ready or len(ready) != len(lines):
                 return Response({"error": "error.orderNotReady"}, status=status.HTTP_409_CONFLICT)
+            now = timezone.now()
             for item in ready:
-                item.status = OrderItemStatus.SERVED
-                item.save(update_fields=["status", "updated_at"])
+                item.handed_over_at = now
+                item.save(update_fields=["handed_over_at", "updated_at"])
             notices = [_item_notice(item) for item in ready]
             record_order_event(order, request.user, "kitchen_handover", details={
                 "item_ids": [item.pk for item in ready],
                 "items": notices,
                 "actor_role": request.user.role,
             })
-            getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
-            _sync_order_kitchen_status(order, request.user)
             _notify_kitchen(order, "order:changed", request.user.pk, ready)
             _notify_order_staff(order, "order:handed_over", request.user.pk, items=notices)
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)

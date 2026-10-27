@@ -99,13 +99,22 @@ class PosStatusView(APIView):
 class ReceiptsView(APIView):
     """GET ?order=<id> or ?bill=<id>: the tax invoices and credit notes that
     cover them, ready to print. Empty while ZATCA is off or nothing was
-    invoiced (the POS then prints its ordinary receipt, as before)."""
+    invoiced (the POS then prints its ordinary receipt, as before).
+
+    ?document=<id> is exactly that one document — the invoices page reprints
+    the row it is on, not everything else on its order."""
 
     permission_classes = [IsCashierStaff]
 
     def get(self, request):
         from orders.models import Order
 
+        document_id = request.query_params.get("document")
+        if document_id:
+            if not document_id.isdigit():
+                return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
+            document = get_object_or_404(ZatcaDocument, pk=document_id, branch=request.user.branch)
+            return Response(receipts.for_document(document))
         orders = Order.objects.filter(branch=request.user.branch)
         if request.query_params.get("order"):
             orders = orders.filter(pk=request.query_params["order"])

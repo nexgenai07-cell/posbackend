@@ -64,6 +64,12 @@ def payload(document, *, settings=None, public=False):
     return data
 
 
+def for_document(document):
+    """One document, ready to print — the invoices page's reprint."""
+    settings = ZatcaSettings.objects.filter(branch_id=document.branch_id).first()
+    return [payload(document, settings=settings)]
+
+
 def for_orders(order_ids, *, public=False):
     """Every document covering these orders, invoices before credit notes."""
     from .models import ZatcaDocument

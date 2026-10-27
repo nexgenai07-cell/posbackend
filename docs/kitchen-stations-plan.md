@@ -1,7 +1,7 @@
 # Kitchen Stations — Plan
 
 > Status: **Phase 1 code ho gaya** — backend (`kitchen` app, routing, KDS `?stations=`, notifications, bulk-station, import, tests) aur admin (station picker, category/product/staff forms, `/admin/kitchen-stations`, menu column + bulk set, KDS chips + greyed lines, setup checklist, en/ar).
-> **Phase 2 code ho gaya** — §5 dekhein. **Phase 3 code ho gaya** — §6 dekhein. Migrations (`accounts 0007`, `branches 0007`, `orders 0015`, `orders 0016`) abhi chalni hain.
+> **Phase 2 code ho gaya** — §5 dekhein. **Phase 3 code ho gaya** — §6 dekhein. Migrations (`accounts 0007`, `branches 0007`, `orders 0015`, `orders 0016`, `orders 0017`) abhi chalni hain.
 > Repos: `restaurant-backend`, `restaurant-admin`. `burger_web` (customer site) mein koi change nahi — customer ko ek hi order dikhta rahega.
 
 ---
@@ -171,7 +171,7 @@ Sab bilingual (en/ar locales), aur errors proper codes ke saath (`error.stationN
 | Start / claim | `OrderItem.started_at` naya; Start par `started_by` + `started_at`. Dusra chef Start dabaye → 409 `error.itemAlreadyStarted` + `started_by_name`. Ready koi bhi chef us station ka kar sakta hai (break cover). | KDS line par "Ahmed is making this" / "You're making this"; error toast mein naam. |
 | Cashier override | `POST /api/orders/<id>/items/<item>/station/` `{station: id\|null}`. `OrderItem.station_moved_by` — fire hote waqt moved line apna station rakhti hai (station band ho gaya to General). Pending line: cashier/owner/manager/head chef. Fired (kisi ne start nahi kiya): sirf head chef/owner/manager. Preparing ke baad → 409. History event `item_station_moved`. Purane + naye station ke chefs ko notification. | Cashier screen (`OrdersPage`) par "Kitchen stations" panel: har waiting line kahan jayegi (dropdown) + "Moved" tag. Head chef KDS par fired line ka "Cook at: …" dropdown. Order item API ab `route_station` bhejti hai (fire se pehle bhi). |
 | Clock-in fallback | `Branch.kitchen_requires_clock_in` (default **off**). On ho to station "staffed" tab hi jab us ka koi chef clocked-in ho (`Shift.clock_out` null) — warna lines sab ko. Screens aur notifications dono isi rule par. Setup checklist assignment hi dekhta hai, clock-in nahi. `GET/PATCH /api/kitchen-stations/settings/`. | Kitchen stations page par toggle "Only clocked-in chefs count"; chef ke naam ke saath "(not clocked in)". KDS "mine" hint ab on-duty dekhta hai. |
-| Expo / head chef | `Staff.is_head_chef` (sirf kitchen role). Head chef = default `all`, har line ki notification, line move, handover. `GET /api/kds/tickets/?scope=expo` (head chef/owner/manager) — har station ki fired/preparing/ready lines + `all_ready`. `POST /api/orders/<id>/handover/` — sab ready ho to ready lines served, waiter ko `order:handed_over`; warna 409 `error.orderNotReady`. | Staff form par "Head chef / expo" tick. KDS par "Expo / pass" tab: ready orders pehle, har line ka station + status, "Hand over to waiter" button. |
+| Expo / head chef | `Staff.is_head_chef` (sirf kitchen role). Head chef = default `all`, har line ki notification, line move, handover. `GET /api/kds/tickets/?scope=expo` (head chef/owner/manager) — har station ki fired/preparing/ready lines + `all_ready`. `POST /api/orders/<id>/handover/` — sab ready ho to lines **ready hi rehti hain**, `OrderItem.handed_over_at` lagta hai (expo se hat jati hain), waiter ko `order:handed_over` ("pick it up"); served waiter hi table par karta hai. Warna 409 `error.orderNotReady`. | Staff form par "Head chef / expo" tick. KDS par "Expo / pass" tab: ready orders pehle, har line ka station + status, "Hand over to waiter" button. |
 
 Tests: `kitchen/test_phase2.py` (claim, move, clock-in, expo).
 
@@ -181,7 +181,7 @@ Tests: `kitchen/test_phase2.py` (claim, move, clock-in, expo).
 |---|---|---|
 | 7 | "Online" ka matlab? | Attendance clock-in (websocket presence nahi). Branch setting se on/off, default off — jo restaurant attendance use nahi karte un ka Phase 1 behaviour nahi badalta. |
 | 8 | Expo alag role ya flag? | Kitchen staff par **flag** `is_head_chef` — naya role nahi (har jagah permissions badalni padtin). |
-| 9 | Handover ka matlab? | Ready lines → **served** (khana kitchen se nikal gaya), waiter ko notification. |
+| 9 | Handover ka matlab? | **Badla gaya:** lines ready rehti hain, sirf `handed_over_at` + waiter ko "pick it up" notification. Served waiter hi karta hai (purana flow bacha rahe). |
 | 10 | Kitchen mein pahunchi line kaun move kare? | Head chef / owner / manager. Cashier sirf bhejne se pehle. Start ho chuki line kabhi nahi. |
 | 11 | Head chef ka naya flag kab lagu? | Agli login par (login payload se aata hai). |
 

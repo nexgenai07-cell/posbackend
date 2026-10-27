@@ -288,7 +288,7 @@ class ExpoTests(Phase2TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"], "error.orderNotReady")
 
-    def test_handover_serves_the_order_and_tells_the_waiter(self):
+    def test_handover_tells_the_waiter_and_leaves_serving_to_them(self):
         order_id = self.fire(self.kebab, self.fries)
         self.cook(self.bbq_client, order_id, self.kebab)
         self.cook(self.fryer_client, order_id, self.fries)
@@ -296,9 +296,17 @@ class ExpoTests(Phase2TestCase):
             self.head_client.post(f"/api/orders/{order_id}/handover/").status_code, 200,
         ))
         self.assertIn(self.waiter.pk, told)
-        self.assertEqual(set(OrderItem.objects.filter(order_id=order_id).values_list("status", flat=True)), {"served"})
-        self.assertEqual(Order.objects.get(pk=order_id).status, "served")
+        # Still ready: the food has left the kitchen, not reached the table.
+        lines = list(OrderItem.objects.filter(order_id=order_id))
+        self.assertEqual({line.status for line in lines}, {"ready"})
+        self.assertTrue(all(line.handed_over_at for line in lines))
+        self.assertEqual(Order.objects.get(pk=order_id).status, "ready")
         self.assertNotIn(order_id, self.expo(self.head_client))
+        self.assertEqual(self.head_client.post(f"/api/orders/{order_id}/handover/").status_code, 409)
+        # The waiter serves it at the table, as before.
+        for line in lines:
+            self.assertEqual(self.item_status(self.waiter_client, order_id, line.pk, "served").status_code, 200)
+        self.assertEqual(Order.objects.get(pk=order_id).status, "served")
 
     def test_a_plain_chef_cannot_hand_over(self):
         order_id = self.fire(self.kebab)
