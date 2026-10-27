@@ -5,9 +5,11 @@ Routing happens once, when a line is fired: the line takes its dish's station
 (the product's own, else its category's) as a snapshot on OrderItem.station.
 Changing a dish's station later never moves lines already in the kitchen.
 
-A line with no station is General — every kitchen screen sees it. So does a
-line whose station has no chef on duty: nothing ever waits on a screen nobody
-is looking at. "On duty" is every active kitchen chef, or — when the branch
+A line with no station is General — it belongs to the chefs who work at no
+station and to head chefs; a chef with stations of their own does not see it
+on "mine". When no such chef is on duty, General is every kitchen screen's.
+So is a line whose station has no chef on duty: nothing ever waits on a
+screen nobody is looking at. "On duty" is every active kitchen chef, or — when the branch
 sets kitchen_requires_clock_in — only those clocked in right now.
 
 A cashier or head chef may move a line to another station by hand
@@ -115,6 +117,21 @@ def on_duty_chefs(branch_id):
     return chefs
 
 
+def general_chefs(branch_id):
+    """On-duty chefs General lines belong to: those at no station, and head
+    chefs (who see every station anyway)."""
+    return on_duty_chefs(branch_id).filter(Q(stations__isnull=True) | Q(is_head_chef=True)).distinct()
+
+
+def mine_includes_general(staff):
+    """Whether General lines are on this chef's "mine": theirs when they work
+    at no station or are a head chef, and everyone's when no chef like that
+    is on duty."""
+    if staff.is_head_chef or not staff.stations.exists():
+        return True
+    return not general_chefs(staff.branch_id).exists()
+
+
 def unstaffed_station_ids(branch, on_duty=True):
     """Stations with no chef on duty — their lines show on every kitchen
     screen. `on_duty=False` asks only whether anyone works there at all (the
@@ -160,7 +177,8 @@ def station_scope(staff, raw):
     """
     The scope for ?stations= on the kitchen screen:
 
-      mine     the chef's own stations, General, and unstaffed stations
+      mine     the chef's own stations and unstaffed stations, plus General
+               when it is theirs (mine_includes_general)
       all      every line
       1,4,general   those stations (and General when listed)
 
@@ -173,8 +191,10 @@ def station_scope(staff, raw):
     if raw == "all":
         return StationScope(everything=True)
     if raw == "mine":
-        mine = set(staff.stations.values_list("pk", flat=True)) if staff.role == StaffRole.KITCHEN else set()
-        return StationScope(mine | unstaffed_station_ids(staff.branch), general=True)
+        if staff.role != StaffRole.KITCHEN:
+            return StationScope(unstaffed_station_ids(staff.branch), general=True)
+        mine = set(staff.stations.values_list("pk", flat=True))
+        return StationScope(mine | unstaffed_station_ids(staff.branch), general=mine_includes_general(staff))
     ids, general = set(), False
     for part in raw.split(","):
         part = part.strip()
@@ -185,12 +205,40 @@ def station_scope(staff, raw):
     return StationScope(ids, general=general)
 
 
+def cookable_station_ids(staff):
+    """Stations whose lines `staff` may start, finish or void: their own and
+    those with no chef on duty. None means every line — head chefs, owners
+    and managers. General lines are every chef's to cook (can_cook)."""
+    if can_run_kitchen(staff):
+        return None
+    return set(staff.stations.values_list("pk", flat=True)) | unstaffed_station_ids(staff.branch)
+
+
+def can_cook(staff, item, station_ids):
+    """Whether `staff` may work this line, `station_ids` from
+    cookable_station_ids. Seeing a line (station_scope) is not enough: the
+    All view shows every station, the rest stays theirs. A line one chef has
+    started is that chef's alone; a kitchen lead may still finish it."""
+    if station_ids is None:
+        return True
+    if item.started_by_id is not None and item.started_by_id != staff.pk:
+        return False
+    return station_is_cookable(item, station_ids)
+
+
+def station_is_cookable(item, station_ids):
+    """The station half of can_cook: General, or a station in `station_ids`
+    (None = every station). Who started the line is not considered."""
+    return station_ids is None or item.station_id is None or item.station_id in station_ids
+
+
 def kitchen_recipient_ids(branch_id, lines):
     """
     Kitchen staff who should hear about `lines`: each station's chefs on
-    duty, and every kitchen chef when any line is General or its station has
-    no chef on duty. Empty `lines` also means every kitchen chef. Head chefs
-    hear about every line, whatever its station.
+    duty, General's chefs (general_chefs) for a General line, and every
+    kitchen chef when a line's station — General included — has no chef on
+    duty. Empty `lines` also means every kitchen chef. Head chefs hear about
+    every line, whatever its station.
     """
     everyone = set(
         Staff.objects.filter(branch_id=branch_id, role=StaffRole.KITCHEN, is_active=True).values_list("pk", flat=True)
@@ -200,13 +248,19 @@ def kitchen_recipient_ids(branch_id, lines):
     )
     kitchen = list(on_duty_chefs(branch_id).prefetch_related("stations"))
     station_ids = {line.station_id for line in lines}
-    if not station_ids or None in station_ids:
+    if not station_ids:
         return everyone
+    recipients = set()
+    if None in station_ids:
+        general = set(general_chefs(branch_id).values_list("pk", flat=True))
+        if not general:
+            return everyone
+        recipients |= general
+        station_ids.discard(None)
     chefs_by_station = defaultdict(set)
     for chef in kitchen:
         for station in chef.stations.all():
             chefs_by_station[station.pk].add(chef.pk)
-    recipients = set()
     for station_id in station_ids:
         chefs = chefs_by_station.get(station_id)
         if not chefs:

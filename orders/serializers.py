@@ -6,6 +6,7 @@ from catalog.models import Product, ProductVariant
 from catalog.services import current_price, is_available_today
 from common.exceptions import ConflictCode
 from inventory.services import check_product_stock, variant_multiplier
+from kitchen.routing import station_is_cookable
 
 from .models import Order, OrderHistory, OrderItem, OrderItemStatus, Payment
 
@@ -268,6 +269,7 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
     station_name_en = serializers.CharField(source="station.name_en", default=None, read_only=True)
     station_name_ar = serializers.CharField(source="station.name_ar", default=None, read_only=True)
     is_mine = serializers.SerializerMethodField()
+    can_cook = serializers.SerializerMethodField()
     started_by_name = serializers.CharField(source="started_by.name", default=None, read_only=True)
     station_moved = serializers.SerializerMethodField()
 
@@ -278,7 +280,7 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "quantity", "status", "notes", "fired_at", "ready_at",
             "recipe_multiplier", "recipe",
-            "station", "station_name_en", "station_name_ar", "is_mine", "station_moved",
+            "station", "station_name_en", "station_name_ar", "is_mine", "can_cook", "station_moved",
             "started_by", "started_by_name", "started_at",
         ]
         read_only_fields = fields
@@ -289,6 +291,14 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
     def get_is_mine(self, item):
         scope = self.context.get("stations")
         return True if scope is None else scope.includes(item.station_id)
+
+    def get_can_cook(self, item):
+        """Whether this line's station is the viewer's to cook — false for
+        another station's line (kitchen/routing.station_is_cookable). A line
+        another chef started says so in started_by; can_cook leaves it out."""
+        if "cook_station_ids" not in self.context:
+            return True
+        return station_is_cookable(item, self.context["cook_station_ids"])
 
     def get_recipe_multiplier(self, item):
         return str(variant_multiplier(item.variant))

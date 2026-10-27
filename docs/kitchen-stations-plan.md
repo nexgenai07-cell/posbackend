@@ -109,7 +109,11 @@ Agar station `is_active=False` ho → null (General).
 - `?stations=<id>,<id>`: kuch khaas stations.
 - Response mein har line ke saath `station` (id + naam) — taake frontend apni lines highlight aur baaqi greyed dikha sake.
 
-**Fallback:** kisi station par koi chef **assign hi nahi** → us ki lines General mein bhi dikhein (sab ko). "Abhi login nahi" wala fallback (shift/online status) Phase 2 mein.
+**Fallback:** kisi station par koi chef **assign hi nahi** → us ki lines General mein bhi dikhein (sab ko).
+
+**Badla gaya (General):** "My stations" par ab General ki lines **nahi** aatin agar General ka koi chef duty par ho — General ka chef = jo kitchen staff kisi station mein nahi, ya head chef. Aisa koi chef na ho to General sab ki "mine" par (taake koi dish na atke); KDS hint batata hai. Notification bhi isi rule par. `GET /api/kitchen-stations/settings/` ab `mine_includes_general` bhi deta hai.
+
+**Kaun bana sakta hai (sirf dekhna kaafi nahi):** chef sirf apne station, General, ya bina-chef station ki line Start/Ready kar sakta hai — "All" view par bhi dusre station ki line greyed rehti hai, server 403 `error.notYourStation`. Ticket line par `can_cook`. Station chef "General" chip daba kar General ki dishes bana sakta hai. Head chef/owner/manager sab. "Abhi login nahi" wala fallback (shift/online status) Phase 2 mein.
 
 **Admin UI** (`KitchenQueuePage.tsx`, `KitchenTicketSlip.tsx`):
 - Upar toggle: **My stations** | **All**, aur station chips (BBQ, Fryer, General…).
@@ -168,7 +172,7 @@ Sab bilingual (en/ar locales), aur errors proper codes ke saath (`error.stationN
 
 | Hissa | Backend | Admin |
 |---|---|---|
-| Start / claim | `OrderItem.started_at` naya; Start par `started_by` + `started_at`. Dusra chef Start dabaye → 409 `error.itemAlreadyStarted` + `started_by_name`. Ready koi bhi chef us station ka kar sakta hai (break cover). | KDS line par "Ahmed is making this" / "You're making this"; error toast mein naam. |
+| Start / claim | `OrderItem.started_at` naya; Start par `started_by` + `started_at`. Dusra chef Start dabaye → 409 `error.itemAlreadyStarted` + `started_by_name`. **Badla gaya:** start ho chuki line sirf wohi chef Ready/void kar sakta hai (dusron ke buttons disabled, "Only Ahmed can finish it"); head chef/owner/manager finish kar sakte hain. | KDS line par "Ahmed is making this" / "You're making this"; error toast mein naam. |
 | Cashier override | `POST /api/orders/<id>/items/<item>/station/` `{station: id\|null}`. `OrderItem.station_moved_by` — fire hote waqt moved line apna station rakhti hai (station band ho gaya to General). Pending line: cashier/owner/manager/head chef. Fired (kisi ne start nahi kiya): sirf head chef/owner/manager. Preparing ke baad → 409. History event `item_station_moved`. Purane + naye station ke chefs ko notification. | Cashier screen (`OrdersPage`) par "Kitchen stations" panel: har waiting line kahan jayegi (dropdown) + "Moved" tag. Head chef KDS par fired line ka "Cook at: …" dropdown. Order item API ab `route_station` bhejti hai (fire se pehle bhi). |
 | Clock-in fallback | `Branch.kitchen_requires_clock_in` (default **off**). On ho to station "staffed" tab hi jab us ka koi chef clocked-in ho (`Shift.clock_out` null) — warna lines sab ko. Screens aur notifications dono isi rule par. Setup checklist assignment hi dekhta hai, clock-in nahi. `GET/PATCH /api/kitchen-stations/settings/`. | Kitchen stations page par toggle "Only clocked-in chefs count"; chef ke naam ke saath "(not clocked in)". KDS "mine" hint ab on-duty dekhta hai. |
 | Expo / head chef | `Staff.is_head_chef` (sirf kitchen role). Head chef = default `all`, har line ki notification, line move, handover. `GET /api/kds/tickets/?scope=expo` (head chef/owner/manager) — har station ki fired/preparing/ready lines + `all_ready`. `POST /api/orders/<id>/handover/` — sab ready ho to lines **ready hi rehti hain**, `OrderItem.handed_over_at` lagta hai (expo se hat jati hain), waiter ko `order:handed_over` ("pick it up"); served waiter hi table par karta hai. Warna 409 `error.orderNotReady`. | Staff form par "Head chef / expo" tick. KDS par "Expo / pass" tab: ready orders pehle, har line ka station + status, "Hand over to waiter" button. |

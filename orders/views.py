@@ -32,7 +32,7 @@ from customers.services import find_or_create_customer
 from inventory.services import ProductStockUnavailable, check_product_stock, deduct_stock_for_order_items
 from inventory.models import StockMovement, StockMovementReason
 from kitchen.models import KitchenStation
-from kitchen.routing import can_run_kitchen, fire_items, kitchen_recipient_ids, move_line, station_scope
+from kitchen.routing import can_cook, can_run_kitchen, cookable_station_ids, fire_items, kitchen_recipient_ids, move_line, station_scope
 from tables.models import Table
 from tables.services import parse_qr_payload
 
@@ -1032,7 +1032,10 @@ class KitchenTicketsView(ListAPIView):
         return self._station_scope
 
     def get_serializer_context(self):
-        return {**super().get_serializer_context(), "scope": self._scope(), "stations": self._stations()}
+        return {
+            **super().get_serializer_context(), "scope": self._scope(), "stations": self._stations(),
+            "cook_station_ids": cookable_station_ids(self.request.user),
+        }
 
     def get_queryset(self):
         qs = Order.objects.select_related("table", "assigned_waiter").prefetch_related(
@@ -1118,7 +1121,10 @@ class KitchenPrintView(APIView):
         ).prefetch_related(
             "items__variant", "items__product__recipe_items__inventory_item", "items__station", "items__started_by",
         ).order_by("opened_at", "pk")
-        context = {"request": request, "stations": scope, "only_item_ids": set(claimed)}
+        context = {
+            "request": request, "stations": scope, "only_item_ids": set(claimed),
+            "cook_station_ids": cookable_station_ids(request.user),
+        }
         return Response({"results": KitchenTicketOrderSerializer(orders, many=True, context=context).data})
 
 
@@ -1168,14 +1174,21 @@ class OrderItemStatusView(APIView):
         # the same order are still cooking; the parent is recomputed below.
         if new_status == OrderItemStatus.SERVED and item.status != OrderItemStatus.READY:
             return Response({"error": "error.itemNotReady"}, status=status.HTTP_409_CONFLICT)
-        # Two chefs of one station pressing Start on the same line: the second
-        # is told who already has it, so nobody makes it twice.
-        if new_status == OrderItemStatus.PREPARING and item.status != OrderItemStatus.FIRED and item.started_by_id:
-            return Response({
-                "error": "error.itemAlreadyStarted",
-                "started_by": item.started_by_id,
-                "started_by_name": item.started_by.name,
-            }, status=status.HTTP_409_CONFLICT)
+        # A line started by one chef is theirs: anyone else — a second Start
+        # included — is told who has it, so nobody makes it twice. A kitchen
+        # lead may still finish it (kitchen/routing.can_cook).
+        if request.user.role != StaffRole.WAITER:
+            cook_stations = cookable_station_ids(request.user)
+            taken = item.started_by_id is not None and item.started_by_id != request.user.pk
+            if taken and (cook_stations is not None or new_status == OrderItemStatus.PREPARING):
+                return Response({
+                    "error": "error.itemAlreadyStarted",
+                    "started_by": item.started_by_id,
+                    "started_by_name": item.started_by.name,
+                }, status=status.HTTP_409_CONFLICT)
+            # Another station's line stays that station's, even on the All view.
+            if not can_cook(request.user, item, cook_stations):
+                return Response({"error": "error.notYourStation"}, status=status.HTTP_403_FORBIDDEN)
         if item.status not in _KDS_ITEM_TRANSITIONS or new_status not in _KDS_ITEM_TRANSITIONS[item.status]:
             return Response({"error": "error.itemAlreadyFinal"}, status=status.HTTP_409_CONFLICT)
 
@@ -1265,7 +1278,7 @@ class OrderItemStationView(APIView):
             # Once in the kitchen, which chef cooks it is the kitchen lead's call.
             if item.status == OrderItemStatus.FIRED and not can_run_kitchen(request.user):
                 return Response({"error": "error.forbidden"}, status=status.HTTP_403_FORBIDDEN)
-            previous_name = item.station.name if item.station_id else None
+            previous_name = item.station.name_en if item.station_id else None
             previous = move_line(item, station, request.user)
             notice = _item_notice(item)
             record_order_event(order, request.user, "item_station_moved", details={
@@ -1275,7 +1288,7 @@ class OrderItemStationView(APIView):
                 "to": item.station_id,
                 # None is General.
                 "from_name": previous_name,
-                "to_name": station.name if station else None,
+                "to_name": station.name_en if station else None,
                 "actor_role": request.user.role,
             })
             if item.status == OrderItemStatus.FIRED and previous != item.station_id:

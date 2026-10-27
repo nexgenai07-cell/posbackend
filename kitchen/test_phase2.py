@@ -91,13 +91,52 @@ class ClaimTests(Phase2TestCase):
         self.assertEqual(response.json()["started_by_name"], "BbqChef")
         self.assertEqual(self.line(order_id, self.kebab).started_by_id, self.bbq_chef.pk)
 
-    def test_another_chef_of_the_station_may_still_finish_it(self):
+    def test_once_started_only_that_chef_finishes_it(self):
         order_id = self.fire(self.kebab)
         item_id = self.line(order_id, self.kebab).pk
         self.set_status(self.bbq_client, order_id, item_id, "preparing")
-        self.set_status(self.second_bbq_client, order_id, item_id, "ready")
+        response = self.item_status(self.second_bbq_client, order_id, item_id, "ready")
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["started_by_name"], "BbqChef")
+        ticket = next(t for t in self.tickets(self.second_bbq_client) if t["id"] == order_id)
+        self.assertEqual(ticket["items"][0]["started_by"], self.bbq_chef.pk)
+        self.set_status(self.bbq_client, order_id, item_id, "ready")
+        self.assertEqual(self.line(order_id, self.kebab).status, "ready")
+
+    def test_a_head_chef_may_finish_a_line_another_chef_started(self):
+        order_id = self.fire(self.kebab)
+        item_id = self.line(order_id, self.kebab).pk
+        self.set_status(self.bbq_client, order_id, item_id, "preparing")
+        self.set_status(self.head_client, order_id, item_id, "ready")
         line = self.line(order_id, self.kebab)
         self.assertEqual((line.status, line.started_by_id), ("ready", self.bbq_chef.pk))
+
+
+class StationRightsTests(Phase2TestCase):
+    """Seeing a line is not cooking it: another station's line stays theirs."""
+
+    def test_a_general_chef_cannot_cook_a_station_line_even_on_all(self):
+        order_id = self.fire(self.kebab, self.burger)
+        kebab, burger = self.line(order_id, self.kebab), self.line(order_id, self.burger)
+        ticket = next(t for t in self.tickets(self.kitchen_client, stations="all") if t["id"] == order_id)
+        lines = {item["name_en_snapshot"]: item for item in ticket["items"]}
+        self.assertFalse(lines["Kebab"]["can_cook"])
+        self.assertTrue(lines["Burger"]["can_cook"])
+        response = self.item_status(self.kitchen_client, order_id, kebab.pk, "preparing")
+        self.assertEqual(response.status_code, 403, response.content)
+        self.assertEqual(response.json()["error"], "error.notYourStation")
+        self.set_status(self.kitchen_client, order_id, burger.pk, "preparing")
+
+    def test_a_station_chef_may_cook_general_lines(self):
+        order_id = self.fire(self.burger)
+        item_id = self.line(order_id, self.burger).pk
+        self.assertIn(order_id, self.ticket_order_ids(self.bbq_client, stations="general"))
+        self.set_status(self.bbq_client, order_id, item_id, "preparing")
+        self.set_status(self.bbq_client, order_id, item_id, "ready")
+
+    def test_a_station_with_no_chef_is_anyones_to_cook(self):
+        order_id = self.fire(self.cake)
+        self.set_status(self.fryer_client, order_id, self.line(order_id, self.cake).pk, "preparing")
 
 
 # =========================================================================== 2
@@ -124,13 +163,24 @@ class MoveLineTests(Phase2TestCase):
         self.assertIn(order_id, self.ticket_order_ids(self.fryer_client))
         self.assertNotIn(order_id, self.ticket_order_ids(self.bbq_client))
 
-    def test_moving_to_general_puts_it_on_every_screen(self):
+    def test_moving_to_general_puts_it_on_the_general_screen(self):
         order_id = self.take_order(self.kebab)
         item_id = self.line(order_id, self.kebab).pk
         self.assertEqual(self.move(self.cashier_client, order_id, item_id, None).status_code, 200)
         self.send(order_id)
         self.assertIsNone(self.line(order_id, self.kebab).station_id)
-        self.assertIn(order_id, self.ticket_order_ids(self.fryer_client))
+        self.assertIn(order_id, self.ticket_order_ids(self.kitchen_client))
+        self.assertIn(order_id, self.ticket_order_ids(self.fryer_client, stations="general"))
+
+    def test_a_head_chef_moves_a_fired_line_to_general_and_back(self):
+        order_id = self.fire(self.kebab)
+        item_id = self.line(order_id, self.kebab).pk
+        self.assertEqual(self.move(self.head_client, order_id, item_id, None).status_code, 200)
+        self.assertIsNone(self.line(order_id, self.kebab).station_id)
+        self.assertEqual(self.move(self.head_client, order_id, item_id, self.fryer).status_code, 200)
+        events = Order.objects.get(pk=order_id).history.filter(event="item_station_moved").order_by("created_at")
+        self.assertEqual([(e.details["from_name"], e.details["to_name"]) for e in events],
+                         [("BBQ", None), (None, "Fryer")])
 
     def test_the_move_is_on_the_order_history(self):
         order_id = self.take_order(self.kebab)

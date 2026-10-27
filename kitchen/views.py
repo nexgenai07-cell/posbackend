@@ -11,7 +11,7 @@ from accounts.permissions import IsOwnerOrManager
 from common.mixins import BranchScopedQuerysetMixin
 
 from .models import KitchenStation
-from .routing import on_duty_chefs, unstaffed_station_ids
+from .routing import mine_includes_general, on_duty_chefs, unstaffed_station_ids
 from .serializers import KitchenSettingsSerializer, KitchenStationSerializer
 
 
@@ -107,7 +107,9 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=["get", "patch"], url_path="settings")
     def kitchen_settings(self, request):
         """The branch's kitchen routing settings — read by any staff (the
-        kitchen screen says whether clock-in counts), changed by owner/manager."""
+        kitchen screen says whether clock-in counts), changed by owner/manager.
+        A GET also says whether General is on the viewer's "mine"
+        (routing.mine_includes_general)."""
         if request.method == "PATCH":
             if not IsOwnerOrManager().has_permission(request, self):
                 self.permission_denied(request)
@@ -115,4 +117,7 @@ class KitchenStationViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
             serializer.is_valid(raise_exception=True)
             serializer.save()
             return Response(serializer.data)
-        return Response(KitchenSettingsSerializer(request.user.branch).data)
+        return Response({
+            **KitchenSettingsSerializer(request.user.branch).data,
+            "mine_includes_general": mine_includes_general(request.user),
+        })

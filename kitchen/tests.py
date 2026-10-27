@@ -13,7 +13,7 @@ from catalog.models import Category, Product
 from inventory.models import RecipeItem
 from orders.models import Order, OrderItem
 from orders.test_customer_session import CustomerSessionTestCase, make_staff
-from accounts.models import StaffRole
+from accounts.models import Staff, StaffRole
 
 from .models import KitchenStation
 from .routing import station_for
@@ -171,20 +171,38 @@ class SnapshotTests(StationTestCase):
 class ChefScreenTests(StationTestCase):
     """?stations= — mine, all, and a chosen few."""
 
-    def test_mine_shows_only_orders_with_my_lines_or_general(self):
+    def test_mine_shows_only_orders_with_my_lines(self):
+        # cls.kitchen works at no station, so General is theirs, not BBQ's or Fryer's.
         bbq_order = self.fire(self.kebab)
         fryer_order = self.fire(self.fries)
         general_order = self.fire(self.burger)
 
         bbq_seen = self.ticket_order_ids(self.bbq_client)
         self.assertIn(bbq_order, bbq_seen)
-        self.assertIn(general_order, bbq_seen)
+        self.assertNotIn(general_order, bbq_seen)
         self.assertNotIn(fryer_order, bbq_seen)
 
         fryer_seen = self.ticket_order_ids(self.fryer_client)
         self.assertIn(fryer_order, fryer_seen)
-        self.assertIn(general_order, fryer_seen)
+        self.assertNotIn(general_order, fryer_seen)
         self.assertNotIn(bbq_order, fryer_seen)
+
+        self.assertIn(general_order, self.ticket_order_ids(self.kitchen_client))
+
+    def test_with_no_general_chef_on_duty_general_is_everyones(self):
+        self.kitchen.stations.set([self.desserts])
+        general_order = self.fire(self.burger)
+        for client in (self.bbq_client, self.fryer_client, self.kitchen_client):
+            self.assertIn(general_order, self.ticket_order_ids(client))
+        self.assertTrue(self.bbq_client.get("/api/kitchen-stations/settings/").json()["mine_includes_general"])
+
+    def test_a_head_chef_takes_general_off_the_station_chefs(self):
+        self.kitchen.stations.set([self.desserts])
+        Staff.objects.filter(pk=self.kitchen.pk).update(is_head_chef=True)
+        general_order = self.fire(self.burger)
+        self.assertNotIn(general_order, self.ticket_order_ids(self.bbq_client))
+        self.assertIn(general_order, self.ticket_order_ids(self.kitchen_client, stations="mine"))
+        self.assertFalse(self.bbq_client.get("/api/kitchen-stations/settings/").json()["mine_includes_general"])
 
     def test_all_shows_everything_and_is_the_default_for_a_manager(self):
         bbq_order, fryer_order = self.fire(self.kebab), self.fire(self.fries)
@@ -204,7 +222,7 @@ class ChefScreenTests(StationTestCase):
         lines = {item["name_en_snapshot"]: item for item in ticket["items"]}
         self.assertEqual(set(lines), {"Kebab", "Fries", "Burger"})
         self.assertTrue(lines["Kebab"]["is_mine"])
-        self.assertTrue(lines["Burger"]["is_mine"])   # General is everyone's
+        self.assertFalse(lines["Burger"]["is_mine"])  # General is the stationless chef's
         self.assertFalse(lines["Fries"]["is_mine"])   # greyed on the BBQ screen
         self.assertEqual(lines["Kebab"]["station_name_en"], "BBQ")
         self.assertIsNone(lines["Burger"]["station"])
@@ -259,9 +277,9 @@ class NotificationTests(StationTestCase):
             ((self.kebab,), {self.bbq_chef.pk}),
             ((self.fries,), {self.fryer_chef.pk}),
             ((self.kebab, self.fries), {self.bbq_chef.pk, self.fryer_chef.pk}),
-            ((self.burger,), kitchen_staff),      # General is everyone's
+            ((self.burger,), {self.kitchen.pk}),  # General: the chef at no station
             ((self.cake,), kitchen_staff),        # nobody works at Desserts
-            ((self.kebab, self.burger), kitchen_staff),
+            ((self.kebab, self.burger), {self.bbq_chef.pk, self.kitchen.pk}),
         ):
             with self.subTest(dishes=[product.name_en for product in products]):
                 told = self.sent("order:kitchen_new", lambda: self.fire(*products))
