@@ -473,7 +473,7 @@ def delete_if_draft(order):
     Delete a staff order that never became anything: no customer, never past
     cashier review, no line ever (not even a voided one), no payment. That is
     a POS ticket whose every line was taken off again — keeping it would leave
-    an order number with nothing in it. Its bill goes too when nothing else is
+    an order number with nothing in it. (Soft-deleted, like every BaseModel.) Its bill goes too when nothing else is
     on it. Returns True if deleted. The caller must hold the order lock.
     """
     if (
@@ -485,9 +485,10 @@ def delete_if_draft(order):
     ):
         return False
     bill_id = order.bill_id
-    order.delete()
-    if bill_id:
-        Bill.objects.filter(pk=bill_id, orders__isnull=True, moyasar_payments__isnull=True).delete()
+    order.delete()  # soft delete: hidden everywhere, row kept
+    # Order.objects skips soft-deleted rows; a bill-level join would not.
+    if bill_id and not Order.objects.filter(bill_id=bill_id).exists():
+        Bill.objects.filter(pk=bill_id, moyasar_payments__isnull=True).delete()
     return True
 
 
