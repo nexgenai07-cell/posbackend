@@ -51,7 +51,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = [
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
-            "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at",
+            "price_snapshot", "quantity", "status", "notes", "fired_at", "ready_at", "station",
             "created_at", "updated_at", "is_new", "is_additional_batch",
         ]
         # Snapshot fields are write-once at creation (see AddOrderItemSerializer)
@@ -60,7 +60,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "order", "product", "variant", "name_en_snapshot", "name_ar_snapshot",
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
-            "price_snapshot", "status", "fired_at", "ready_at", "created_at", "updated_at",
+            "price_snapshot", "status", "fired_at", "ready_at", "station", "created_at", "updated_at",
         ]
 
 
@@ -226,6 +226,12 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
 
     recipe_multiplier = serializers.SerializerMethodField()
     recipe = serializers.SerializerMethodField()
+    # The station the line was sent to (null = General), and whether it is
+    # one this screen shows as its own (?stations=) — the rest are greyed.
+    station_name_en = serializers.CharField(source="station.name_en", default=None, read_only=True)
+    station_name_ar = serializers.CharField(source="station.name_ar", default=None, read_only=True)
+    is_mine = serializers.SerializerMethodField()
+    started_by_name = serializers.CharField(source="started_by.name", default=None, read_only=True)
 
     class Meta:
         model = OrderItem
@@ -234,8 +240,13 @@ class KitchenTicketItemSerializer(serializers.ModelSerializer):
             "variant_name_en_snapshot", "variant_name_ar_snapshot",
             "quantity", "status", "notes", "fired_at", "ready_at",
             "recipe_multiplier", "recipe",
+            "station", "station_name_en", "station_name_ar", "is_mine", "started_by", "started_by_name",
         ]
         read_only_fields = fields
+
+    def get_is_mine(self, item):
+        scope = self.context.get("stations")
+        return True if scope is None else scope.includes(item.station_id)
 
     def get_recipe_multiplier(self, item):
         return str(variant_multiplier(item.variant))
@@ -277,7 +288,7 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
         if self.context.get("scope") == "history":
             # The kitchen log: everything that was ever fired, in any outcome.
             eligible = [item for item in lines if item.fired_at is not None]
-            return KitchenTicketItemSerializer(eligible, many=True).data
+            return KitchenTicketItemSerializer(eligible, many=True, context=self.context).data
         new_ids = additional_batch_item_ids(order)
         cooking = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING)
         active_batch = [item for item in lines if item.status in cooking]
@@ -286,7 +297,7 @@ class KitchenTicketOrderSerializer(serializers.ModelSerializer):
             eligible = additional_batch
         else:
             eligible = active_batch or [item for item in lines if item.status == OrderItemStatus.READY]
-        return KitchenTicketItemSerializer(eligible, many=True).data
+        return KitchenTicketItemSerializer(eligible, many=True, context=self.context).data
 
 
 class PublicOrderItemSerializer(serializers.ModelSerializer):

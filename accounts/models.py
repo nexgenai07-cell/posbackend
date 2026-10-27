@@ -32,6 +32,9 @@ class Staff(BaseModel):
         "accounts.ShiftTemplate", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="assigned_staff",
     )
+    # The kitchen stations a kitchen chef works at; their screen shows these
+    # stations' lines plus General. Ignored for every other role.
+    stations = models.ManyToManyField("kitchen.KitchenStation", blank=True, related_name="chefs")
 
     # Not a Django auth user, but DRF's permission plumbing (and anything
     # checking request.user) expects these two attributes to exist.

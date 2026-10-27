@@ -38,6 +38,7 @@ urlpatterns = [
     path('api/', include('common.urls')),
     path('api/', include('accounts.urls')),
     path('api/', include('branches.urls')),
+    path('api/', include('kitchen.urls')),
     path('api/', include('catalog.urls')),
     path('api/', include('tables.urls')),
     path('api/', include('orders.urls')),

@@ -4,12 +4,38 @@ from rest_framework import serializers
 
 from common.validators import reject_branch_mismatch, require_bilingual_pair
 from inventory.services import check_product_stock
+from kitchen.models import KitchenStation
+from kitchen.serializers import validate_station_branch
 
 from .models import Category, Deal, DealWindow, Product, ProductVariant, Weekday
 
 
+def _station_ref(station):
+    return {"id": station.pk, "name_en": station.name_en, "name_ar": station.name_ar, "is_active": station.is_active}
+
+
+def effective_station(product):
+    """
+    Where this dish's lines go when fired, and why — shown on the menu and
+    product form so nobody has to work out the category fallback in their head.
+    `source` is "product" (set on the dish), "category" (the category's
+    default) or "general" (neither, or the station is switched off).
+    Mirrors kitchen.routing.stations_for_products.
+    """
+    if product.station_id and product.station.is_active:
+        return {"source": "product", "station": _station_ref(product.station)}
+    category_station = product.category.station if product.category_id else None
+    if category_station is not None and category_station.is_active:
+        return {"source": "category", "station": _station_ref(category_station)}
+    return {"source": "general", "station": None}
+
+
 class CategorySerializer(serializers.ModelSerializer):
     product_count = serializers.IntegerField(read_only=True, default=0)
+    station = serializers.PrimaryKeyRelatedField(
+        queryset=KitchenStation.objects.all(), allow_null=True, required=False,
+        error_messages={"does_not_exist": "error.stationNotFound"},
+    )
     # Neither language is unconditionally required — see require_bilingual_pair
     # below, which only requires whichever one the admin UI has active.
     name_en = serializers.CharField(required=False, allow_blank=True)
@@ -17,8 +43,11 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ["id", "branch", "name_en", "name_ar", "sort_order", "created_at", "updated_at", "product_count"]
+        fields = ["id", "branch", "name_en", "name_ar", "sort_order", "station", "created_at", "updated_at", "product_count"]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_station(self, value):
+        return validate_station_branch(value, self.context.get("request"))
 
     def validate(self, attrs):
         branch = attrs.get("branch", getattr(self.instance, "branch", None))
@@ -175,6 +204,13 @@ class ProductSerializer(serializers.ModelSerializer):
         queryset=Category.objects.all(),
         error_messages={"required": "error.categoryRequired", "does_not_exist": "error.categoryRequired"},
     )
+    # The dish's own station; null follows the category. `effective_station`
+    # is where its lines actually go.
+    station = serializers.PrimaryKeyRelatedField(
+        queryset=KitchenStation.objects.all(), allow_null=True, required=False,
+        error_messages={"does_not_exist": "error.stationNotFound"},
+    )
+    effective_station = serializers.SerializerMethodField()
     deal = DealSerializer(read_only=True)
     is_orderable = serializers.SerializerMethodField()
     # Whole units current stock can make (base recipe), so a POS can disable
@@ -192,10 +228,16 @@ class ProductSerializer(serializers.ModelSerializer):
             "id", "branch", "category", "name_en", "name_ar",
             "description_en", "description_ar", "price", "cost_price",
             "image", "is_available", "is_orderable", "available_quantity", "badge", "days", "deal",
-            "variants", "costing",
+            "variants", "costing", "station", "effective_station",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "variants", "costing", "created_at", "updated_at"]
+        read_only_fields = ["id", "variants", "costing", "effective_station", "created_at", "updated_at"]
+
+    def validate_station(self, value):
+        return validate_station_branch(value, self.context.get("request"))
+
+    def get_effective_station(self, product):
+        return effective_station(product)
 
     def validate_days(self, value):
         valid_days = {choice for choice, _ in Weekday.choices}

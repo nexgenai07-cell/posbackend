@@ -3,8 +3,9 @@ from django.db import transaction
 
 from branches.models import Branch
 from common.validators import reject_branch_mismatch
+from kitchen.models import KitchenStation
 
-from .models import Shift, ShiftTemplate, Staff
+from .models import Shift, ShiftTemplate, Staff, StaffRole
 
 
 class PinLoginSerializer(serializers.Serializer):
@@ -40,15 +41,23 @@ class LoginStaffChoiceSerializer(serializers.ModelSerializer):
 
 class StaffSerializer(serializers.ModelSerializer):
     pin = serializers.CharField(write_only=True, required=False)
+    # Kitchen stations this chef works at. Only kept for the kitchen role:
+    # anyone else is saved with none.
+    stations = serializers.PrimaryKeyRelatedField(
+        queryset=KitchenStation.objects.all(), many=True, required=False,
+        error_messages={"does_not_exist": "error.stationNotFound"},
+    )
 
     class Meta:
         model = Staff
-        fields = ["id", "branch", "name", "role", "pin", "is_active", "created_at", "updated_at"]
+        fields = ["id", "branch", "name", "role", "pin", "is_active", "stations", "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
 
     def validate(self, attrs):
         branch = attrs.get("branch") or getattr(self.instance, "branch", None)
         reject_branch_mismatch(self.context.get("request"), branch)
+        if any(station.branch_id != getattr(branch, "pk", None) for station in attrs.get("stations", [])):
+            raise serializers.ValidationError({"stations": "error.stationBranchMismatch"})
 
         pin = attrs.get("pin")
         if pin:
@@ -59,20 +68,32 @@ class StaffSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"pin": "error.pinRequired"})
         return attrs
 
+    def _save_stations(self, staff, stations):
+        if staff.role != StaffRole.KITCHEN:
+            staff.stations.clear()
+        elif stations is not None:
+            staff.stations.set(stations)
+
     def create(self, validated_data):
         pin = validated_data.pop("pin")
-        staff = Staff(**validated_data)
-        staff.set_pin(pin)
-        staff.save()
+        stations = validated_data.pop("stations", None)
+        with transaction.atomic():
+            staff = Staff(**validated_data)
+            staff.set_pin(pin)
+            staff.save()
+            self._save_stations(staff, stations)
         return staff
 
     def update(self, instance, validated_data):
         pin = validated_data.pop("pin", None)
+        stations = validated_data.pop("stations", None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         if pin:
             instance.set_pin(pin)
-        instance.save()
+        with transaction.atomic():
+            instance.save()
+            self._save_stations(instance, stations)
         return instance
 
 

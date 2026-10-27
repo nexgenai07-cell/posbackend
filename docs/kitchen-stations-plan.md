@@ -1,0 +1,182 @@
+# Kitchen Stations — Plan
+
+> Status: **Phase 1 code ho gaya** — backend (`kitchen` app, routing, KDS `?stations=`, notifications, bulk-station, import, tests) aur admin (station picker, category/product/staff forms, `/admin/kitchen-stations`, menu column + bulk set, KDS chips + greyed lines, setup checklist, en/ar). Migrations abhi chalni hain. Phase 2/3 baaqi.
+> Repos: `restaurant-backend`, `restaurant-admin`. `burger_web` (customer site) mein koi change nahi — customer ko ek hi order dikhta rahega.
+
+---
+
+## 1. Masla
+
+Abhi kitchen screen (`KitchenTicketsView`, `/kds`) par **har kitchen staff ko har order ki har line** dikhti hai. Lekin har chef alag cheez banata hai — BBQ ka expert BBQ, koi fryer, koi desserts. Chahiye ke:
+
+- Har chef ko **sirf apni cheezein** dikhein (jaise waiter ko sirf apne orders dikhte hain).
+- Order **split na ho** — customer, waiter, cashier aur bill ke liye ek hi order rahe.
+- Agar kuch set nahi kiya gaya, to **poora order as it is kitchen mein** jaye (koi cheez kabhi atke nahi).
+
+## 2. Solution — Kitchen Stations
+
+Har dish ek **station** (BBQ, Grill, Fryer, Desserts, Drinks…) se judi hoti hai. Har chef ek ya zyada stations mein hota hai. Order kitchen jate waqt **har line khud apne station par** chali jati hai — cashier ko har order par kuch chunna nahi padta.
+
+```
+Product "Mixed Grill"  ──► Station: BBQ   ──► Chef Ahmed, Chef Bilal (BBQ)
+Product "Fries"        ──► Station: Fryer ──► Chef Sana (Fryer)
+Product "Cola"         ──► (koi station nahi) ──► General ──► saare kitchen staff
+
+Order #20: 2× Mixed Grill, 1× Fries, 1× Cola
+  Ahmed/Bilal ki screen: 2× Mixed Grill   (+ greyed: Fries · Fryer, Cola · General)
+  Sana ki screen:        1× Fries         (+ greyed: Mixed Grill · BBQ, Cola · General)
+  General:               1× Cola
+Waiter/cashier/customer: ek hi Order #20, har line ka apna status.
+```
+
+### Kyun station, kisi ek chef ko direct assign kyun nahi
+- Ek station par 2 chef ho sakte hain → dono ko dikhe, jo pehle "Start" kare us ka naam lag jaye.
+- Chef break / chhutti par ho → order us ke naam par nahi atakta, station ke dusre chef ko dikhta hai.
+- Cashier par rush time mein har order ka bojh nahi.
+
+## 3. Pehle se kya maujood hai (reuse hoga)
+
+| Cheez | Kahan | Faida |
+|---|---|---|
+| Har line ka apna status (pending → fired → preparing → ready → served) | `OrderItem.status`, `OrderItemStatusView` | "BBQ ready, Fries abhi ban rahi" pehle se support hai |
+| Order status lines se calculate hota hai | `recompute_order_status_from_items` | Order tab ready jab saari stations ki lines ready |
+| `fired_at`, `ready_at` har line par | `OrderItem` | Phase 3 mein station-wise time report muft |
+| Har staff ka apna realtime group | `staff_<id>_events` (`realtime/consumers.py`) | Notification sirf us station ke chefs ko bheji ja sakti hai |
+| Kitchen ko notification | `_notify_role_staff(..., {StaffRole.KITCHEN})` | Isi ko station-aware banana hai |
+| Setup checklist | `restaurant-admin/src/components/dashboard/SetupChecklist.tsx` | Naya step "Kitchen stations" |
+| Excel import | `imports/importers.py` | Products ke saath `station` column |
+
+---
+
+## 4. Phase 1 — Detailed plan (core: setup + auto routing + chef ki screen)
+
+### 4.1 Setup flow (user ki taraf se)
+
+1. **Product add/edit karte waqt** "Kitchen station" dropdown.
+   - List mein station na ho to wahin **"+ New station"** → naam (English/Arabic) likho → ban kar select ho jaye. Alag page par jana zaroori nahi.
+   - Khaali chhoda → **General** (saare kitchen staff ko dikhta hai).
+2. **Category par default station.** "BBQ Platters" category = BBQ → us category mein naya product add karo to station pehle se BBQ chuna hua aaye (badal sakte ho). Product ka apna station category se upar (override).
+3. **Staff add/edit** — role Kitchen ho to **"Stations"** checkboxes. Ek chef ke kai stations ho sakte hain.
+4. **Purane products** (menu pehle se bana hai):
+   - Menu page par **bulk assign**: products select karo → "Set station: BBQ".
+   - Excel import mein **`station`** column (naam se match; naya naam ho to station ban jaye ya error — decision #4 dekhein).
+5. **Setup checklist** mein step: "Kitchen stations" — dikhaye ke kitne products bina station ke hain aur kis station par koi chef nahi.
+
+### 4.2 Data model (backend)
+
+**Naya model** `kitchen.KitchenStation` (nayi app `kitchen`, ya `catalog` ke andar — decision #5):
+
+| Field | Type | Note |
+|---|---|---|
+| `branch` | FK Branch | branch-scoped, baaqi models ki tarah |
+| `name_en`, `name_ar` | CharField | bilingual, `require_bilingual_pair` jaisa rule |
+| `sort_order` | int | screen par tabs ka order |
+| `is_active` | bool | delete ki jagah band karna (purane orders ka record bacha rahe) |
+
+Unique: `(branch, name_en)` case/space-insensitive — tables wale label check jaisa.
+
+**Fields jo add honge:**
+
+| Model | Field | Note |
+|---|---|---|
+| `Category` | `station` FK null | default station |
+| `Product` | `station` FK null | override; null = category ka, woh bhi null = General |
+| `Staff` | `stations` M2M | sirf Kitchen role ke liye meaningful |
+| `OrderItem` | `station` FK null | **kitchen bhejte waqt snapshot** — baad mein product ka station badle to purane/chalte orders na badlein. null = General |
+| `OrderItem` | `started_by` FK Staff null | "Start" dabane wala chef (Phase 2 mein UI, field Phase 1 mein hi) |
+
+"General" ek **asli row nahi** — `station = null` ka matlab General. Is se "station delete ho gaya" ya "set hi nahi" dono khud General mein gir jate hain.
+
+Migrations: schema + `nothing to backfill` (purani lines null = General, jaisa abhi sab ko dikhta hai). Aap ke rule ke mutabiq migrations aakhir mein ek saath chalengi.
+
+### 4.3 Routing — line station tak kaise jati hai
+
+Ek helper `resolve_station(product)` → `product.station or product.category.station or None`.
+
+Jahan line **fire** hoti hai (pending → fired), wahin `item.station = resolve_station(item.product)` save ho:
+- `SendToKitchenView` (waiter/cashier "Send to kitchen")
+- `OrderItemsView.post` — dispatched order mein add hua item seedha fire hota hai
+- cashier review / koi bhi aur jagah jo `status = FIRED` + `fired_at` set karti hai (ek shared helper `fire_items(items)` bana kar sab ko us se guzaarna — taake koi raasta station bhool na jaye)
+
+Agar station `is_active=False` ho → null (General).
+
+### 4.4 Chef ki screen (KDS)
+
+**API** — `GET /api/orders/kitchen/` (`KitchenTicketsView`) mein:
+- `?stations=mine` (kitchen staff ka default): sirf woh orders jin mein **login chef ke stations ki ya General ki** active line ho.
+- `?stations=all`: sab (head chef / manager / owner).
+- `?stations=<id>,<id>`: kuch khaas stations.
+- Response mein har line ke saath `station` (id + naam) — taake frontend apni lines highlight aur baaqi greyed dikha sake.
+
+**Fallback:** kisi station par koi chef **assign hi nahi** → us ki lines General mein bhi dikhein (sab ko). "Abhi login nahi" wala fallback (shift/online status) Phase 2 mein.
+
+**Admin UI** (`KitchenQueuePage.tsx`, `KitchenTicketSlip.tsx`):
+- Upar toggle: **My stations** | **All**, aur station chips (BBQ, Fryer, General…).
+- Ticket par apni lines normal; usi order ki dusri stations ki lines **greyed** — "Fries · Fryer · cooking" — taake chef apni cheez time kar sake (decision #2).
+- Ticket print (`KitchenTicketSlip`) sirf apni station ki lines (station printers Phase 3).
+
+### 4.5 Realtime notifications
+
+`_notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, ...)` ki jagah station-aware helper:
+- Lines ke stations nikaalo → un stations ke chefs + agar koi line General ki ho to saare kitchen staff.
+- Station par koi chef nahi → saare kitchen staff (fallback ke mutabiq).
+- `order:changed` / `order:cancelled` bhi sirf us order ki lines wale stations ko.
+
+Existing `staff_<id>_events` groups hi use honge — naya websocket group zaroori nahi.
+
+### 4.6 Admin screens (setup)
+
+| Screen | Change |
+|---|---|
+| Product form (`ProductFormPage.tsx`) | Station dropdown + "+ New station" inline; category ka default pehle se select |
+| Category form (`EditCategoryPage.tsx` / new) | Default station dropdown |
+| Menu list (`MenuPage.tsx`) | Station column + bulk "Set station" |
+| Staff form (`EditStaffPage.tsx` / new) | Kitchen role par Stations checkboxes |
+| Naya page: **Kitchen stations** (`/admin/kitchen-stations`) | List, add/rename, band karna, har station ke chefs aur dishes ki ginti |
+| Setup checklist | "Kitchen stations" step |
+| Excel import | `station` column (products sheet) |
+
+Sab bilingual (en/ar locales), aur errors proper codes ke saath (`error.stationNameExists` waghera — en/ar translations ke saath).
+
+### 4.7 Tests (backend)
+
+- Product → category → General resolve order.
+- Fire hote waqt station snapshot; baad mein product ka station badla to line nahi badalti.
+- `?stations=mine` sirf apni + General lines wale orders; `all` sab.
+- Station par chef nahi → General mein bhi dikhe.
+- Notification sirf sahi chefs ko.
+- Station `is_active=False` → naye fire General mein.
+- Branch scoping: dusri branch ka station assign na ho sake.
+- Order status: ek station ready, dusri cooking → order "preparing"; sab ready → "ready" (existing behaviour bachta hai).
+
+### 4.8 Phase 1 mein kya **nahi**
+- "Start" par chef ka naam UI mein, cashier override, "abhi login nahi" fallback → Phase 2
+- Station printers, station-wise reports → Phase 3
+- Customer site — koi change nahi
+
+---
+
+## 5. Phase 2 — Kaam ki taqseem aur override
+
+- **Start / claim:** chef "Start" dabaye → `started_by` = woh chef, line "preparing". Usi station ke dusre chef ko "Ahmed is making this" dikhe — do log ek cheez na banayein.
+- **Cashier override:** waiter assign karte waqt cashier dekhe order kin stations par ja raha hai; kisi line ko dusre station par bhej sake (jaise BBQ chef aaj chhutti par).
+- **Koi chef login nahi** fallback: station ka koi chef us waqt online/on-shift nahi (attendance clock-in pehle se hai — `accounts` shifts) → lines General mein bhi.
+- **Expo / head chef view:** saari stations ek saath, order "sab ready" hone par waiter ko handover.
+
+## 6. Phase 3 — Hardware aur reports
+
+- **Station printers:** har station ka apna kitchen printer — fire hote hi us station ki lines us printer par.
+- **Reports:** har station ka average prep time (`fired_at` → `ready_at`), har chef ki lines, rush hours mein kaun sa station slow.
+
+---
+
+## 7. Aap ke decisions (OK se pehle)
+
+| # | Sawal | Mera default (agar aap kuch na kahein) |
+|---|---|---|
+| 1 | Assign station ko ya khaas chef ko? | **Station** |
+| 2 | Chef ko usi order ki dusri stations ki items greyed mein dikhein? | **Haan, greyed** |
+| 3 | Head chef / expo hai jo saari stations dekhe? | Owner/Manager + "All" toggle har kitchen staff ke paas; alag expo role Phase 2 |
+| 4 | Import mein naya station naam aaye to? | **Station khud ban jaye** (import preview mein dikhe ke naya bana) |
+| 5 | Station model kahan? | Nayi app **`kitchen`** (catalog aur orders dono use karte hain) |
+| 6 | Ek dish ke variants (Half KG / 1 KG) alag stations par? | **Nahi** — station product ka; zaroorat ho to baad mein |

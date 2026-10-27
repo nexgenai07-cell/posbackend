@@ -28,6 +28,7 @@ from customers.models import Customer
 from customers.services import find_or_create_customer
 from inventory.services import ProductStockUnavailable, check_product_stock, deduct_stock_for_order_items
 from inventory.models import StockMovement, StockMovementReason
+from kitchen.routing import fire_items, kitchen_recipient_ids, station_scope
 from tables.models import Table
 from tables.services import parse_qr_payload
 
@@ -176,24 +177,23 @@ def _set_payment_status(order, value, actor, event, details=None):
 
 
 def _dispatch_confirmed_order(order, actor, *, move_order_to_sent=True):
-    """Fire only pending items after waiter confirmation; unconfirmed items stay off KDS."""
+    """Fire only pending items after waiter confirmation; unconfirmed items stay off KDS.
+    Returns (error response or None, the lines fired)."""
     pending_items = list(
         order.items.select_for_update().filter(status=OrderItemStatus.PENDING).select_related("product")
     )
     if not pending_items:
-        return Response({"error": "error.noPendingItems"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"error": "error.noPendingItems"}, status=status.HTTP_400_BAD_REQUEST), []
     deduct_stock_for_order_items(pending_items)
-    OrderItem.objects.filter(pk__in=[item.pk for item in pending_items]).update(
-        status=OrderItemStatus.FIRED, fired_at=timezone.now()
-    )
+    fire_items(pending_items)
     details = {"item_count": len(pending_items)}
     if move_order_to_sent:
         conflict = _transition_or_conflict(order, OrderStatus.SENT, actor, "sent_to_kitchen", details=details)
         if conflict:
-            return conflict
+            return conflict, pending_items
     else:
         record_order_event(order, actor, "additional_items_sent_to_kitchen", details=details)
-    return None
+    return None, pending_items
 
 
 def _order_event_payload(order, actor_id=None, staff_id=None, **extra):
@@ -219,6 +219,26 @@ def _notify_role_staff(order, event_name, roles, actor_id=None, **extra):
     recipients = recipients.values_list("pk", flat=True)
     for staff_id in recipients:
         publish_staff_event(staff_id, event_name, _order_event_payload(order, actor_id, staff_id, event_id=event_id, **extra))
+
+
+_KITCHEN_LINE_STATUSES = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
+
+
+def _notify_kitchen(order, event_name, actor_id=None, lines=None, **extra):
+    """
+    Tell the kitchen about `lines` (default: the order's lines still in the
+    kitchen) — only the chefs of those lines' stations, or every kitchen chef
+    when a line is General or its station has nobody (kitchen/routing.py).
+    Each event carries the station ids involved; None stands for General.
+    """
+    if lines is None:
+        lines = [item for item in order.items.all() if item.status in _KITCHEN_LINE_STATUSES]
+    station_ids = sorted({line.station_id for line in lines}, key=lambda value: (value is None, value or 0))
+    event_id = uuid.uuid4().hex
+    for staff_id in kitchen_recipient_ids(order.branch_id, lines) - {actor_id}:
+        publish_staff_event(staff_id, event_name, _order_event_payload(
+            order, actor_id, staff_id, event_id=event_id, station_ids=station_ids, **extra,
+        ))
 
 
 def _notify_order_staff(order, event_name, actor_id=None, staff_ids=None, **extra):
@@ -440,10 +460,7 @@ class CashierReviewView(APIView):
                     if not pending_items:
                         return Response({"error": "error.orderNotAwaitingCashier"}, status=status.HTTP_409_CONFLICT)
                     deduct_stock_for_order_items(pending_items)
-                    now = timezone.now()
-                    OrderItem.objects.filter(pk__in=[item.pk for item in pending_items]).update(
-                        status=OrderItemStatus.FIRED, fired_at=now,
-                    )
+                    fire_items(pending_items)
                     item_details = [_item_notice(item) for item in pending_items]
                     record_order_event(order, request.user, "customer_items_reviewed_and_sent", details={
                         "item_ids": [item.pk for item in pending_items],
@@ -452,7 +469,7 @@ class CashierReviewView(APIView):
                     })
                     order._prefetched_objects_cache.pop("items", None)
                     recompute_order_status_from_items(order, request.user, event="additional_items_started")
-                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=item_details)
+                    _notify_kitchen(order, "order:kitchen_new", request.user.pk, pending_items, items=item_details)
                     _notify_order_staff(order, "order:new_items", request.user.pk,
                                         {order.assigned_waiter_id} - {None}, items=item_details)
                 else:
@@ -535,11 +552,11 @@ class WaiterConfirmView(APIView):
                 )
                 if conflict:
                     return conflict
-                dispatch_error = _dispatch_confirmed_order(order, request.user)
+                dispatch_error, fired = _dispatch_confirmed_order(order, request.user)
                 if dispatch_error:
                     transaction.set_rollback(True)
                 else:
-                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
+                    _notify_kitchen(order, "order:kitchen_new", request.user.pk, fired)
                     _notify_order_staff(order, "order:confirmed", request.user.pk, {order.assigned_cashier_id} - {None})
                     _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         except ProductStockUnavailable:
@@ -603,7 +620,7 @@ class CancelOrderView(APIView):
             paid = sum((payment.amount for payment in order.payments.all()), Decimal("0"))
             if is_admin and not reason and (order.status not in _BEFORE_KITCHEN or paid > 0):
                 return Response({"error": "error.cancelReasonRequired"}, status=status.HTTP_400_BAD_REQUEST)
-            kitchen_was_notified = order.items.filter(status__in=(OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)).exists()
+            kitchen_lines = list(order.items.filter(status__in=_KITCHEN_LINE_STATUSES))
             live_items = list(order.items.exclude(status=OrderItemStatus.VOIDED))
             total = sum((item.price_snapshot * item.quantity for item in live_items), Decimal("0"))
             # Dispatched lines already took their ingredients out of stock; the
@@ -643,8 +660,8 @@ class CancelOrderView(APIView):
                 from zatca import pos as zatca_pos
                 zatca_pos.order_cancelled(order.pk, actor=request.user)
             _notify_order_staff(order, "order:cancelled", request.user.pk)
-            if kitchen_was_notified:
-                _notify_role_staff(order, "order:cancelled", {StaffRole.KITCHEN}, request.user.pk)
+            if kitchen_lines:
+                _notify_kitchen(order, "order:cancelled", request.user.pk, kitchen_lines)
             _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk)
         return Response(OrderSerializer(_order_queryset().get(pk=order.pk)).data)
 
@@ -705,12 +722,10 @@ class OrderItemsView(APIView):
                     except ProductStockUnavailable:
                         transaction.set_rollback(True)
                         return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
-                    item.status = OrderItemStatus.FIRED
-                    item.fired_at = timezone.now()
-                    item.save(update_fields=["status", "fired_at", "updated_at"])
+                    fire_items([item])
                     record_order_event(order, request.user, "waiter_item_added_and_sent", details=details)
                     recompute_order_status_from_items(order, request.user, event="additional_items_started")
-                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=details["items"])
+                    _notify_kitchen(order, "order:kitchen_new", request.user.pk, [item], items=details["items"])
                     _notify_role_staff(order, "order:new_items", {StaffRole.CASHIER}, request.user.pk, items=details["items"])
                     _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk, items=details["items"])
                 else:
@@ -723,12 +738,10 @@ class OrderItemsView(APIView):
                 except ProductStockUnavailable:
                     transaction.set_rollback(True)
                     return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
-                item.status = OrderItemStatus.FIRED
-                item.fired_at = timezone.now()
-                item.save(update_fields=["status", "fired_at", "updated_at"])
+                fire_items([item])
                 record_order_event(order, request.user, "cashier_item_added_and_sent", details=details)
                 recompute_order_status_from_items(order, request.user, event="additional_items_added")
-                _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk, items=details["items"])
+                _notify_kitchen(order, "order:kitchen_new", request.user.pk, [item], items=details["items"])
                 _notify_order_staff(order, "order:new_items", request.user.pk, {order.assigned_waiter_id} - {None}, items=details["items"])
                 _notify_role_staff(order, "order:admin_update", {StaffRole.OWNER, StaffRole.MANAGER}, request.user.pk, items=details["items"])
             else:
@@ -853,7 +866,7 @@ class SendToKitchenView(APIView):
                     return Response({"error": "error.orderTransitionInvalid"}, status=status.HTTP_409_CONFLICT)
                 if not is_additional_batch and order.status != OrderStatus.CONFIRMED:
                     return Response({"error": "error.orderTransitionInvalid"}, status=status.HTTP_409_CONFLICT)
-                dispatch_error = _dispatch_confirmed_order(
+                dispatch_error, fired = _dispatch_confirmed_order(
                     order, request.user, move_order_to_sent=not is_additional_batch,
                 )
                 if dispatch_error:
@@ -861,7 +874,7 @@ class SendToKitchenView(APIView):
                 if is_additional_batch:
                     getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
                     recompute_order_status_from_items(order, request.user, event="additional_items_started")
-                    _notify_role_staff(order, "order:kitchen_new", {StaffRole.KITCHEN}, request.user.pk)
+                    _notify_kitchen(order, "order:kitchen_new", request.user.pk, fired)
                     _notify_order_staff(order, "order:changed", request.user.pk)
         except ProductStockUnavailable:
             return Response({"error": "error.productUnavailable"}, status=status.HTTP_409_CONFLICT)
@@ -970,7 +983,12 @@ class KitchenTicketsView(ListAPIView):
     ?scope=history switches to the kitchen log: every order that had anything
     fired to the kitchen, newest first, with all of its fired lines whatever
     became of them. Either scope narrows by ?from= / ?to= (opened date),
-    ?table=<id>, ?type=dine_in|takeaway|qr|web and ?search=<order number>."""
+    ?table=<id>, ?type=dine_in|takeaway|qr|web and ?search=<order number>.
+
+    ?stations= picks whose lines count (kitchen/routing.station_scope): a
+    kitchen chef defaults to `mine`, owners and managers to `all`. Each line
+    says its station and `is_mine`, so the other stations' lines of the same
+    order can be shown greyed."""
 
     serializer_class = KitchenTicketOrderSerializer
     permission_classes = [IsKitchenStaff]
@@ -978,18 +996,29 @@ class KitchenTicketsView(ListAPIView):
     def _scope(self):
         return "history" if self.request.query_params.get("scope") == "history" else "live"
 
+    def _stations(self):
+        if not hasattr(self, "_station_scope"):
+            self._station_scope = station_scope(self.request.user, self.request.query_params.get("stations"))
+        return self._station_scope
+
     def get_serializer_context(self):
-        return {**super().get_serializer_context(), "scope": self._scope()}
+        return {**super().get_serializer_context(), "scope": self._scope(), "stations": self._stations()}
 
     def get_queryset(self):
         qs = Order.objects.select_related("table", "assigned_waiter").prefetch_related(
             "history", "items__variant", "items__product__recipe_items__inventory_item",
+            "items__station", "items__started_by",
         ).filter(branch=self.request.user.branch)
+        # ?stations=mine|all|<ids>[,general] — only orders with a line at one
+        # of these stations. The station condition sits in the same filter()
+        # as the line condition so both apply to the SAME line.
+        station_q = self._stations().item_q()
         if self._scope() == "history":
-            qs = qs.filter(items__fired_at__isnull=False).distinct().order_by("-opened_at")
+            line_q = Q(items__fired_at__isnull=False)
+            qs = qs.filter(line_q & station_q if station_q else line_q).distinct().order_by("-opened_at")
         else:
-            active = (OrderItemStatus.FIRED, OrderItemStatus.PREPARING, OrderItemStatus.READY)
-            qs = qs.filter(items__status__in=active).distinct()
+            line_q = Q(items__status__in=_KITCHEN_LINE_STATUSES)
+            qs = qs.filter(line_q & station_q if station_q else line_q).distinct()
 
         params = self.request.query_params
         if params.get("table"):
@@ -1078,6 +1107,9 @@ class OrderItemStatusView(APIView):
             })
         item.status = new_status
         update_fields = ["status", "updated_at"]
+        if new_status == OrderItemStatus.PREPARING and item.started_by_id is None:
+            item.started_by = request.user
+            update_fields.append("started_by")
         if new_status == OrderItemStatus.READY and item.ready_at is None:
             item.ready_at = timezone.now()
             update_fields.append("ready_at")
@@ -1091,7 +1123,7 @@ class OrderItemStatusView(APIView):
         )
         getattr(order, "_prefetched_objects_cache", {}).pop("items", None)
         _sync_order_kitchen_status(order, request.user)
-        _notify_role_staff(order, "order:changed", {StaffRole.KITCHEN}, request.user.pk, change_id=item.pk, item_status=new_status)
+        _notify_kitchen(order, "order:changed", request.user.pk, change_id=item.pk, item_status=new_status)
         if (new_status == OrderItemStatus.PREPARING and previous_order_status != OrderStatus.PREPARING
                 and order.status == OrderStatus.PREPARING):
             _notify_order_staff(order, "order:preparing", request.user.pk)

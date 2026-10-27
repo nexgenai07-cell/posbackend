@@ -37,6 +37,7 @@ from openpyxl.utils import get_column_letter, quote_sheetname
 
 from catalog.models import Category, Product, ProductVariant
 from inventory.models import InventoryItem, RecipeItem, StockMovementReason
+from kitchen.models import KitchenStation
 from inventory.services import adjust_stock, units_compatible
 from purchasing.models import Supplier
 
@@ -348,7 +349,7 @@ class StockImporter(SheetImporter):
 
 # ── Menu (products and their sizes) ─────────────────────────────────────────
 
-PRODUCT_FIELDS = ("category", "name_en", "name_ar", "description_en", "description_ar", "price", "available")
+PRODUCT_FIELDS = ("category", "name_en", "name_ar", "description_en", "description_ar", "price", "available", "station")
 
 
 class ProductImporter(SheetImporter):
@@ -363,6 +364,7 @@ class ProductImporter(SheetImporter):
         Column("description_ar", "Description (Arabic)", "Optional.", width=32),
         Column("price", "Price", "Menu price, number only. Required for a new dish. For a dish with sizes, the price of the regular size.", width=10, example="1400", number="zero"),
         Column("available", "Available", "Yes or No. Leave empty to keep it as it is (new dishes are available).", width=11, example="Yes", choices="YesNo", strict=True),
+        Column("station", "Kitchen station", "Which part of the kitchen cooks this dish, so only those chefs see it. Pick from the list, or type a new station name to add it. Leave empty and the dish follows its category, or goes to every kitchen screen.", width=18, example="BBQ", choices="Stations"),
         Column("size_en", "Size (English)", "Only for dishes sold in sizes: one row per size, repeating the dish name. e.g. Half KG / 1 KG.", width=16, example="1 KG"),
         Column("size_ar", "Size (Arabic)", "Optional Arabic size name.", width=14),
         Column("size_price", "Size price", "Price of this size, number only. Required for a new size.", width=11, example="2600", number="zero"),
@@ -385,6 +387,7 @@ class ProductImporter(SheetImporter):
                 "name_en": product.name_en, "name_ar": product.name_ar,
                 "description_en": product.description_en, "description_ar": product.description_ar,
                 "price": product.price, "available": "Yes" if product.is_available else "No",
+                "station": (product.station.name_en or product.station.name_ar) if product.station_id else "",
             }
             variants = list(product.variants.all())
             if not variants:
@@ -396,9 +399,9 @@ class ProductImporter(SheetImporter):
 
     def _read(self, row, result):
         values = row.values
-        parsed = {key: text(values.get(key)) for key in ("category", "name_en", "name_ar", "size_en", "size_ar")}
+        parsed = {key: text(values.get(key)) for key in ("category", "name_en", "name_ar", "size_en", "size_ar", "station")}
         parsed.update({key: paragraph(values.get(key)) for key in ("description_en", "description_ar")})
-        for key, max_length in (("category", 255), ("name_en", 255), ("name_ar", 255), ("size_en", 120), ("size_ar", 120)):
+        for key, max_length in (("category", 255), ("name_en", 255), ("name_ar", 255), ("size_en", 120), ("size_ar", 120), ("station", 120)):
             _limit(result, parsed[key], self.col(key), max_length)
         for key in ("price", "size_price"):
             parsed[key], problem = decimal(values.get(key), self.col(key))
@@ -425,6 +428,12 @@ class ProductImporter(SheetImporter):
                 if name:
                     categories.setdefault(name.strip().casefold(), category)
         known_categories = {key: category.name_en or category.name_ar for key, category in categories.items()}
+        stations = {}
+        for station in KitchenStation.objects.filter(branch=self.branch):
+            for name in (station.name_en, station.name_ar):
+                if name:
+                    stations.setdefault(name.strip().casefold(), station)
+        known_stations = {key: station.name_en or station.name_ar for key, station in stations.items()}
 
         groups = {}
         results = []
@@ -466,6 +475,7 @@ class ProductImporter(SheetImporter):
 
         self._ops = []
         self._new_categories = {}
+        self._new_stations = {}
         for group in groups.values():
             values = group["values"]
             first_result = group["rows"][0][0]
@@ -486,6 +496,13 @@ class ProductImporter(SheetImporter):
                     first_result.note("similarExists", name=values["category"], existing=similar)
                 first_result.note("newCategory", name=values["category"])
 
+            if values["station"] and _key(values["station"]) not in stations:
+                self._new_stations.setdefault(_key(values["station"]), values["station"])
+                similar = _similar(values["station"], known_stations)
+                if similar:
+                    first_result.note("similarExists", name=values["station"], existing=similar)
+                first_result.note("newStation", name=values["station"])
+
             product_fields = {}
             if product is None:
                 if values["price"] is None:
@@ -495,7 +512,7 @@ class ProductImporter(SheetImporter):
                 if similar:
                     first_result.note("similarExists", name=values["name_en"] or values["name_ar"], existing=similar)
                 first_result.action = "create"
-                for field_key in ("category", "name_en", "name_ar", "description_en", "description_ar", "price"):
+                for field_key in ("category", "name_en", "name_ar", "description_en", "description_ar", "price", "station"):
                     if values[field_key] not in (None, ""):
                         first_result.change(field_key, "", values[field_key])
                 first_result.change("available", "", True if values["available"] is None else values["available"])
@@ -517,6 +534,10 @@ class ProductImporter(SheetImporter):
                 if values["available"] is not None and values["available"] != product.is_available:
                     product_fields["is_available"] = values["available"]
                     first_result.change("available", product.is_available, values["available"])
+                current_station = product.station if product.station_id else None
+                if values["station"] and _key(values["station"]) not in (_key(getattr(current_station, "name_en", "")), _key(getattr(current_station, "name_ar", ""))):
+                    product_fields["station"] = values["station"]
+                    first_result.change("station", (current_station.name_en or current_station.name_ar) if current_station else "", values["station"])
                 if product_fields:
                     first_result.action = "update"
 
@@ -565,7 +586,25 @@ class ProductImporter(SheetImporter):
 
     def apply(self):
         created_categories = {}
+        created_stations = {}
         next_sort = (Category.objects.filter(branch=self.branch).order_by("-sort_order").values_list("sort_order", flat=True).first() or 0) + 1
+        next_station_sort = (KitchenStation.objects.filter(branch=self.branch).order_by("-sort_order").values_list("sort_order", flat=True).first() or 0) + 1
+
+        def station_for(name):
+            nonlocal next_station_sort
+            if not name:
+                return None
+            key = _key(name)
+            found = (KitchenStation.objects.filter(branch=self.branch, name_en__iexact=name).first()
+                     or KitchenStation.objects.filter(branch=self.branch, name_ar__iexact=name).first())
+            if found:
+                return found
+            if key not in created_stations:
+                created_stations[key] = KitchenStation.objects.create(
+                    branch=self.branch, name_en=self._new_stations.get(key, name), name_ar="", sort_order=next_station_sort,
+                )
+                next_station_sort += 1
+            return created_stations[key]
 
         def category_for(name):
             nonlocal next_sort
@@ -586,6 +625,7 @@ class ProductImporter(SheetImporter):
                     description_en=values["description_en"], description_ar=values["description_ar"],
                     price=values["price"], cost_price=Decimal("0"),
                     is_available=True if values["available"] is None else values["available"],
+                    station=station_for(values["station"]),
                 )
                 for name in (values["name_en"], values["name_ar"]):
                     if name:
@@ -593,6 +633,8 @@ class ProductImporter(SheetImporter):
             elif product_fields:
                 if "category" in product_fields:
                     product_fields["category"] = category_for(product_fields["category"])
+                if "station" in product_fields:
+                    product_fields["station"] = station_for(product_fields["station"])
                 for key, value in product_fields.items():
                     setattr(product, key, value)
                 product.save(update_fields=[*product_fields, "updated_at"])
@@ -826,6 +868,7 @@ class RestaurantImport:
             "YesNo": ["Yes", "No"],
             "Suppliers": sorted(s.name_en for s in Supplier.objects.all() if s.name_en),
             "Categories": [c.name_en or c.name_ar for c in Category.objects.filter(branch=self.branch).order_by("sort_order", "id")],
+            "Stations": [s.name_en or s.name_ar for s in KitchenStation.objects.filter(branch=self.branch, is_active=True).order_by("sort_order", "id")],
             "Dishes": dishes,
             "Ingredients": sheet_column_range(STOCK_SHEET, 1),
         }

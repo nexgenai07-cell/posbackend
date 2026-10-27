@@ -243,6 +243,16 @@ class OrderItem(BaseModel):
     # public client can show "cooking for Xm" / total time-to-ready.
     fired_at = models.DateTimeField(null=True, blank=True)
     ready_at = models.DateTimeField(null=True, blank=True)
+    # The kitchen station this line was sent to, fixed when it was fired
+    # (kitchen/routing.fire_items) so moving a dish to another station later
+    # never moves lines already cooking. Null = General.
+    station = models.ForeignKey(
+        "kitchen.KitchenStation", on_delete=models.SET_NULL, null=True, blank=True, related_name="order_items",
+    )
+    # The chef who started making this line (fired -> preparing).
+    started_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name="started_order_items",
+    )
 
     def __str__(self):
         return f"{self.quantity}x {self.name_en_snapshot}"

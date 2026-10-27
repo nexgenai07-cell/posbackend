@@ -27,6 +27,11 @@ class Category(BaseModel):
     name_en = models.CharField(max_length=255)
     name_ar = models.CharField(max_length=255)
     sort_order = models.PositiveIntegerField(default=0)
+    # The kitchen station this category's dishes go to unless a dish sets its
+    # own (Product.station). Null = General. See kitchen/routing.py.
+    station = models.ForeignKey(
+        "kitchen.KitchenStation", on_delete=models.SET_NULL, null=True, blank=True, related_name="categories",
+    )
 
     class Meta:
         ordering = ["sort_order"]
@@ -50,6 +55,12 @@ class Product(BaseModel):
     # Plain JSONField (not postgres ArrayField) so this still works against
     # the local sqlite fallback, not just Neon. Empty list = every day.
     days = models.JSONField(default=list, blank=True)
+    # This dish's kitchen station, overriding its category's. Null = follow
+    # the category (and General when that has none too). Read when a line is
+    # fired, never afterwards — see OrderItem.station.
+    station = models.ForeignKey(
+        "kitchen.KitchenStation", on_delete=models.SET_NULL, null=True, blank=True, related_name="products",
+    )
 
     def __str__(self):
         return self.name_en

@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'common',
     'accounts',
     'branches',
+    'kitchen',
     'catalog',
     'tables',
     'orders',

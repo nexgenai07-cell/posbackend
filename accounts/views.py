@@ -166,7 +166,7 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     scoped to the requester's own branch — an owner can't see or edit
     another branch's staff."""
 
-    queryset = Staff.objects.select_related("branch").all()
+    queryset = Staff.objects.select_related("branch").prefetch_related("stations").all()
     serializer_class = StaffSerializer
     permission_classes = [IsOwnerOrManager]
 

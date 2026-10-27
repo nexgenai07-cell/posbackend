@@ -1,6 +1,8 @@
 from common.pagination import ListMetadataMixin
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,6 +10,7 @@ from rest_framework.views import APIView
 from accounts.permissions import IsOwnerOrManager
 from branches.models import Branch
 from common.mixins import BranchScopedQuerysetMixin
+from kitchen.models import KitchenStation
 from inventory.services import availability_from, stock_requirements, units_from, variant_multiplier
 
 from .models import Category, Deal, Product, ProductVariant
@@ -57,7 +60,7 @@ class ProductViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.Mode
     # (availability / deal timezone), variants, and recipe lines with their
     # ingredient (live costing). Without these the list ran ~10 queries per
     # product, which on a remote database made the POS menu take seconds.
-    queryset = Product.objects.select_related("category", "branch").prefetch_related(
+    queryset = Product.objects.select_related("category__station", "branch", "station").prefetch_related(
         "deal__windows", "variants", "recipe_items__inventory_item",
     )
 
@@ -88,6 +91,15 @@ class ProductViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.Mode
             qs = qs.exclude(Exists(RecipeItem.objects.filter(product=OuterRef("pk"))))
         if params.get("has_deal") == "true":
             qs = qs.filter(deal__isnull=False)
+        # ?station=<id> — dishes whose lines go there (set on the dish, or
+        # inherited from the category); ?station=general — dishes going to
+        # General. Same resolution as kitchen.routing, inactive stations
+        # included so a switched-off station's dishes can still be found.
+        station = (params.get("station") or "").strip().lower()
+        if station == "general":
+            qs = qs.filter(station__isnull=True, category__station__isnull=True)
+        elif station.isdigit():
+            qs = qs.filter(Q(station_id=station) | Q(station__isnull=True, category__station_id=station))
         from common.filters import ordering_filter
         language = "ar" if params.get("language") == "ar" else "en"
         return ordering_filter(qs, params, {"name": f"name_{language}", "category": f"category__name_{language}", "price": "price", "available": "is_available", "ingredients": "recipe_count", "cost": "cost_price"}, ["name_en"])
@@ -121,6 +133,32 @@ class ProductViewSet(ListMetadataMixin, BranchScopedQuerysetMixin, viewsets.Mode
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated()]
         return [IsOwnerOrManager()]
+
+    @action(detail=False, methods=["post"], url_path="bulk-station")
+    def bulk_station(self, request):
+        """
+        POST /api/products/bulk-station/ {"products": [ids], "station": id|null}
+        — set the kitchen station of many dishes at once (the menu's "Set
+        station"). null clears it, so the dishes follow their category again.
+        """
+        ids = request.data.get("products")
+        if not isinstance(ids, list) or not ids or not all(isinstance(pk, int) for pk in ids):
+            return Response({"error": "error.productsRequired"}, status=status.HTTP_400_BAD_REQUEST)
+        station_id = request.data.get("station")
+        station = None
+        if station_id is not None:
+            station = KitchenStation.objects.filter(pk=station_id, branch=request.user.branch).first()
+            if station is None:
+                return Response({"error": "error.stationNotFound"}, status=status.HTTP_400_BAD_REQUEST)
+        products = list(Product.objects.filter(branch=request.user.branch, pk__in=ids))
+        if len(products) != len(set(ids)):
+            return Response({"error": "error.notFound"}, status=status.HTTP_404_NOT_FOUND)
+        for product in products:
+            # One save per dish (not a bulk update) so each one's
+            # product:updated event still reaches the menu screens.
+            product.station = station
+            product.save(update_fields=["station", "updated_at"])
+        return Response({"updated": len(products), "station": station.pk if station else None})
 
     def destroy(self, request, *args, **kwargs):
         """
