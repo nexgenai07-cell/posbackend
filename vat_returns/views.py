@@ -1,20 +1,24 @@
 from datetime import date
 
 from django.db import transaction
-from django.http import HttpResponse
+from django.http import FileResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils.http import content_disposition_header
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsOwner, IsOwnerOrManager
+from common import pdf_fonts
+from purchasing.models import SupplierDocument
 from zatca.environments import profile
-from zatca.models import VatFilingFrequency, ZatcaSettings
+from zatca.models import VatFilingFrequency, ZatcaDocument, ZatcaSettings
 
-from . import adjustments, exports, figures, filing as vat_filing, history as vat_history, payments as vat_payments
+from . import adjustments, archive, archive_zip, exports, figures, filing as vat_filing, history as vat_history
+from . import invoice_pdf, payments as vat_payments
 from . import reminders as vat_reminders
 from . import periods as vat_periods
-from .models import VatAuditLog, VatPayment, VatPeriod, VatRefund
+from .models import ArchiveExportStatus, VatArchiveExport, VatAuditLog, VatPayment, VatPeriod, VatRefund
 
 # The VAT filing settings, as stored on ZatcaSettings.
 SETTINGS_FIELDS = ("vat_filing_frequency", "vat_frequency_effective_from", "vat_registration_date",
@@ -447,3 +451,133 @@ class VatPeriodDocumentsView(APIView):
         except ValueError:
             page = 1
         return Response(figures.document_list(period, settings, which, page))
+
+
+# -- invoice archive (plan §11): read only -------------------------------------------
+
+
+def _attachment(content, content_type, filename):
+    """Like _download, but the name may hold Arabic (a supplier's name):
+    an ASCII filename plus the UTF-8 filename* the browser prefers."""
+    response = HttpResponse(content, content_type=content_type)
+    response["Content-Disposition"] = content_disposition_header(True, filename)
+    return response
+
+
+class ArchiveListView(APIView):
+    """GET /vat/archive/<sales|purchases>/?filters&page=N: one page of the
+    archive (50 rows) with the count and signed totals over the whole
+    filtered list. Filters as in vat_returns/archive.py; a value that
+    can't be read is a 400 keyed by its name."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, side):
+        if side not in archive.SIDES:
+            raise Http404
+        branch = request.user.branch
+        settings = ZatcaSettings.for_branch(branch)
+        try:
+            filters = archive.parse(side, request.query_params, branch, settings)
+        except archive.FilterInvalid as exc:
+            return Response(exc.errors, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            number = int(request.query_params.get("page", 1))
+        except ValueError:
+            number = 1
+        return Response({"side": side, "environment": settings.environment,
+                         "is_test": profile(settings.environment).is_test,
+                         **archive.page(side, branch, settings, filters, number)})
+
+
+class ArchiveSalePdfView(APIView):
+    """GET: a sales document as its A4 tax invoice PDF, from the snapshot
+    frozen at issue (vat_returns/invoice_pdf.py). 503 when the Arabic font
+    or shaping libraries aren't installed on this server."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, pk):
+        settings = ZatcaSettings.for_branch(request.user.branch)
+        document = get_object_or_404(ZatcaDocument, pk=pk, branch=request.user.branch, source="pos",
+                                     environment=settings.environment)
+        try:
+            content = invoice_pdf.render(document, settings)
+        except pdf_fonts.PdfUnavailable as exc:
+            return Response({"error": "error.archivePdfUnavailable", "detail": str(exc)},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return _attachment(content, "application/pdf", f"{archive_zip.safe_name(document.number)}.pdf")
+
+
+class ArchivePurchaseXmlView(APIView):
+    """GET: a supplier document's XML as keyed in (404 when there is none).
+    Its PDF is the stored pdf_url, opened directly."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, pk):
+        document = get_object_or_404(SupplierDocument.objects.select_related("purchase__supplier"), pk=pk,
+                                     purchase__branch=request.user.branch, purchase__is_deleted=False)
+        if not document.xml:
+            raise Http404
+        supplier = document.purchase.supplier
+        name = archive_zip.safe_name(f"{supplier.name_en or supplier.name_ar}_{document.number}")
+        return _attachment(document.xml.encode("utf-8"), "application/xml; charset=utf-8", f"{name}.xml")
+
+
+class ArchiveExportsView(APIView):
+    """GET: the branch's latest ZIP exports (newest first), for the page to
+    list and poll. POST {sides: [sales, purchases], ...filters}: request a
+    ZIP of the matching documents; it is built in the background and comes
+    back queued (201)."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request):
+        settings = ZatcaSettings.for_branch(request.user.branch)
+        rows = (VatArchiveExport.objects.filter(branch=request.user.branch, environment=settings.environment)
+                    .select_related("requested_by", "period")[:20])
+        return Response({"exports": [archive_zip.export_dict(export) for export in rows]})
+
+    def post(self, request):
+        branch = request.user.branch
+        settings = ZatcaSettings.for_branch(branch)
+        try:
+            export = archive_zip.request(branch, settings, request.user, request.data)
+        except archive_zip.ExportRejected as exc:
+            return Response(exc.errors, status=status.HTTP_400_BAD_REQUEST)
+        export = VatArchiveExport.objects.select_related("requested_by", "period").get(pk=export.pk)
+        return Response(archive_zip.export_dict(export), status=status.HTTP_201_CREATED)
+
+
+def _export(request, pk):
+    return get_object_or_404(VatArchiveExport.objects.select_related("requested_by", "period", "branch"), pk=pk,
+                             branch=request.user.branch)
+
+
+class ArchiveExportView(APIView):
+    """GET: one export, polled until it is ready or failed."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, pk):
+        return Response(archive_zip.export_dict(_export(request, pk)))
+
+
+class ArchiveExportDownloadView(APIView):
+    """GET: the ready ZIP, streamed from the private folder. 409 while it
+    is being prepared, after it failed, or once it expired. Every download
+    is audited."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, pk):
+        export = _export(request, pk)
+        path = archive_zip.path_of(export)
+        if export.status != ArchiveExportStatus.READY or not export.file_path or not path.exists():
+            return Response({"error": "error.archiveExportNotReady", "status": export.status},
+                            status=status.HTTP_409_CONFLICT)
+        archive_zip.audit(export, request.user, "archive_downloaded",
+                           f"Invoice archive ZIP downloaded ({export.file_name})")
+        return FileResponse(path.open("rb"), as_attachment=True, filename=export.file_name,
+                            content_type="application/zip")

@@ -3,7 +3,7 @@
 Updated after every milestone. Plans: `docs/ZATCA_Approval_Prompt.md` (ZATCA e-invoicing) and
 `docs/vat-dashboard-plan.md` (VAT dashboard + invoice archive).
 
-Last update: **2026-10-29: VAT dashboard M3 code written, waiting for your test run (M2 output not received yet).**
+Last update: **2026-10-29: VAT dashboard M10 (invoice archive) code written, waiting for your test run.**
 
 **How to run tests** without touching Neon (`.env` points `DATABASE_URL` at Neon):
 ```
@@ -58,8 +58,8 @@ These statuses come from **reading the code** on 2026-10-29. Please correct any 
 | M6 | Payments, refunds (requested / received), status, credit carried forward | 🟡 **code written; not confirmed.** You sent part of the test run (only the expected `RuntimeError: boom`) and asked to go on to M7, reporting errors if any come (migration `vat_returns/0003`) |
 | M7 | History + CSV/PDF export (summary table + optional per-period PDF) | 🟡 **code written; not confirmed** (you said "move next"; you'll report errors) |
 | M8 | Reminder banners | 🟡 **code written, waiting for your test run** (no migrations) |
-| M9 | Late purchases, amendments, frequency switch, first period | ⬜ after M6 is tested |
-| M10 | Invoice archive (Sales/Purchases tabs, per-document PDF/XML, background ZIP) | ⬜ after M9 |
+| M9 | Late purchases, amendments, frequency switch, first period | 🟡 **code present** (`adjustments.py`, `test_late_amend.py`, migration `vat_returns/0004`); no test output recorded here |
+| M10 | Invoice archive (Sales/Purchases tabs, per-document PDF/XML, background ZIP) | 🟡 **code written, waiting for your test run** (migration `vat_returns/0005`; Arabic font files to add) |
 
 ### M1: what was built
 - `zatca/breakdown.py`: turns the VAT engine's result or a stored signed XML into `(net_total, vat_breakdown)`.
@@ -220,6 +220,31 @@ These statuses come from **reading the code** on 2026-10-29. Please correct any 
 - **Tests:** `vat_returns/test_reminders.py` (7). The shared test fixture now takes the sale's environment from its device, so Production sales can be made.
 - **To see it in the app** you need Production. In Sandbox the banner is hidden on purpose; the tests cover it.
 
+### M10: what was built
+- **Archive queries** (`vat_returns/archive.py`), read only:
+  - Sales: POS `ZatcaDocument`s (no self-tests) of the current environment. Purchases: `SupplierDocument`s of non-deleted purchases.
+  - Filters: dates (sales in Saudi time), VAT period (sales: the period window; purchases: `claim_date`, the same as the VAT returns page), type, ZATCA status, B2C/B2B, customer, supplier, number, total range, free text (number, customer/supplier name, VAT number, order number).
+  - 50 a page. Count and signed totals over the whole filtered list (credit notes negative).
+- **Tax invoice PDF** (`vat_returns/invoice_pdf.py`): A4, English + Arabic, drawn from the `receipt` snapshot frozen at issue, with the QR where the receipt prints one. Arabic needs `common/pdf_fonts.py`: the Amiri font in `common/fonts/` plus `arabic-reshaper` and `python-bidi`. Without them the PDF endpoint answers `503 error.archivePdfUnavailable`, and the ZIP lists the PDF as "missing (why)".
+- **ZIP** (`vat_returns/archive_zip.py`, model `VatArchiveExport`, migration `vat_returns/0005_archive_export`):
+  - Stores the filter, freezes the matching IDs when the build starts, and writes the ZIP to disk entry by entry.
+  - Contents: `index.csv` (BOM, header block, TOTALS per side), `sales/<number>.pdf/.xml/_cleared.xml`, `purchases/<supplier>_<number>.pdf/.xml`. Names are made safe (Arabic kept, duplicates get `_2`). A file that can't be included is written as `missing (why)`, never skipped.
+  - Built by a daemon thread right after the request. `manage.py vat_archive_exports` (every 5 minutes, like `zatca_retry_queue`) builds anything still queued, re-queues a build stuck for 30 minutes, and removes ZIPs 7 days after they were built (the row stays, as Expired).
+  - Saved under `VAT_ARCHIVE_DIR` (default `private/vat_archives/`, git-ignored, never public media).
+  - Audited in `VatAuditLog`: requested, ready / failed, every download.
+- **Endpoints** (owner and manager; cashier 403):
+  - `GET /api/vat/archive/sales/` and `/purchases/` (filters + `page`).
+  - `GET /api/vat/archive/sales/<id>/pdf/`, `GET /api/vat/archive/purchases/<id>/xml/`. The sales XML uses the M4 endpoint `/api/zatca/documents/<id>/xml/`; a supplier PDF is its stored `pdf_url`.
+  - `GET`/`POST /api/vat/archive/exports/`, `GET /api/vat/archive/exports/<id>/`, `GET /api/vat/archive/exports/<id>/download/` (409 until ready).
+- **Admin:**
+  - New sidebar item ZATCA → **Invoice archive** (`/admin/zatca/archive`). Sales / Purchases tabs, filters in the URL, totals, view drawer, PDF / XML per row, "Create ZIP" for the filtered list, and a ZIP downloads card that refreshes itself while one is being prepared.
+  - VAT returns: **Download all invoices for this period** asks for a ZIP of both sides for the period and opens the archive on it.
+  - Downloads now read the UTF-8 `filename*`, so Arabic file names come through.
+- **Tests:** `vat_returns/test_archive.py` (18). The real-PDF test is skipped until the font files are in `common/fonts/`.
+- **Different from the plan:**
+  - The customer filter is the free-text search (name or VAT number). The backend also takes `customer=<id>`, but the page has no company picker yet.
+  - The history and period PDFs (M7) still use the built-in English font. Switching them to Amiri is a small follow-up now that `common/pdf_fonts.py` exists.
+
 ---
 
 ## Decisions (VAT dashboard, approved 2026-10-29)
@@ -237,7 +262,7 @@ These statuses come from **reading the code** on 2026-10-29. Please correct any 
 
 - **Box names** in `vat-dashboard-plan.md` §4.5. To check against the live ZATCA portal: boxes 2, 8, 9, 14, 15, 16, and whether a 5% line still exists under box 1.
 - **Arabic in VAT PDFs (M7):** English only until the M10 PDF dependencies are in; then the history and period PDFs switch to the Arabic font too.
-- **M10 dependencies:** an Arabic PDF needs `arabic-reshaper`, `python-bidi`, a bundled Arabic font and a QR library. These go on the VPS checklist.
+- **M10 on the VPS:** `pip install -r requirements.txt` (`arabic-reshaper`, `python-bidi`), the Amiri font files in `common/fonts/`, and a scheduled `manage.py vat_archive_exports` every 5 minutes. The QR uses reportlab's own widget (no extra library).
 - **M4 scope:** per-document XML download was moved earlier from M10 (you said "move to next" on the M4 plan that listed it). It is a small read-only endpoint; say if you'd rather drop it.
 - **Follow-up, not in scope:** backup of attachments (Cloudinary filing and SADAD PDFs) for the 6-year retention.
 - **ZATCA M10:** Simulation run with a real company, unreported-invoice banner, this runbook's go-live section.

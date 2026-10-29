@@ -114,7 +114,7 @@ def request(branch, settings, actor, data):
             branch=branch, environment=settings.environment, sides=sides, period=period, requested_by=actor,
             filters={side: archive.as_json(filters) for side, filters in parsed.items()},
         )
-        _audit(export, actor, "archive_requested", f"Invoice archive ZIP requested ({', '.join(sides)})")
+        audit(export, actor, "archive_requested", f"Invoice archive ZIP requested ({', '.join(sides)})")
         transaction.on_commit(lambda: start(export.pk))
     return export
 
@@ -154,7 +154,7 @@ def run(pk):
         export.error = str(exc)[:1000] or exc.__class__.__name__
         export.finished_at = timezone.now()
         export.save(update_fields=["status", "error", "finished_at"])
-        _audit(export, None, "archive_failed", f"Invoice archive ZIP failed: {export.error}")
+        audit(export, None, "archive_failed", f"Invoice archive ZIP failed: {export.error}")
     return export
 
 
@@ -209,7 +209,7 @@ def _build(export):
     export.missing_count = missing
     export.finished_at = timezone.now()
     export.save(update_fields=["status", "file_path", "size", "missing_count", "finished_at"])
-    _audit(export, None, "archive_ready",
+    audit(export, None, "archive_ready",
            f"Invoice archive ZIP ready: {export.sales_count} sales, {export.purchases_count} purchase documents, "
            f"{missing} files missing")
 
@@ -250,7 +250,9 @@ def _add_sale(zip_file, names, document, settings):
         zip_file.writestr(f"{stem}_cleared.xml", document.cleared_xml.encode("utf-8"))
         cleared = f"{stem}_cleared.xml"
     elif not document.simplified:
-        cleared, missing = _missing(f"not cleared by ZATCA: {document.status}"), missing + 1
+        reason = ("ZATCA's cleared copy not stored" if document.status == DocumentStatus.CLEARED
+                  else f"not cleared by ZATCA: {DocumentStatus(document.status).label}")
+        cleared, missing = _missing(reason), missing + 1
     row = archive.sales_row(document)
     issued = document.issued_at.astimezone(vat_periods.ZoneInfo(settings.timezone))
     data = [
@@ -380,7 +382,7 @@ def export_dict(export):
     }
 
 
-def _audit(export, actor, action, summary, **data):
+def audit(export, actor, action, summary, **data):
     VatAuditLog.objects.create(branch=export.branch, period=export.period, actor=actor, action=action,
                                summary=summary, data={"export": export.pk, "sides": export.sides,
                                                       "filters": export.filters, **data})

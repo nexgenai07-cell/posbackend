@@ -1,6 +1,12 @@
 from django.urls import path
 
 from .views import (
+    ArchiveExportDownloadView,
+    ArchiveExportsView,
+    ArchiveExportView,
+    ArchiveListView,
+    ArchivePurchaseXmlView,
+    ArchiveSalePdfView,
     VatHistoryCsvView,
     VatHistoryPdfView,
     VatHistoryView,
@@ -38,4 +44,11 @@ urlpatterns = [
     path("vat/periods/<int:pk>/refunds/", VatPeriodRefundsView.as_view(), name="vat-period-refunds"),
     path("vat/payments/<int:pk>/void/", VatPaymentVoidView.as_view(), name="vat-payment-void"),
     path("vat/refunds/<int:pk>/void/", VatRefundVoidView.as_view(), name="vat-refund-void"),
+    path("vat/archive/exports/", ArchiveExportsView.as_view(), name="vat-archive-exports"),
+    path("vat/archive/exports/<int:pk>/", ArchiveExportView.as_view(), name="vat-archive-export"),
+    path("vat/archive/exports/<int:pk>/download/", ArchiveExportDownloadView.as_view(),
+         name="vat-archive-export-download"),
+    path("vat/archive/sales/<int:pk>/pdf/", ArchiveSalePdfView.as_view(), name="vat-archive-sale-pdf"),
+    path("vat/archive/purchases/<int:pk>/xml/", ArchivePurchaseXmlView.as_view(), name="vat-archive-purchase-xml"),
+    path("vat/archive/<str:side>/", ArchiveListView.as_view(), name="vat-archive-list"),
 ]

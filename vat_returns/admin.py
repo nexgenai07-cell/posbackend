@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import VatAuditLog, VatFiling, VatLockOverride, VatPayment, VatPeriod, VatRefund
+from .models import VatArchiveExport, VatAuditLog, VatFiling, VatLockOverride, VatPayment, VatPeriod, VatRefund
 
 
 class ReadOnlyAdmin(admin.ModelAdmin):
@@ -56,3 +56,10 @@ class VatPaymentAdmin(ReadOnlyAdmin):
 class VatRefundAdmin(ReadOnlyAdmin):
     list_display = ("id", "period", "amount", "received_on", "reference", "voided", "recorded_by")
     list_filter = ("voided",)
+
+
+@admin.register(VatArchiveExport)
+class VatArchiveExportAdmin(ReadOnlyAdmin):
+    list_display = ("id", "branch", "environment", "status", "sales_count", "purchases_count", "missing_count",
+                    "requested_by", "created_at", "finished_at")
+    list_filter = ("status", "environment")
