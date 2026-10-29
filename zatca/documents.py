@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from django.db import transaction
 from django.utils import timezone
 
-from . import qr, signing, ubl
+from . import breakdown, qr, signing, ubl
 from .client import ZatcaAuthError, ZatcaClient, ZatcaUnavailable
 from .models import DeviceStatus, DocumentStatus, ZatcaDevice, ZatcaDocument, ZatcaSettings
 
@@ -81,10 +81,12 @@ def issue(branch, *, kind, simplified, vat, names, payment_means=(ubl.PaymentMea
             billing_reference=original.number if original else "", reason=reason, timezone=settings.timezone,
         )
         signed = Signer.for_device(device).sign(ubl.build(doc))
+        net_total, vat_breakdown = breakdown.from_vat_result(vat)
         document = ZatcaDocument.objects.create(
             branch=branch, device=device, environment=device.environment, kind=kind, simplified=simplified,
             number=number, uuid=doc.uuid, icv=icv, pih=pih, invoice_hash=signed.invoice_hash,
-            issued_at=doc.issued_at, total=vat.payable, vat_total=vat.vat_total, original=original,
+            issued_at=doc.issued_at, total=vat.payable, vat_total=vat.vat_total,
+            net_total=net_total, vat_breakdown=vat_breakdown, original=original,
             reason=reason, source=source, signed_xml=signed.xml, qr=signed.qr,
         )
         setattr(device, sequence, seq)

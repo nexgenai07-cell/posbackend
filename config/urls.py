@@ -50,4 +50,5 @@ urlpatterns = [
     path('api/', include('marketing.urls')),
     path('api/', include('imports.urls')),
     path('api/', include('zatca.urls')),
+    path('api/', include('vat_returns.urls')),
 ]

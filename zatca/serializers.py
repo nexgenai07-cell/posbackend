@@ -262,7 +262,8 @@ class ZatcaDocumentSerializer(serializers.ModelSerializer):
         model = ZatcaDocument
         fields = ["id", "number", "kind", "simplified", "environment", "icv", "status", "zatca_status",
                   "http_status", "warnings", "errors", "last_error", "attempts", "last_attempt_at", "accepted_at",
-                  "issued_at", "total", "vat_total", "order_numbers", "original_number", "buyer_name", "source"]
+                  "issued_at", "total", "vat_total", "net_total", "vat_breakdown", "order_numbers", "original_number",
+                  "buyer_name", "source"]
         read_only_fields = fields
 
     def get_order_numbers(self, obj):

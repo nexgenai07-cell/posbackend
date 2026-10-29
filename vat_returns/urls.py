@@ -1,0 +1,41 @@
+from django.urls import path
+
+from .views import (
+    VatHistoryCsvView,
+    VatHistoryPdfView,
+    VatHistoryView,
+    VatPaymentVoidView,
+    VatPeriodAdjustmentView,
+    VatPeriodAmendView,
+    VatPeriodAuditView,
+    VatPeriodDocumentsView,
+    VatPeriodFileView,
+    VatPeriodPaymentsView,
+    VatPeriodPdfView,
+    VatPeriodRefundsView,
+    VatPeriodsView,
+    VatPeriodView,
+    VatRefundVoidView,
+    VatRemindersView,
+    VatSettingsView,
+)
+
+urlpatterns = [
+    path("vat/settings/", VatSettingsView.as_view(), name="vat-settings"),
+    path("vat/periods/", VatPeriodsView.as_view(), name="vat-periods"),
+    path("vat/reminders/", VatRemindersView.as_view(), name="vat-reminders"),
+    path("vat/history/", VatHistoryView.as_view(), name="vat-history"),
+    path("vat/history/csv/", VatHistoryCsvView.as_view(), name="vat-history-csv"),
+    path("vat/history/pdf/", VatHistoryPdfView.as_view(), name="vat-history-pdf"),
+    path("vat/periods/<int:pk>/", VatPeriodView.as_view(), name="vat-period"),
+    path("vat/periods/<int:pk>/documents/", VatPeriodDocumentsView.as_view(), name="vat-period-documents"),
+    path("vat/periods/<int:pk>/file/", VatPeriodFileView.as_view(), name="vat-period-file"),
+    path("vat/periods/<int:pk>/amend/", VatPeriodAmendView.as_view(), name="vat-period-amend"),
+    path("vat/periods/<int:pk>/adjustment/", VatPeriodAdjustmentView.as_view(), name="vat-period-adjustment"),
+    path("vat/periods/<int:pk>/pdf/", VatPeriodPdfView.as_view(), name="vat-period-pdf"),
+    path("vat/periods/<int:pk>/audit/", VatPeriodAuditView.as_view(), name="vat-period-audit"),
+    path("vat/periods/<int:pk>/payments/", VatPeriodPaymentsView.as_view(), name="vat-period-payments"),
+    path("vat/periods/<int:pk>/refunds/", VatPeriodRefundsView.as_view(), name="vat-period-refunds"),
+    path("vat/payments/<int:pk>/void/", VatPaymentVoidView.as_view(), name="vat-payment-void"),
+    path("vat/refunds/<int:pk>/void/", VatRefundVoidView.as_view(), name="vat-refund-void"),
+]

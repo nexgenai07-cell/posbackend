@@ -1,3 +1,4 @@
+import functools
 from decimal import Decimal
 
 from django.db import transaction
@@ -10,15 +11,38 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from accounts.permissions import IsOwnerOrManager
+from common.csv_export import csv_response
 from common.mixins import BranchScopedQuerysetMixin
 from inventory.models import InventoryItem, StockMovement, StockMovementReason
 from inventory.services import adjust_stock
 from reports.filters import branch_datetime_bounds, parse_date_range
+from vat_returns import locks
 
-from . import vat as purchase_vat
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument, SupplierDocumentKind
+from . import input_vat, vat as purchase_vat
+from .models import (
+    Purchase,
+    PurchaseItem,
+    PurchaseStatus,
+    Supplier,
+    SupplierDocument,
+    SupplierDocumentKind,
+    refresh_supplier_documents,
+)
 from .services import apply_purchase_stock, reverse_purchase_stock
 from .serializers import PurchaseSerializer, SupplierDocumentSerializer, SupplierSerializer
+
+
+def lock_overridable(view):
+    """Lets the owner push a supplier document change through a filed VAT
+    period by sending `lock_override_reason` (vat_returns/locks.py). Without
+    it, such a change is refused with 409 error.vatPeriodLocked."""
+
+    @functools.wraps(view)
+    def wrapper(self, request, *args, **kwargs):
+        with locks.override_from(request):
+            return view(self, request, *args, **kwargs)
+
+    return wrapper
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
@@ -46,6 +70,13 @@ class SupplierViewSet(viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated()]
         return [IsOwnerOrManager()]
+
+    def perform_update(self, serializer):
+        # Fixing a supplier's VAT details (e.g. adding a missing VAT number)
+        # is copied onto its tax documents, so their claimable VAT follows;
+        # documents in a filed VAT period keep the figures they were filed with.
+        supplier = serializer.save()
+        refresh_supplier_documents(supplier)
 
     def destroy(self, request, *args, **kwargs):
         supplier = self.get_object()
@@ -149,8 +180,14 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
 
         Dropping the row while leaving the inventory it added would overstate
         stock permanently, with nothing in the ledger to explain the gap.
+
+        A purchase with supplier tax documents can't be deleted at all until
+        they are removed: they are tax records, and a soft-deleted purchase
+        would otherwise leave its VAT claim behind with no purchase to show.
         """
         purchase = self.get_object()
+        if purchase.supplier_documents.exists():
+            return Response({"error": "error.purchaseHasSupplierDocuments"}, status=status.HTTP_409_CONFLICT)
         if purchase.status != PurchaseStatus.RECEIVED:
             purchase.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
@@ -303,6 +340,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         return response
 
     @action(detail=True, methods=["post"], url_path="receive")
+    @lock_overridable
     def receive(self, request, pk=None):
         """
         The only place a PO touches stock: adjust_stock() per line (locked,
@@ -357,6 +395,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         return SupplierDocument.objects.filter(purchase=purchase, kind=kind)
 
     @action(detail=True, methods=["get", "put", "delete"], url_path="supplier-invoice")
+    @lock_overridable
     def supplier_invoice(self, request, pk=None):
         """The supplier's tax invoice for this purchase (at most one).
         PUT creates or replaces it; the QR is re-checked on every save."""
@@ -379,6 +418,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
                         status=status.HTTP_200_OK if invoice else status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get", "post"], url_path="supplier-credit-notes")
+    @lock_overridable
     def supplier_credit_notes(self, request, pk=None):
         """The supplier's credit notes for returns on this purchase. POST may
         also take the goods back out of stock: `returned_lines: [{purchase_item,
@@ -422,6 +462,7 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
                         status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["patch", "delete"], url_path=r"supplier-credit-notes/(?P<document_id>\d+)")
+    @lock_overridable
     def supplier_credit_note(self, request, pk=None, document_id=None):
         """Correct or remove a keyed-in credit note. Removing it doesn't put
         returned goods back: that's a stock adjustment, done on purpose."""
@@ -472,59 +513,19 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         Input VAT for a period, by the supplier document's date: every
         supplier invoice and credit note (credit notes reduce the VAT), with
         flags for anything a person should look at, plus received purchases
-        in the period that have no supplier invoice yet. Purchases from
-        suppliers that aren't VAT-registered are listed but claim nothing.
+        in the period that have no supplier invoice yet. Documents whose
+        supplier isn't VAT-registered or has no VAT number claim nothing and
+        are counted under `review` ("VAT needing review"). See input_vat.py.
         """
         from_date, to_date = parse_date_range(request)
-        branch = request.user.branch
-        documents = (SupplierDocument.objects.filter(purchase__branch=branch, issue_date__gte=from_date,
-                                                     issue_date__lte=to_date)
-                     .select_related("purchase__supplier")
-                     .prefetch_related("purchase__items")
-                     .order_by("issue_date", "id"))
-        zero = Decimal("0.00")
-        totals = {"net": zero, "vat": zero, "total": zero, "claimable_vat": zero}
-        rows = []
-        for document in documents:
-            supplier = document.purchase.supplier
-            sign = -1 if document.kind == SupplierDocumentKind.CREDIT_NOTE else 1
-            flags = purchase_vat.document_flags(document, supplier)
-            if not supplier.vat_registered:
-                flags.append(purchase_vat.NOT_REGISTERED)
-            elif not supplier.vat_number:
-                flags.append(purchase_vat.SUPPLIER_VAT)
-            if document.kind == SupplierDocumentKind.INVOICE:
-                subtotal = sum((line.quantity * line.unit_cost for line in document.purchase.items.all()),
-                               Decimal("0"))
-                if abs(subtotal - document.net) > Decimal("0.05"):
-                    flags.append(purchase_vat.NET_VS_PO)
-            claimable = purchase_vat.claimable_vat(document, supplier)
-            totals["net"] += sign * document.net
-            totals["vat"] += sign * document.vat
-            totals["total"] += sign * document.total
-            totals["claimable_vat"] += claimable
-            rows.append({
-                "id": document.pk, "kind": document.kind, "purchase": document.purchase_id,
-                "supplier": supplier.pk, "supplier_name_en": supplier.name_en, "supplier_name_ar": supplier.name_ar,
-                "supplier_vat_number": supplier.vat_number, "vat_registered": supplier.vat_registered,
-                "number": document.number, "issue_date": document.issue_date,
-                "net": sign * document.net, "vat": sign * document.vat, "total": sign * document.total,
-                "claimable_vat": claimable, "flags": flags,
-            })
+        return Response(input_vat.build(request.user.branch, from_date, to_date))
 
-        start, end = branch_datetime_bounds(branch, from_date, to_date)
-        missing = []
-        for purchase in (Purchase.objects.filter(branch=branch, status=PurchaseStatus.RECEIVED,
-                                                 received_at__gte=start, received_at__lt=end)
-                         .exclude(supplier_documents__kind=SupplierDocumentKind.INVOICE)
-                         .select_related("supplier").prefetch_related("items").order_by("received_at")):
-            missing.append({
-                "purchase": purchase.pk, "supplier": purchase.supplier_id,
-                "supplier_name_en": purchase.supplier.name_en, "supplier_name_ar": purchase.supplier.name_ar,
-                "vat_registered": purchase.supplier.vat_registered, "received_at": purchase.received_at,
-                "subtotal": sum((line.quantity * line.unit_cost for line in purchase.items.all()), Decimal("0")),
-                "flags": [purchase_vat.NO_INVOICE] if purchase.supplier.vat_registered
-                else [purchase_vat.NO_INVOICE, purchase_vat.NOT_REGISTERED],
-            })
-        return Response({"from": from_date, "to": to_date, "rows": rows, "missing_invoices": missing,
-                         "totals": totals})
+    @action(detail=False, methods=["get"], url_path="input-vat/csv")
+    def input_vat_csv(self, request):
+        """The same report as a CSV for the accountant (UTF-8 with BOM, a
+        header block, credit notes negative, a TOTALS row)."""
+        from_date, to_date = parse_date_range(request)
+        branch = request.user.branch
+        report = input_vat.build(branch, from_date, to_date)
+        return csv_response(f"input-vat_{from_date:%Y-%m-%d}_{to_date:%Y-%m-%d}.csv",
+                            **input_vat.csv_parts(report, branch))

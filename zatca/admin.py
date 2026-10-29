@@ -53,8 +53,8 @@ class ZatcaAuditLogAdmin(admin.ModelAdmin):
 class ZatcaDocumentAdmin(admin.ModelAdmin):
     """Read-only: a signed document is never edited, only answered by ZATCA."""
 
-    list_display = ("number", "branch", "environment", "kind", "simplified", "icv", "status", "zatca_status", "total",
-                    "issued_at")
+    list_display = ("number", "branch", "environment", "kind", "simplified", "icv", "status", "zatca_status",
+                    "net_total", "vat_total", "total", "issued_at")
     list_filter = ("environment", "status", "kind", "simplified", "source")
     search_fields = ("number", "uuid")
 

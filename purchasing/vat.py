@@ -118,27 +118,79 @@ QR_MISMATCH = "qrMismatch"
 NOT_REGISTERED = "notRegistered"
 SUPPLIER_VAT = "supplierVatMissing"
 TOTALS = "totalsDontAdd"
+VAT_NOT_STANDARD = "vatNot15"
 NET_VS_PO = "netDiffersFromPurchase"
 
+# The flags that hold a document's VAT back from the claim: it goes to the
+# "VAT needing review" card instead, until the supplier's details are fixed.
+REVIEW_FLAGS = (NOT_REGISTERED, SUPPLIER_VAT)
 
-def document_flags(document, supplier):
+# For the CSV, which is read outside the app (by the accountant), in English.
+FLAG_LABELS = {
+    NO_INVOICE: "No supplier invoice",
+    NO_QR: "No QR",
+    QR_UNREADABLE: "QR unreadable",
+    QR_MISMATCH: "QR doesn't match",
+    NOT_REGISTERED: "Supplier not VAT-registered",
+    SUPPLIER_VAT: "Supplier VAT number missing",
+    TOTALS: "Net + VAT doesn't equal total",
+    VAT_NOT_STANDARD: "VAT not 15%",
+    NET_VS_PO: "Net differs from purchase order",
+}
+
+STANDARD_RATE = Decimal("15")
+# "VAT not 15%" warns when the VAT is further than this from 15% of the net.
+RATE_TOLERANCE = Decimal("0.05")
+_CENT = Decimal("0.01")
+
+
+def is_claimable(document):
+    """A document's VAT can be claimed only from a supplier that was
+    VAT-registered with a VAT number when the document was saved (the
+    snapshot on the document, not the supplier as it is now)."""
+    return document.supplier_vat_registered and bool(document.supplier_vat_number)
+
+
+def claimable_vat(document):
+    """Input VAT this document lets the restaurant claim (negative for a
+    credit note): none unless is_claimable()."""
+    if not is_claimable(document):
+        return Decimal("0.00")
+    return -document.vat if document.kind == "credit_note" else document.vat
+
+
+def vat_rate(document):
+    """VAT as a % of net, 2 decimals; None when the net is 0."""
+    if not document.net:
+        return None
+    return (document.vat / document.net * 100).quantize(_CENT)
+
+
+def document_flags(document, purchase_subtotal=None):
+    """What a person should look at on a supplier document, from its stored
+    figures and supplier snapshot. `purchase_subtotal` (quantity x unit cost
+    of the purchase's lines) adds the net-vs-PO check on an invoice."""
     flags = []
     if abs(document.net + document.vat - document.total) > TOLERANCE:
         flags.append(TOTALS)
     check = document.qr_check or {}
-    if supplier.vat_registered and document.kind == "invoice":
+    if document.supplier_vat_registered and document.kind == "invoice":
         if not check.get("present"):
             flags.append(NO_QR)
         elif not check.get("readable"):
             flags.append(QR_UNREADABLE)
         elif check.get("mismatches"):
             flags.append(QR_MISMATCH)
+    if not document.supplier_vat_registered:
+        flags.append(NOT_REGISTERED)
+    elif not document.supplier_vat_number:
+        flags.append(SUPPLIER_VAT)
+    # Zero-rated and exempt documents carry no VAT by design.
+    if document.vat_category == "standard":
+        expected = (document.net * STANDARD_RATE / 100).quantize(_CENT)
+        if abs(document.vat - expected) > RATE_TOLERANCE:
+            flags.append(VAT_NOT_STANDARD)
+    if document.kind == "invoice" and purchase_subtotal is not None:
+        if abs(purchase_subtotal - document.net) > Decimal("0.05"):
+            flags.append(NET_VS_PO)
     return flags
-
-
-def claimable_vat(document, supplier):
-    """Input VAT this document lets the restaurant claim (negative for a
-    credit note): none from a supplier that isn't VAT-registered."""
-    if not supplier.vat_registered:
-        return Decimal("0.00")
-    return -document.vat if document.kind == "credit_note" else document.vat

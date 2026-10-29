@@ -165,4 +165,6 @@ class PurchaseVatApiTests(TestCase):
         self.api.put(f"/api/purchases/{self.purchase.pk}/supplier-invoice/",
                      self.invoice_body(issue_date=str(timezone.localdate()), net="90.00", qr_text=""), format="json")
         [row] = self.api.get("/api/purchases/input-vat/").data["rows"]
-        self.assertEqual(row["flags"], ["totalsDontAdd", "noQr", "supplierVatMissing", "netDiffersFromPurchase"])
+        # 15.00 on a net of 90.00 is 16.67%: "VAT not 15%" (VAT dashboard M2).
+        self.assertEqual(row["flags"], ["totalsDontAdd", "noQr", "supplierVatMissing", "vatNot15",
+                                        "netDiffersFromPurchase"])

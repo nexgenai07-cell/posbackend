@@ -64,6 +64,7 @@ INSTALLED_APPS = [
     'imports',
     'realtime',
     'zatca',
+    'vat_returns',
 ]
 
 MIDDLEWARE = [
@@ -244,6 +245,9 @@ SIMPLE_JWT = {
 # CORS — restaurant-admin's Vite dev server needs to be listed here,
 # e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173
 CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[])
+# Lets the admin read a download's file name (CSV/PDF/ZIP exports) from
+# another origin; browsers hide this header otherwise.
+CORS_EXPOSE_HEADERS = ['Content-Disposition']
 
 
 # Moyasar payment gateway (orders/moyasar.py, orders/billing.py)
@@ -376,6 +380,10 @@ CUSTOMER_WEB_BASE_URL = env('CUSTOMER_WEB_BASE_URL', default='http://localhost:3
 # off. ZATCA_SDK_HOME is the Java SDK, used only as a test oracle and fallback signer.
 ZATCA_ENCRYPTION_KEY = env('ZATCA_ENCRYPTION_KEY', default='')
 ZATCA_SDK_HOME = env('ZATCA_SDK_HOME', default='')
+
+# Invoice archive ZIPs (vat_returns/archive_zip.py). A private folder, never
+# served as media: downloads go through an owner/manager-only endpoint.
+VAT_ARCHIVE_DIR = env('VAT_ARCHIVE_DIR', default=str(BASE_DIR / 'private' / 'vat_archives'))
 
 
 # Email

@@ -6,6 +6,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from common.admin import SoftDeleteAdmin
+from vat_returns import locks
 from inventory.models import InventoryItem, StockMovementReason
 from inventory.services import adjust_stock
 
@@ -151,8 +152,22 @@ class SupplierDocumentAdmin(admin.ModelAdmin):
     """Supplier tax invoices and credit notes, as recorded for input VAT.
     Nothing here is sent to ZATCA."""
 
-    list_display = ("id", "kind", "number", "issue_date", "purchase", "net", "vat", "total")
-    list_filter = ("kind",)
+    list_display = ("id", "kind", "number", "issue_date", "purchase", "net", "vat", "total", "vat_category",
+                    "claimable_vat")
+    list_filter = ("kind", "vat_category", "supplier_vat_registered")
     search_fields = ("number", "purchase__supplier__name_en")
-    readonly_fields = ("qr_check", "created_by", "created_at", "updated_at")
+    # The supplier copy and the claimable VAT are written by save() only.
+    readonly_fields = ("qr_check", "supplier_vat_registered", "supplier_vat_number", "supplier_crn", "claimable_vat",
+                       "created_by", "created_at", "updated_at")
     raw_id_fields = ("purchase",)
+
+    # In a filed VAT period a document changes only through the API, with
+    # an owner override that is logged (vat_returns/locks.py).
+    def _locked(self, obj):
+        return obj is not None and locks.locked_period(obj.purchase.branch, obj.claim_date) is not None
+
+    def has_change_permission(self, request, obj=None):
+        return super().has_change_permission(request, obj) and not self._locked(obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return super().has_delete_permission(request, obj) and not self._locked(obj)

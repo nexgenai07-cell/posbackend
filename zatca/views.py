@@ -1,5 +1,6 @@
 from django.db import transaction
 from django.db.models import Count, Q
+from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import AllowAny
@@ -268,6 +269,29 @@ class DocumentRetryView(APIView):
             pos.submit_safely(document.pk)
             document.refresh_from_db()
         return Response(ZatcaDocumentSerializer(document).data)
+
+
+class DocumentXmlView(APIView):
+    """GET ?which=signed|cleared: download a document's XML. "signed" is the
+    XML this POS signed (every document); "cleared" is the copy ZATCA sent
+    back for a cleared B2B invoice, 404 when there is none."""
+
+    permission_classes = [IsOwnerOrManager]
+
+    def get(self, request, pk):
+        document = get_object_or_404(ZatcaDocument, pk=pk, branch=request.user.branch)
+        which = request.query_params.get("which", "signed")
+        if which == "cleared":
+            xml, filename = document.cleared_xml, f"{document.number}_cleared.xml"
+        elif which == "signed":
+            xml, filename = document.signed_xml, f"{document.number}.xml"
+        else:
+            return Response({"which": "error.xmlKindInvalid"}, status=status.HTTP_400_BAD_REQUEST)
+        if not xml:
+            raise Http404
+        response = HttpResponse(xml, content_type="application/xml; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 
 
 # -- go-live wizard (owners act, managers watch) --------------------------------

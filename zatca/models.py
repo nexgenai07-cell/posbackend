@@ -29,6 +29,14 @@ class SellerIdScheme(models.TextChoices):
     OTH = "OTH", "Other ID"
 
 
+class VatFilingFrequency(models.TextChoices):
+    """How often the VAT return is filed: quarterly by default (turnover up
+    to SAR 40 million), monthly above that or by choice."""
+
+    QUARTERLY = "quarterly", "Quarterly"
+    MONTHLY = "monthly", "Monthly"
+
+
 class ZatcaSettings(models.Model):
     """
     One branch's ZATCA identity: who the seller is on every invoice and which
@@ -77,6 +85,20 @@ class ZatcaSettings(models.Model):
     # Printed at the bottom of every tax invoice and credit note.
     receipt_footer_en = models.CharField(max_length=255, blank=True)
     receipt_footer_ar = models.CharField(max_length=255, blank=True)
+
+    # VAT returns (vat_returns app). Edited through /api/vat/settings/, which
+    # rebuilds the periods; the first period starts on the later of the two
+    # dates, and there are no periods until at least one is set.
+    vat_filing_frequency = models.CharField(max_length=10, choices=VatFilingFrequency.choices,
+                                            default=VatFilingFrequency.QUARTERLY)
+    vat_registration_date = models.DateField(null=True, blank=True)
+    vat_tracking_start = models.DateField(null=True, blank=True)
+    # A frequency change once a period is filed (M9): vat_filing_frequency
+    # applies to periods starting on or after this date (a quarter start);
+    # earlier ones keep the frequency they were created with. None: it
+    # applies from the first period.
+    vat_frequency_effective_from = models.DateField(null=True, blank=True)
+    vat_reminder_days = models.PositiveSmallIntegerField(default=14)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -340,6 +362,12 @@ class ZatcaDocument(models.Model):
     issued_at = models.DateTimeField()
     total = models.DecimalField(max_digits=12, decimal_places=2)
     vat_total = models.DecimalField(max_digits=12, decimal_places=2)
+    # The VAT return's source figures, exactly as the signed XML states them
+    # (see zatca/breakdown.py): TaxExclusiveAmount, and per VAT category the
+    # taxable amount and VAT. Positive for every kind. Null only on an old
+    # document the backfill couldn't read; the VAT dashboard flags those.
+    net_total = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    vat_breakdown = models.JSONField(null=True, blank=True)
     original = models.ForeignKey("self", on_delete=models.PROTECT, null=True, blank=True, related_name="adjustments")
     reason = models.CharField(max_length=255, blank=True)
     # Where it came from: "pos", or "selftest" for the milestone checks.

@@ -5,8 +5,17 @@ from django.db import transaction
 
 from common.validators import reject_branch_mismatch, require_bilingual_pair
 from inventory.models import InventoryItem, StockMovement
+from vat_returns import periods as vat_periods
 
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument, SupplierDocumentKind
+from .models import (
+    Purchase,
+    PurchaseItem,
+    PurchaseStatus,
+    Supplier,
+    SupplierDocument,
+    SupplierDocumentKind,
+    SupplierVatCategory,
+)
 from .vat import check_qr
 
 
@@ -58,14 +67,26 @@ class SupplierDocumentSerializer(serializers.ModelSerializer):
                                                                   "required": "error.supplierInvoiceNumberRequired"})
     issue_date = serializers.DateField(error_messages={"invalid": "error.dateInvalid", "required": "error.dateInvalid",
                                                        "null": "error.dateInvalid"})
+    # Owner only, with a lock override: claim a document dated in a filed
+    # VAT period in that period (to amend its return) rather than the
+    # oldest open one.
+    keep_in_filed_period = serializers.BooleanField(write_only=True, required=False)
+    # The VAT period that claims it and, when that isn't the period of its
+    # own date (that one was filed), the period of its date.
+    claim_period = serializers.SerializerMethodField()
+    issue_period = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierDocument
-        fields = ["id", "purchase", "kind", "number", "issue_date", "net", "vat", "total", "reason", "qr_text",
-                  "qr_check", "xml", "pdf_url", "created_at", "updated_at"]
-        read_only_fields = ["id", "purchase", "kind", "qr_check", "created_at", "updated_at"]
+        fields = ["id", "purchase", "kind", "number", "issue_date", "net", "vat", "total", "vat_category", "reason",
+                  "qr_text", "qr_check", "xml", "pdf_url", "supplier_vat_registered", "supplier_vat_number",
+                  "supplier_crn", "claimable_vat", "claim_date", "claim_period", "issue_period",
+                  "keep_in_filed_period", "created_at", "updated_at"]
+        read_only_fields = ["id", "purchase", "kind", "qr_check", "supplier_vat_registered", "supplier_vat_number",
+                            "supplier_crn", "claimable_vat", "claim_date", "created_at", "updated_at"]
         extra_kwargs = {"reason": {"required": False}, "qr_text": {"required": False},
-                        "xml": {"required": False}, "pdf_url": {"required": False}}
+                        "xml": {"required": False}, "pdf_url": {"required": False},
+                        "vat_category": {"required": False}}
 
     def validate(self, attrs):
         purchase = self.context["purchase"]
@@ -75,6 +96,14 @@ class SupplierDocumentSerializer(serializers.ModelSerializer):
         if not supplier.vat_registered and merged["vat"]:
             # A supplier outside VAT can't charge it; nothing to claim either.
             errors["vat"] = "error.supplierNotVatRegistered"
+        if merged["vat"]:
+            category = attrs.get("vat_category")
+            if category in (SupplierVatCategory.ZERO, SupplierVatCategory.EXEMPT):
+                errors["vat_category"] = "error.vatCategoryNeedsZeroVat"
+            elif category is None and self.instance is not None:
+                # VAT entered on a document that was zero rated/exempt: it's
+                # standard rated now, unless the request says otherwise.
+                attrs["vat_category"] = SupplierVatCategory.STANDARD
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
@@ -88,6 +117,25 @@ class SupplierDocumentSerializer(serializers.ModelSerializer):
                                       issue_date=values.get("issue_date"), total=values.get("total"),
                                       vat=values.get("vat"))
         return super().save(**kwargs)
+
+    def create(self, validated_data):
+        keep = validated_data.pop("keep_in_filed_period", False)
+        document = SupplierDocument(**validated_data)
+        document.keep_in_filed_period = keep
+        document.save()
+        return document
+
+    def update(self, instance, validated_data):
+        instance.keep_in_filed_period = validated_data.pop("keep_in_filed_period", False)
+        return super().update(instance, validated_data)
+
+    def get_claim_period(self, obj):
+        return vat_periods.period_on(obj.purchase.branch, obj.claim_date)
+
+    def get_issue_period(self, obj):
+        if obj.claim_date == obj.issue_date:
+            return None
+        return vat_periods.period_on(obj.purchase.branch, obj.issue_date)
 
 
 class PurchaseItemSerializer(serializers.ModelSerializer):

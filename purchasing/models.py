@@ -2,6 +2,7 @@ from django.db import models
 
 from branches.models import Branch
 from common.models import BaseModel
+from vat_returns import locks
 
 
 class Supplier(BaseModel):
@@ -67,6 +68,14 @@ class SupplierDocumentKind(models.TextChoices):
     CREDIT_NOTE = "credit_note", "Credit note"
 
 
+class SupplierVatCategory(models.TextChoices):
+    """Which purchases box of the VAT return a document belongs to."""
+
+    STANDARD = "standard", "Standard rated"
+    ZERO = "zero", "Zero rated"
+    EXEMPT = "exempt", "Exempt"
+
+
 class SupplierDocument(models.Model):
     """
     A tax document the SUPPLIER issued for a purchase: its tax invoice (at
@@ -79,6 +88,11 @@ class SupplierDocument(models.Model):
     purchasing/vat.py): the decoded fields and any mismatch with what was
     entered.
 
+    The supplier's VAT details are copied onto the document every time it is
+    saved (the `supplier_*` fields), and `claimable_vat` is worked out from
+    that copy, so the input VAT is a stored figure: editing a supplier later
+    changes its documents only through refresh_supplier_documents().
+
     Not a BaseModel: a tax record, deleted only for a keying mistake.
     """
 
@@ -89,6 +103,19 @@ class SupplierDocument(models.Model):
     net = models.DecimalField(max_digits=12, decimal_places=2)
     vat = models.DecimalField(max_digits=12, decimal_places=2)
     total = models.DecimalField(max_digits=12, decimal_places=2)
+    # VAT 0 defaults to zero rated (save()); the owner can mark it exempt.
+    vat_category = models.CharField(max_length=10, choices=SupplierVatCategory.choices,
+                                    default=SupplierVatCategory.STANDARD)
+    supplier_vat_registered = models.BooleanField(default=True)
+    supplier_vat_number = models.CharField(max_length=15, blank=True)
+    supplier_crn = models.CharField(max_length=10, blank=True)
+    # Signed: negative for a credit note, 0 when not claimable (purchasing/vat.py).
+    claimable_vat = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # The date that decides which VAT period claims this document: its own
+    # date, or for one dated in a filed period, the start of the oldest
+    # open period (save(), _claim_date()). A date rather than a period
+    # link, so it survives switching environment or frequency.
+    claim_date = models.DateField()
     reason = models.CharField(max_length=255, blank=True)
     qr_text = models.TextField(blank=True)
     qr_check = models.JSONField(default=dict, blank=True)
@@ -108,3 +135,64 @@ class SupplierDocument(models.Model):
 
     def __str__(self):
         return f"{self.get_kind_display()} {self.number} ({self.total})"
+
+    # Set (not stored) by the owner's "claim in the filed period": the
+    # document is claimed on its own date even in a filed period, which
+    # then needs a lock override.
+    keep_in_filed_period = False
+
+    # Written by save() on every save, whatever else update_fields names.
+    DERIVED_FIELDS = ("vat_category", "supplier_vat_registered", "supplier_vat_number", "supplier_crn",
+                      "claimable_vat", "claim_date")
+
+    def save(self, *args, **kwargs):
+        from .vat import claimable_vat
+
+        supplier = self.purchase.supplier
+        self.supplier_vat_registered = supplier.vat_registered
+        self.supplier_vat_number = supplier.vat_number
+        self.supplier_crn = supplier.crn
+        if not self.vat and self.vat_category == SupplierVatCategory.STANDARD:
+            self.vat_category = SupplierVatCategory.ZERO
+        self.claimable_vat = claimable_vat(self)
+        self.claim_date = self._claim_date()
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = {*kwargs["update_fields"], *self.DERIVED_FIELDS, "updated_at"}
+        # A document in a filed VAT period changes only with an owner override.
+        with locks.guard_supplier_document(self, "update" if self.pk else "create"):
+            super().save(*args, **kwargs)
+
+    def _claim_date(self):
+        """Its own date, unless that is in a filed VAT period: then the
+        oldest open period's first day (VAT plan §7.2), since input VAT may
+        be claimed in a later return. A save that doesn't change the date
+        keeps the stored claim date, so a re-save never moves a document
+        between periods."""
+        if self.keep_in_filed_period:
+            return self.issue_date
+        if self.pk:
+            stored = type(self).objects.filter(pk=self.pk).values_list("issue_date", "claim_date").first()
+            if stored is not None and stored[0] == self.issue_date:
+                return stored[1]
+        return locks.claim_date_for(self.purchase.branch, self.issue_date)
+
+    def delete(self, *args, **kwargs):
+        with locks.guard_supplier_document(self, "delete"):
+            return super().delete(*args, **kwargs)
+
+
+def refresh_supplier_documents(supplier):
+    """Re-copy a supplier's edited VAT details onto its documents, so fixing
+    a missing VAT number makes their VAT claimable. Documents in a filed VAT
+    period are left as they were filed. Returns (refreshed, left as filed)."""
+    documents = SupplierDocument.objects.filter(purchase__supplier=supplier).select_related("purchase__supplier",
+                                                                                             "purchase__branch")
+    refreshed = kept = 0
+    for document in documents:
+        try:
+            document.save(update_fields=[])
+        except locks.PeriodLocked:
+            kept += 1
+            continue
+        refreshed += 1
+    return refreshed, kept
