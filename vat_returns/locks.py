@@ -1,12 +1,13 @@
 """
-Period locks. Filing a VAT return locks its period: a supplier document
-whose claim date is inside it can't be created, changed (including moved
-out of it) or deleted, unless the owner overrides with a reason. Every
-override is written as a VatLockOverride and an audit entry, in the same
-transaction as the change.
+Period locks. Filing a VAT return locks its period: a supplier document or
+business expense whose claim date is inside it can't be created, changed
+(including moved out of it), deleted or voided, unless the owner overrides
+with a reason. Every override is written as a VatLockOverride and an audit
+entry, in the same transaction as the change.
 
-The guard runs inside SupplierDocument.save() and .delete(), so the API,
-the Django admin and the shell all go through it. A view lets the owner
+The guard runs inside SupplierDocument.save()/.delete() and Expense.save()
+(a void is a save), so the API, the Django admin and the shell all go
+through it. A view lets the owner
 override by wrapping its work in `override_from(request)`, which reads
 `lock_override_reason` from the body (or the query string, for DELETE).
 
@@ -36,6 +37,9 @@ from .models import VatAuditLog, VatLockOverride, VatPeriod
 
 MIN_REASON = 10
 SUPPLIER_DOCUMENT = "purchasing.SupplierDocument"
+EXPENSE = "purchasing.Expense"
+# How an override names the document in the audit summary.
+NOUNS = {SUPPLIER_DOCUMENT: "supplier", EXPENSE: "expense"}
 
 _override = ContextVar("vat_lock_override", default=None)
 
@@ -114,16 +118,20 @@ def override_from(request):
 
 
 def _snapshot(document):
-    return {
+    snapshot = {
         "number": document.number, "kind": document.kind, "issue_date": document.issue_date,
         "claim_date": document.claim_date, "net": document.net, "vat": document.vat, "total": document.total,
         "vat_category": document.vat_category, "claimable_vat": document.claimable_vat,
     }
+    if hasattr(document, "voided"):  # expenses
+        snapshot.update(voided=document.voided, not_claimable=document.not_claimable)
+    return snapshot
 
 
 @contextmanager
-def guard_supplier_document(document, action):
-    """Wraps the save ("create" / "update") or delete of a supplier document.
+def guard_tax_document(document, action):
+    """Wraps the save ("create" / "update" / "void") or delete of a supplier
+    document or expense (anything with `tax_branch` and `claim_date`).
     Checks the claim date it had (from the database) and the one it will
     have; raises PeriodLocked when either is in a filed period and there is
     no override."""
@@ -135,7 +143,8 @@ def guard_supplier_document(document, action):
             days.append(old.claim_date)
     if action != "delete":
         days.append(document.claim_date)
-    branch = document.purchase.branch
+    branch = document.tax_branch
+    object_type = document._meta.label
     periods = {}
     for day in days:
         period = locked_period(branch, day)
@@ -158,12 +167,13 @@ def guard_supplier_document(document, action):
         object_id = object_id or document.pk
         after = None if action == "delete" else _snapshot(document)
         for period in periods.values():
-            VatLockOverride.objects.create(period=period, action=action, object_type=SUPPLIER_DOCUMENT,
+            VatLockOverride.objects.create(period=period, action=action, object_type=object_type,
                                            object_id=object_id, before=before, after=after, reason=reason,
                                            actor=actor)
             VatAuditLog.objects.create(
                 branch=period.branch, period=period, actor=actor, action="lock_override",
-                summary=f"{action} supplier {document.kind.replace('_', ' ')} {document.number}",
-                data={"object_type": SUPPLIER_DOCUMENT, "object_id": object_id, "before": before, "after": after,
+                summary=f"{action} {NOUNS.get(object_type, object_type)} {document.kind.replace('_', ' ')} "
+                        f"{document.number}",
+                data={"object_type": object_type, "object_id": object_id, "before": before, "after": after,
                       "reason": reason},
             )

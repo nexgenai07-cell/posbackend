@@ -120,6 +120,10 @@ SUPPLIER_VAT = "supplierVatMissing"
 TOTALS = "totalsDontAdd"
 VAT_NOT_STANDARD = "vatNot15"
 NET_VS_PO = "netDiffersFromPurchase"
+# Business expenses only (purchasing/expenses.py).
+NOT_CLAIMABLE = "notClaimable"
+NO_ATTACHMENT = "noAttachment"
+POSSIBLE_DUPLICATE = "possibleDuplicate"
 
 # The flags that hold a document's VAT back from the claim: it goes to the
 # "VAT needing review" card instead, until the supplier's details are fixed.
@@ -136,6 +140,9 @@ FLAG_LABELS = {
     TOTALS: "Net + VAT doesn't equal total",
     VAT_NOT_STANDARD: "VAT not 15%",
     NET_VS_PO: "Net differs from purchase order",
+    NOT_CLAIMABLE: "Not claimable",
+    NO_ATTACHMENT: "No attachment",
+    POSSIBLE_DUPLICATE: "Possible duplicate",
 }
 
 STANDARD_RATE = Decimal("15")
@@ -153,8 +160,9 @@ def is_claimable(document):
 
 def claimable_vat(document):
     """Input VAT this document lets the restaurant claim (negative for a
-    credit note): none unless is_claimable()."""
-    if not is_claimable(document):
+    credit note): none unless is_claimable(), and none for an expense
+    marked "Not claimable" or voided (its VAT stays recorded)."""
+    if not is_claimable(document) or getattr(document, "not_claimable", False) or getattr(document, "voided", False):
         return Decimal("0.00")
     return -document.vat if document.kind == "credit_note" else document.vat
 

@@ -76,7 +76,39 @@ class SupplierVatCategory(models.TextChoices):
     EXEMPT = "exempt", "Exempt"
 
 
-class SupplierDocument(models.Model):
+class ClaimDateMixin:
+    """Which VAT period claims a tax document (supplier document or
+    expense): `claim_date`. Needs `tax_branch` and `issue_date`."""
+
+    # Set (not stored) by the owner's "claim in the filed period": the
+    # document is claimed on its own date even in a filed period, which
+    # then needs a lock override.
+    keep_in_filed_period = False
+
+    def _claim_date(self):
+        """Its own date, unless that is in a filed VAT period: then the
+        oldest open period's first day (VAT plan §7.2), since input VAT may
+        be claimed in a later return. A save that doesn't change the date
+        keeps the stored claim date, so a re-save never moves a document
+        between periods."""
+        if self.keep_in_filed_period:
+            return self.issue_date
+        if self.pk:
+            stored = type(self).objects.filter(pk=self.pk).values_list("issue_date", "claim_date").first()
+            if stored is not None and stored[0] == self.issue_date:
+                return stored[1]
+        return locks.claim_date_for(self.tax_branch, self.issue_date)
+
+    def _copy_supplier(self, supplier):
+        """The supplier's VAT details as they are now, kept on the document."""
+        self.supplier_vat_registered = supplier.vat_registered
+        self.supplier_vat_number = supplier.vat_number
+        self.supplier_crn = supplier.crn
+        if not self.vat and self.vat_category == SupplierVatCategory.STANDARD:
+            self.vat_category = SupplierVatCategory.ZERO
+
+
+class SupplierDocument(ClaimDateMixin, models.Model):
     """
     A tax document the SUPPLIER issued for a purchase: its tax invoice (at
     most one per purchase) or a credit note for a return. Recorded here for
@@ -136,57 +168,143 @@ class SupplierDocument(models.Model):
     def __str__(self):
         return f"{self.get_kind_display()} {self.number} ({self.total})"
 
-    # Set (not stored) by the owner's "claim in the filed period": the
-    # document is claimed on its own date even in a filed period, which
-    # then needs a lock override.
-    keep_in_filed_period = False
-
     # Written by save() on every save, whatever else update_fields names.
     DERIVED_FIELDS = ("vat_category", "supplier_vat_registered", "supplier_vat_number", "supplier_crn",
                       "claimable_vat", "claim_date")
 
+    @property
+    def tax_branch(self):
+        return self.purchase.branch
+
     def save(self, *args, **kwargs):
         from .vat import claimable_vat
 
-        supplier = self.purchase.supplier
-        self.supplier_vat_registered = supplier.vat_registered
-        self.supplier_vat_number = supplier.vat_number
-        self.supplier_crn = supplier.crn
-        if not self.vat and self.vat_category == SupplierVatCategory.STANDARD:
-            self.vat_category = SupplierVatCategory.ZERO
+        self._copy_supplier(self.purchase.supplier)
         self.claimable_vat = claimable_vat(self)
         self.claim_date = self._claim_date()
         if kwargs.get("update_fields") is not None:
             kwargs["update_fields"] = {*kwargs["update_fields"], *self.DERIVED_FIELDS, "updated_at"}
         # A document in a filed VAT period changes only with an owner override.
-        with locks.guard_supplier_document(self, "update" if self.pk else "create"):
+        with locks.guard_tax_document(self, "update" if self.pk else "create"):
             super().save(*args, **kwargs)
 
-    def _claim_date(self):
-        """Its own date, unless that is in a filed VAT period: then the
-        oldest open period's first day (VAT plan §7.2), since input VAT may
-        be claimed in a later return. A save that doesn't change the date
-        keeps the stored claim date, so a re-save never moves a document
-        between periods."""
-        if self.keep_in_filed_period:
-            return self.issue_date
-        if self.pk:
-            stored = type(self).objects.filter(pk=self.pk).values_list("issue_date", "claim_date").first()
-            if stored is not None and stored[0] == self.issue_date:
-                return stored[1]
-        return locks.claim_date_for(self.purchase.branch, self.issue_date)
-
     def delete(self, *args, **kwargs):
-        with locks.guard_supplier_document(self, "delete"):
+        with locks.guard_tax_document(self, "delete"):
             return super().delete(*args, **kwargs)
 
 
+class ExpenseCategory(models.TextChoices):
+    RENT = "rent", "Rent"
+    UTILITIES = "utilities", "Utilities"
+    EQUIPMENT = "equipment", "Equipment"
+    MAINTENANCE = "maintenance", "Maintenance"
+    SERVICES = "services", "Services"
+    MARKETING = "marketing", "Marketing"
+    OTHER = "other", "Other"
+
+
+class NotClaimableReason(models.TextChoices):
+    """Why an expense's VAT is recorded but not claimed (blocked input VAT).
+    A starting list; the accountant confirms which apply (runbook A10)."""
+
+    PERSONAL_USE = "personal_use", "Personal use"
+    ENTERTAINMENT = "entertainment", "Entertainment / hospitality"
+    GIFTS = "gifts", "Gifts"
+    PASSENGER_CAR = "passenger_car", "Passenger car (non-commercial)"
+    STAFF_BENEFITS = "staff_benefits", "Staff personal benefits"
+    OTHER = "other", "Other"
+
+
+class Expense(ClaimDateMixin, models.Model):
+    """
+    A business expense with VAT paid outside a purchase order (rent,
+    utilities, equipment, maintenance, services, marketing): the supplier's
+    tax invoice or credit note, keyed in from paper, PDF or photo. Input VAT
+    like a SupplierDocument, with the same rules (purchasing/vat.py), the
+    same supplier snapshot, claim date and period lock (VAT plan §12).
+
+    "Not claimable" keeps the VAT recorded but claims none (blocked input
+    VAT: personal use, entertainment, ...). `capital_asset` marks equipment
+    for the accountant.
+
+    Never deleted: a wrong expense is voided with a reason (purchasing/
+    expenses.py), stays listed and stops counting.
+    """
+
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="expenses")
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="expenses")
+    kind = models.CharField(max_length=12, choices=SupplierDocumentKind.choices, default=SupplierDocumentKind.INVOICE)
+    number = models.CharField(max_length=64)
+    issue_date = models.DateField()
+    category = models.CharField(max_length=12, choices=ExpenseCategory.choices)
+    description = models.CharField(max_length=255, blank=True)
+    net = models.DecimalField(max_digits=12, decimal_places=2)
+    vat = models.DecimalField(max_digits=12, decimal_places=2)
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    vat_category = models.CharField(max_length=10, choices=SupplierVatCategory.choices,
+                                    default=SupplierVatCategory.STANDARD)
+    supplier_vat_registered = models.BooleanField(default=True)
+    supplier_vat_number = models.CharField(max_length=15, blank=True)
+    supplier_crn = models.CharField(max_length=10, blank=True)
+    not_claimable = models.BooleanField(default=False)
+    not_claimable_reason = models.CharField(max_length=16, choices=NotClaimableReason.choices, blank=True)
+    not_claimable_note = models.CharField(max_length=255, blank=True)
+    # Signed: negative for a credit note; 0 when not claimable or voided.
+    claimable_vat = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    capital_asset = models.BooleanField(default=False)
+    claim_date = models.DateField()
+    qr_text = models.TextField(blank=True)
+    qr_check = models.JSONField(default=dict, blank=True)
+    # The supplier's PDF or a photo of the paper invoice (Cloudinary URL).
+    attachment_url = models.CharField(max_length=500, blank=True)
+    attachment_name = models.CharField(max_length=255, blank=True)
+    voided = models.BooleanField(default=False)
+    voided_reason = models.TextField(blank=True)
+    voided_by = models.ForeignKey("accounts.Staff", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    voided_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey("accounts.Staff", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-issue_date", "-id"]
+        indexes = [models.Index(fields=["branch", "claim_date"], name="expense_branch_claim_date")]
+
+    def __str__(self):
+        return f"Expense {self.number} ({self.total})"
+
+    DERIVED_FIELDS = SupplierDocument.DERIVED_FIELDS
+
+    @property
+    def tax_branch(self):
+        return self.branch
+
+    def save(self, *args, **kwargs):
+        from .vat import claimable_vat
+
+        self._copy_supplier(self.supplier)
+        self.claimable_vat = claimable_vat(self)
+        self.claim_date = self._claim_date()
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = {*kwargs["update_fields"], *self.DERIVED_FIELDS, "updated_at"}
+        action = getattr(self, "_lock_action", None) or ("update" if self.pk else "create")
+        with locks.guard_tax_document(self, action):
+            super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise models.ProtectedError("Expenses are voided, never deleted.", {self})
+
+
 def refresh_supplier_documents(supplier):
-    """Re-copy a supplier's edited VAT details onto its documents, so fixing
-    a missing VAT number makes their VAT claimable. Documents in a filed VAT
-    period are left as they were filed. Returns (refreshed, left as filed)."""
-    documents = SupplierDocument.objects.filter(purchase__supplier=supplier).select_related("purchase__supplier",
-                                                                                             "purchase__branch")
+    """Re-copy a supplier's edited VAT details onto its documents and
+    (non-voided) expenses, so fixing a missing VAT number makes their VAT
+    claimable. Documents in a filed VAT period are left as they were filed.
+    Returns (refreshed, left as filed)."""
+    documents = [
+        *SupplierDocument.objects.filter(purchase__supplier=supplier).select_related("purchase__supplier",
+                                                                                     "purchase__branch"),
+        *Expense.objects.filter(supplier=supplier, voided=False).select_related("supplier", "branch"),
+    ]
     refreshed = kept = 0
     for document in documents:
         try:

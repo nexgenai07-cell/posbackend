@@ -174,6 +174,8 @@ def period_pdf(branch, settings, detail):
     summary = [["", "SAR"],
                ["Sales VAT (output)", money(cards["output_vat"])],
                ["Purchase VAT (input, claimable)", money(cards["input_vat"])],
+               ["    from purchase orders", money(cards["input_vat_purchases"])],
+               ["    from expenses", money(cards["input_vat_expenses"])],
                [f"Credit carried in ({cards['credit_source']})", money(cards["credit_in"])]]
     if cards["correction"]:
         summary.append([_p(f"Box 14 correction: {detail['correction_reason']}", cell), money(cards["correction"])])

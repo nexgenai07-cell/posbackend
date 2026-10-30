@@ -147,11 +147,11 @@ class VatFiling(models.Model):
 
 
 class VatLockOverride(models.Model):
-    """A change to a supplier document dated in a filed (locked) period that
-    the owner pushed through, with the reason and the stored figures before
-    and after. Written in the same transaction as the change."""
+    """A change to a supplier document or expense dated in a filed (locked)
+    period that the owner pushed through, with the reason and the stored
+    figures before and after. Written in the same transaction as the change."""
 
-    ACTIONS = [("create", "Create"), ("update", "Update"), ("delete", "Delete")]
+    ACTIONS = [("create", "Create"), ("update", "Update"), ("delete", "Delete"), ("void", "Void")]
 
     period = models.ForeignKey(VatPeriod, on_delete=models.PROTECT, related_name="lock_overrides")
     action = models.CharField(max_length=10, choices=ACTIONS)

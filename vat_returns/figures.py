@@ -9,10 +9,12 @@ Reported or Cleared. Invoices and debit notes add, credit notes subtract
 (their amounts are stored positive). Pending and Rejected ones in the same
 window are listed separately and not counted.
 
-Purchases (input VAT): supplier documents of non-deleted purchases whose
-claim_date falls in the period, adding their stored claimable_vat (negative
-for a credit note, 0 when the supplier isn't VAT-registered or has no VAT
-number: those are listed as "needing review").
+Purchases (input VAT): supplier documents of non-deleted purchases and
+non-voided business expenses (VAT plan §12) whose claim_date falls in the
+period, adding their stored claimable_vat (negative for a credit note, 0
+when the supplier isn't VAT-registered or has no VAT number: those are
+listed as "needing review"; 0 for an expense marked "Not claimable": that
+is blocked VAT, listed for information and left out of the boxes).
 
 Credit carried in: worked out period by period from the first one, which
 starts with its opening credit (owner-entered, usually 0). A filed period
@@ -41,7 +43,7 @@ from zoneinfo import ZoneInfo
 
 from django.db.models import Count, Sum
 
-from purchasing.models import SupplierDocument
+from purchasing.models import Expense, SupplierDocument
 from zatca.models import DocumentStatus, ZatcaDocument
 
 from . import boxes as return_boxes
@@ -73,6 +75,18 @@ def purchase_documents(branches, period):
                                            claim_date__gte=period.start_date, claim_date__lte=period.end_date)
 
 
+def expense_documents(branches, period):
+    """Every non-voided business expense claimed in the period."""
+    return Expense.objects.filter(branch__in=branches, voided=False, claim_date__gte=period.start_date,
+                                  claim_date__lte=period.end_date)
+
+
+def needs_review(qs):
+    """Documents whose VAT is held back until the supplier's details are
+    fixed (not VAT-registered, or no VAT number)."""
+    return qs.exclude(supplier_vat_registered=True, supplier_vat_number__gt="")
+
+
 def _signed_vat(rows):
     return sum((SIGN[row["kind"]] * (row["amount"] or ZERO) for row in rows), ZERO)
 
@@ -83,8 +97,14 @@ def output_vat(branches, period, settings):
     return _signed_vat(rows)
 
 
+def input_vat_parts(branches, period):
+    """(from purchase orders, from expenses): the input VAT card's two lines."""
+    return (purchase_documents(branches, period).aggregate(vat=Sum("claimable_vat"))["vat"] or ZERO,
+            expense_documents(branches, period).aggregate(vat=Sum("claimable_vat"))["vat"] or ZERO)
+
+
 def input_vat(branches, period):
-    return purchase_documents(branches, period).aggregate(vat=Sum("claimable_vat"))["vat"] or ZERO
+    return sum(input_vat_parts(branches, period), ZERO)
 
 
 def current_filing(period):
@@ -180,9 +200,15 @@ def _boxes(branches, period, settings, credit):
                 values[number]["adjustment"] += SIGN[kind] * taxable
             values[number]["vat"] += SIGN[kind] * vat
 
-    claimable = purchase_documents(branches, period).filter(supplier_vat_registered=True).exclude(
-        supplier_vat_number="")
-    for kind, category, net, vat in claimable.values_list("kind", "vat_category", "net", "claimable_vat"):
+    # Claimable documents only: a not-claimable expense's blocked VAT is
+    # left out of the boxes entirely (accountant question A9).
+    claimable = [
+        purchase_documents(branches, period).filter(supplier_vat_registered=True).exclude(supplier_vat_number=""),
+        expense_documents(branches, period).filter(supplier_vat_registered=True, not_claimable=False).exclude(
+            supplier_vat_number=""),
+    ]
+    for kind, category, net, vat in (row for qs in claimable
+                                     for row in qs.values_list("kind", "vat_category", "net", "claimable_vat")):
         number = return_boxes.PURCHASES_BOX[category]
         if kind == "invoice":
             values[number]["amount"] += net
@@ -214,6 +240,7 @@ def document_ids(branches, period, settings):
         "output": sorted(sales_documents(branches, period, settings).filter(status__in=COUNTED)
                          .values_list("id", flat=True)),
         "input": sorted(purchase_documents(branches, period).values_list("id", flat=True)),
+        "expenses": sorted(expense_documents(branches, period).values_list("id", flat=True)),
     }
 
 
@@ -223,21 +250,27 @@ def compute(period, settings, branches=None, filing=None):
     branches = branches or [period.branch]
     filing = filing if filing is not None else current_filing(period)
     output = output_vat(branches, period, settings)
-    purchases = input_vat(branches, period)
+    from_purchases, from_expenses = input_vat_parts(branches, period)
+    purchases = from_purchases + from_expenses
     credit, credit_source = credit_in(branches, period, settings)
     due = net_due(output, purchases, period.correction, credit)
     payments = paid(period)
     # What is owed: ZATCA's figure once filed, ours until then.
     owed = filing.zatca_amount if filing else due
     boxes, missing_breakdown = _boxes(branches, period, settings, credit)
-    review = purchase_documents(branches, period).exclude(supplier_vat_registered=True, supplier_vat_number__gt="")
-    review_rows = review.order_by().values("kind").annotate(amount=Sum("vat"), count=Count("id"))
+    review_rows = [row for qs in (purchase_documents(branches, period), expense_documents(branches, period))
+                   for row in needs_review(qs).order_by().values("kind").annotate(amount=Sum("vat"), count=Count("id"))]
+    blocked_rows = (expense_documents(branches, period).filter(not_claimable=True)
+                    .order_by().values("kind").annotate(amount=Sum("vat"), count=Count("id")))
     previous = (VatPeriod.objects.filter(branch=period.branch, environment=period.environment,
                                          end_date__lt=period.start_date).order_by("-start_date").first())
     return {
         "cards": {
             "output_vat": output,
             "input_vat": purchases,
+            # The input VAT card's two lines; input_vat is the two added up.
+            "input_vat_purchases": from_purchases,
+            "input_vat_expenses": from_expenses,
             "credit_in": credit,
             "credit_source": credit_source,
             "previous_period": previous.pk if previous else None,
@@ -254,6 +287,8 @@ def compute(period, settings, branches=None, filing=None):
         "boxes": boxes,
         "not_counted": _not_counted(branches, period, settings),
         "review": {"count": sum(row["count"] for row in review_rows), "vat": _signed_vat(review_rows)},
+        # Expenses marked "Not claimable": VAT recorded, not claimed. For information.
+        "not_claimable": {"count": sum(row["count"] for row in blocked_rows), "vat": _signed_vat(blocked_rows)},
         # Counted documents whose VAT split couldn't be read (M1 backfill):
         # in the cards, but missing from the boxes.
         "missing_breakdown": missing_breakdown,
@@ -277,7 +312,8 @@ def changed_since_filing(branches, period, settings, filing, output, purchases, 
     filed_ids = snapshot.get("documents", {})
     live_ids = document_ids(branches, period, settings)
     documents = {}
-    for name in ("output", "input"):
+    # A filing made before expenses existed has no "expenses" list.
+    for name in ("output", "input", "expenses"):
         filed, live = set(filed_ids.get(name, [])), set(live_ids[name])
         documents[name] = {"added": sorted(live - filed), "removed": sorted(filed - live)}
     if not any(deltas.values()) and not any(change["added"] or change["removed"] for change in documents.values()):
@@ -287,7 +323,7 @@ def changed_since_filing(branches, period, settings, filing, output, purchases, 
 
 # -- "Show documents" -------------------------------------------------------------
 
-LISTS = ("output", "not_counted", "input", "review")
+LISTS = ("output", "not_counted", "input", "expenses", "review", "not_claimable")
 PAGE_SIZE = 100
 
 
@@ -310,12 +346,37 @@ def _purchase_row(document):
     sign = -1 if document.kind == "credit_note" else 1
     supplier = document.purchase.supplier
     return {
-        "id": document.pk, "purchase": document.purchase_id, "number": document.number, "kind": document.kind,
-        "issue_date": document.issue_date, "claim_date": document.claim_date,
+        "source": "purchase", "id": document.pk, "purchase": document.purchase_id, "number": document.number,
+        "kind": document.kind, "issue_date": document.issue_date, "claim_date": document.claim_date,
         "supplier_name_en": supplier.name_en, "supplier_name_ar": supplier.name_ar,
         "supplier_vat_number": document.supplier_vat_number, "vat_category": document.vat_category,
         "net": sign * document.net, "vat": sign * document.vat, "claimable_vat": document.claimable_vat,
         "flags": purchase_vat.document_flags(document),
+    }
+
+
+def _expense_row(document):
+    from purchasing import expenses as expense_rules
+
+    sign = -1 if document.kind == "credit_note" else 1
+    supplier = document.supplier
+    return {
+        "source": "expense", "id": document.pk, "purchase": None, "number": document.number, "kind": document.kind,
+        "issue_date": document.issue_date, "claim_date": document.claim_date,
+        "supplier_name_en": supplier.name_en, "supplier_name_ar": supplier.name_ar,
+        "supplier_vat_number": document.supplier_vat_number, "vat_category": document.vat_category,
+        "net": sign * document.net, "vat": sign * document.vat, "claimable_vat": document.claimable_vat,
+        "category": document.category, "capital_asset": document.capital_asset,
+        "not_claimable_reason": document.not_claimable_reason if document.not_claimable else "",
+        # No duplicate check here: that is the Expenses page's job.
+        "flags": expense_rules.flags(document, set()),
+    }
+
+
+def _list_totals(querysets):
+    return {
+        "claimable_vat": sum((qs.aggregate(v=Sum("claimable_vat"))["v"] or ZERO for qs in querysets), ZERO),
+        "vat": sum((_signed_vat(qs.order_by().values("kind").annotate(amount=Sum("vat"))) for qs in querysets), ZERO),
     }
 
 
@@ -329,12 +390,27 @@ def document_list(period, settings, which, page=1, branches=None):
         totals = {"vat": _signed_vat(qs.order_by().values("kind").annotate(amount=Sum("vat_total")))}
         qs = qs.select_related("buyer", "original").order_by("issued_at", "id")
         to_row = _sales_row
+    elif which == "review":
+        # Supplier documents and expenses together, by claim date. The list
+        # is what needs fixing, so it is short and merged in memory.
+        parts = [needs_review(purchase_documents(branches, period)), needs_review(expense_documents(branches, period))]
+        merged = sorted([*parts[0].select_related("purchase__supplier"), *parts[1].select_related("supplier")],
+                        key=lambda document: (document.claim_date, isinstance(document, Expense), document.pk))
+        page = max(1, page)
+        rows = [_expense_row(document) if isinstance(document, Expense) else _purchase_row(document)
+                for document in merged[(page - 1) * PAGE_SIZE:page * PAGE_SIZE]]
+        return {"list": which, "count": len(merged), "page": page, "page_size": PAGE_SIZE,
+                "has_more": page * PAGE_SIZE < len(merged), "totals": _list_totals(parts), "rows": rows}
+    elif which in ("expenses", "not_claimable"):
+        qs = expense_documents(branches, period)
+        if which == "not_claimable":
+            qs = qs.filter(not_claimable=True)
+        totals = _list_totals([qs])
+        qs = qs.select_related("supplier").order_by("claim_date", "id")
+        to_row = _expense_row
     else:
         qs = purchase_documents(branches, period)
-        if which == "review":
-            qs = qs.exclude(supplier_vat_registered=True, supplier_vat_number__gt="")
-        totals = {"claimable_vat": qs.aggregate(v=Sum("claimable_vat"))["v"] or ZERO,
-                  "vat": _signed_vat(qs.order_by().values("kind").annotate(amount=Sum("vat")))}
+        totals = _list_totals([qs])
         qs = qs.select_related("purchase__supplier").order_by("claim_date", "id")
         to_row = _purchase_row
     count = qs.count()

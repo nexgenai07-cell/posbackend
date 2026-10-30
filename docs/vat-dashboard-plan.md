@@ -502,6 +502,8 @@ There are no DELETE endpoints in this app.
 | **M9** | **Late purchases, amendments, frequency switch, first period** | Key an invoice dated in a filed quarter → "will be claimed in Q4". Amend a filing → old one shown as superseded. Switch to monthly from the next quarter → monthly periods after it, and a mid-quarter switch is refused. Short first period labelled correctly. |
 
 | **M10** | **Invoice archive** (§11) | ZATCA → Invoice archive: Sales and Purchases tabs, filters, per-document view/PDF/XML, bulk ZIP built in the background with a "ready to download" link; "Download all invoices for this period" on the VAT dashboard. |
+| **M11a** | **Expenses: model, rules, page** (§12) | Inventory → Expenses: add a rent invoice with QR and PDF; a supplier without a VAT number claims 0; "Not claimable" with a reason claims 0 and shows the blocked VAT; "Capital asset" ticks itself for equipment. After filing a period, editing an expense dated in it → "Period locked"; the owner overrides with a reason. Void instead of delete. |
+| **M11b** | **Expenses in VAT figures, report, CSV, archive** (§12) | VAT returns: the input VAT card shows "from purchase orders" + "from expenses" lines, each with Show documents; box 7/10/11 include expenses. Input VAT page and CSV list expenses with source, category, capital asset and not-claimable reason. Invoice archive: Expenses tab and an `expenses/` folder in the ZIP. |
 
 Each milestone comes with backend tests (figures, locks, permissions, CSV format) and I'll report it the way §8 of
 the approval doc asks: what was built, how to test it, and anything I decided differently.
@@ -575,3 +577,137 @@ The list is paginated on the server, like the purchases list.
 | Sales PDF renderer, ZIP job, archive page | **M10** | New dependencies and a background job; nothing earlier needs them |
 
 I'll add the XML download link to M4 unless you'd rather keep everything archive-related in M10.
+
+---
+
+## 12. M11: Business expenses with VAT
+
+VAT paid **outside purchase orders**: rent, electricity and water, equipment, maintenance, services, marketing.
+Today input VAT only comes from `SupplierDocument`, and every supplier document belongs to a purchase order. These
+costs have no PO, so their VAT is never claimed.
+
+### 12.1 Where it fits
+It touches M2 (claimable rules), M4 (cards, boxes, lists), M5 (locks), M7 (CSV) and M10 (archive). Those are
+written and waiting for your test run, so I'd **not** reopen them. Instead it becomes **M11**, in two stops:
+- **M11a**: model, rules, Expenses page, locks.
+- **M11b**: VAT dashboard, Input VAT report and CSV, invoice archive.
+
+It should come **before the VPS deploy**, so the server is migrated once, with everything.
+
+### 12.2 Model: `purchasing.Expense`
+A new model, not a `SupplierDocument` without a purchase. A supplier document's rules (one invoice per PO, the
+net-vs-PO check, "received without invoice") don't apply to expenses, and making `purchase` nullable would touch
+every query that joins through it. The VAT logic is shared instead (§12.3).
+
+Not a BaseModel, never deleted (§12.5). One row per supplier document.
+
+| Field | Notes |
+|---|---|
+| `branch` | FK, PROTECT |
+| `supplier` | FK `Supplier`, PROTECT. Picked from the Suppliers list, or created inline from the expense form (name EN/AR, VAT-registered, VAT number, CR). The landlord and the electricity company become ordinary suppliers. |
+| `kind` | `invoice` / `credit_note` (e.g. a refund on returned equipment); credit notes are negative everywhere, as for supplier documents |
+| `number`, `issue_date` | as printed |
+| `category` | `rent`, `utilities`, `equipment`, `maintenance`, `services`, `marketing`, `other` |
+| `description` | short text; required when category = `other` |
+| `net`, `vat`, `total` | as printed |
+| `vat_category` | `standard` / `zero` / `exempt`; VAT 0 defaults to zero rated, as for supplier documents |
+| `supplier_vat_registered`, `supplier_vat_number`, `supplier_crn` | **snapshot** at every save |
+| `not_claimable` | bool, the "Not claimable" switch |
+| `not_claimable_reason` | `personal_use` / `entertainment` / `gifts` / `other`, plus `not_claimable_note` (required for `other`) |
+| `claimable_vat` | stored, signed; 0 when not claimable (§12.3) |
+| `capital_asset` | bool; ticked automatically when category = equipment, owner/manager can change it |
+| `claim_date` | same rule as supplier documents: its date, or the oldest open period if that date is in a filed one |
+| `qr_text`, `qr_check` | same QR check as supplier documents (`purchasing.vat.check_qr`) |
+| `attachment_url`, `attachment_name` | PDF or photo (JPG/PNG), Cloudinary signed upload as today |
+| `voided`, `voided_reason`, `voided_by`, `voided_at` | a wrong expense is voided, never deleted |
+| `created_by`, `created_at`, `updated_at` | |
+
+Migration: `purchasing/0009_expense` (schema only, no backfill: there are no expenses yet).
+
+### 12.3 Claimable rules (shared with supplier documents)
+`purchasing/vat.py` already works on any object with `kind`, `net`, `vat`, `total`, `vat_category`, `qr_check` and the
+supplier snapshot. Expenses use the same functions:
+- **Claimable = 0** when the supplier wasn't VAT-registered, has no VAT number, **or the expense is marked Not
+  claimable**. Otherwise claimable = VAT (negative for a credit note).
+- **Flags**, same codes and labels: `noQr`, `qrUnreadable`, `qrMismatch`, `notRegistered`, `supplierVatMissing`,
+  `totalsDontAdd`, `vatNot15`. New for expenses:
+  - `notClaimable`: "Not claimable: personal use" etc. Shown, not a problem to fix.
+  - `noAttachment`: no PDF/photo uploaded.
+  - `possibleDuplicate`: another non-voided expense or supplier document has the same supplier, number and kind.
+  Warnings only, never a block.
+- `netDiffersFromPurchase` and `noInvoice` don't apply (no PO).
+- **Blocked VAT is recorded, not claimed**: the expense keeps its VAT; `claimable_vat` is 0; the page shows
+  "VAT 150.00 · not claimable (personal use)".
+- Editing a supplier re-copies its details onto its expenses too (`refresh_supplier_documents`), except in filed
+  periods, as now.
+
+### 12.4 Expenses page (admin)
+Inventory → **Expenses** (`/admin/inventory/expenses`), next to Purchases and Input VAT. Owner and manager; a
+cashier gets neither the menu item nor the API (403).
+- **List:** date, supplier, number, category, net, VAT, claimable VAT, flags, attachment, a capital-asset badge.
+  Filters: dates, category, supplier, claimable / not claimable / needs review, capital assets. Voided rows can be
+  shown, struck through.
+- **Form:** supplier picker with "New supplier" inline; number, date, category, description; net, VAT, total
+  (no auto-fill: what's printed is what's typed); VAT category (shown when VAT is 0); QR field with the same live
+  check as supplier documents; attachment; Not claimable switch + reason; Capital asset tick. The form shows
+  the claimable VAT the backend returns, and why (e.g. "0.00: supplier has no VAT number").
+- **Void** (owner and manager) with a reason of at least 10 characters.
+
+API: `GET/POST /api/expenses/`, `GET/PATCH /api/expenses/<id>/`, `POST /api/expenses/<id>/void/`. No DELETE.
+
+### 12.5 Locks, snapshots, never deleted
+- `vat_returns/locks.py`: the guard is made generic (branch and object type passed in) so `Expense.save()` uses the
+  same check as `SupplierDocument.save()`. Creating, changing, moving out of, or voiding an expense whose claim date
+  is in a filed period → `409 error.vatPeriodLocked`; the owner overrides with a reason → `VatLockOverride`
+  (`object_type = "purchasing.Expense"`) + audit entry, in the same transaction.
+- **Void, not delete**: a voided expense stays listed, struck through, and isn't counted. This is stricter than
+  supplier documents (which can be deleted for a keying mistake in an open period). Say if you want both the same
+  either way.
+- Read-only in Django admin when its period is locked.
+
+### 12.6 VAT dashboard (M11b)
+- `figures.input_vat()` = supplier documents + **non-voided expenses** claimed in the period (`claim_date`).
+- The **VAT on purchases** card gets two lines, each with Show documents:
+  - From purchase orders: X
+  - From expenses: Y
+  - Total = X + Y (shown with its formula)
+- **Boxes 7 / 10 / 11**: expenses go in by `vat_category` like supplier documents (standard → 7, zero → 10,
+  exempt → 11), claimable ones only. Not-claimable expenses are left out of the boxes (accountant question A9).
+- **Show documents** lists: `input` (purchase orders, as now), new `expenses`, and `review` includes expenses. A new
+  `not_claimable` list shows blocked VAT (count + VAT), for information.
+- **Checklist**: "Supplier documents with warnings" counts expenses too; new item "Expenses without attachment".
+- **Filing snapshot** stores the expense IDs as well, so "changed since filing" covers them.
+- History, reminders and the period PDF use `figures`, so they follow automatically.
+
+### 12.7 Input VAT report and CSV (M11b)
+- Expenses appear as rows next to supplier documents, by date.
+- New columns: **Source** (Purchase order / Expense), **Expense category**, **Capital asset** (Yes/blank),
+  **Not claimable reason**. The Purchase column is blank for expenses.
+- TOTALS adds both; the header says "supplier invoices and expenses, less credit notes".
+- The "VAT needing review" card includes expenses.
+
+### 12.8 Invoice archive (M11b)
+- A third tab, **Expenses**, with the same filters as Purchases plus category and capital asset.
+- ZIP: a new side `expenses`, folder `expenses/<supplier>_<number>.<pdf|jpg|png>`; a missing or failed attachment is
+  written as `missing (why)` in `index.csv`, like supplier PDFs. `index.csv` gets the category, capital asset and
+  not-claimable columns.
+- "Download all invoices for this period" includes expenses.
+
+### 12.9 Tests
+`purchasing/test_expenses.py` (rules, flags, snapshot, void, permissions, locks) and additions to
+`vat_returns/test_figures.py` (cards, lines, boxes, lists), the Input VAT CSV test and `test_archive.py`.
+
+### 12.10 Questions
+**For you**
+1. **Supplier**: pick from the Suppliers list (+ create inline), as above? Or free-text supplier fields on the
+   expense only (then the landlord isn't in the Suppliers list)? I recommend the Suppliers list.
+2. **Credit notes for expenses**: include them (as above), or invoices only?
+3. **Void vs delete** (§12.5): void only, as above?
+4. **Not-claimable reasons**: personal use, entertainment, gifts, other. Anything to add?
+
+**For the accountant** (added to the runbook list)
+- **A9.** Not-claimable (blocked) VAT: left out of box 7 entirely (our default), or net in box 7 with VAT 0?
+- **A10.** Which expense types are blocked in KSA (entertainment, hospitality, personal use, some vehicles…)? The
+  list above is a starting point, not tax advice.
+- **A11.** Capital assets: is the tick enough, or do they need an asset register (useful life, disposal) for
+  capital-goods adjustments later?

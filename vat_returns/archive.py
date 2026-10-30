@@ -5,12 +5,14 @@ only. Nothing here changes, re-signs or deletes a document.
   sales      ZatcaDocument from the POS (not self-tests) in the branch's
              current environment: invoices, credit and debit notes, B2C/B2B
   purchases  SupplierDocument of non-deleted purchases
+  expenses   non-voided business expenses (VAT plan §12); a voided one is
+             a keying mistake and counts nowhere
 
 Filters come as query parameters (so a filtered view can be bookmarked) and
 are parsed by parse(); the same parsed filter drives the page and a ZIP
 export (archive_zip.py). A VAT period filter means exactly what the VAT
 returns page counts: sales issued in the period's window (Saudi time),
-purchases whose claim_date is in the period.
+purchases and expenses whose claim_date is in the period.
 
 Amounts are signed: credit notes negative, as in the dashboard lists and
 the ZIP's index.csv.
@@ -22,14 +24,14 @@ from zoneinfo import ZoneInfo
 
 from django.db.models import Q, Sum
 
-from purchasing.models import SupplierDocument
+from purchasing.models import Expense, ExpenseCategory, SupplierDocument
 from zatca.models import DocumentStatus, ZatcaDocument
 
 from . import figures
 from .filing import parse_amount
 from .models import VatPeriod
 
-SIDES = ("sales", "purchases")
+SIDES = ("sales", "purchases", "expenses")
 PAGE_SIZE = 50
 ZERO = Decimal("0.00")
 SALES_KINDS = ("invoice", "credit_note", "debit_note")
@@ -40,6 +42,8 @@ KEYS = {
     "sales": ("date_from", "date_to", "period", "kind", "status", "channel", "customer", "number", "amount_min",
               "amount_max", "q"),
     "purchases": ("date_from", "date_to", "period", "kind", "supplier", "number", "amount_min", "amount_max", "q"),
+    "expenses": ("date_from", "date_to", "period", "kind", "supplier", "number", "amount_min", "amount_max", "q",
+                 "category", "capital_asset"),
 }
 
 
@@ -88,6 +92,11 @@ def parse(side, params, branch, settings):
             values[key] = raw if raw in CHANNELS else errors.setdefault(key, "error.archiveChannelInvalid")
         elif key in ("customer", "supplier"):
             values[key] = _id(raw) or errors.setdefault(key, "error.archiveIdInvalid")
+        elif key == "category":
+            values[key] = raw if raw in ExpenseCategory.values else errors.setdefault(key, "error.archiveCategoryInvalid")
+        elif key == "capital_asset":
+            flag = {"true": True, "1": True, "false": False, "0": False}.get(raw.lower())
+            values[key] = flag if flag is not None else errors.setdefault(key, "error.archiveCapitalAssetInvalid")
         elif key in ("amount_min", "amount_max"):
             amount = parse_amount(raw)
             values[key] = amount if amount is not None else errors.setdefault(key, "error.vatAmountInvalid")
@@ -167,7 +176,32 @@ def purchases(branch, settings, filters):
     return queryset.select_related("purchase__supplier").order_by("-issue_date", "-id")
 
 
-QUERIES = {"sales": sales, "purchases": purchases}
+def expenses(branch, settings, filters):
+    queryset = Expense.objects.filter(branch=branch, voided=False)
+    if "date_from" in filters:
+        queryset = queryset.filter(issue_date__gte=filters["date_from"])
+    if "date_to" in filters:
+        queryset = queryset.filter(issue_date__lte=filters["date_to"])
+    if "period" in filters:
+        period = filters["period"]
+        queryset = queryset.filter(claim_date__gte=period.start_date, claim_date__lte=period.end_date)
+    for key in ("kind", "category", "capital_asset"):
+        if key in filters:
+            queryset = queryset.filter(**{key: filters[key]})
+    if "supplier" in filters:
+        queryset = queryset.filter(supplier_id=filters["supplier"])
+    if "number" in filters:
+        queryset = queryset.filter(number__icontains=filters["number"])
+    queryset = _amount_range(queryset, filters)
+    if "q" in filters:
+        q = filters["q"]
+        queryset = queryset.filter(Q(number__icontains=q) | Q(supplier__name_en__icontains=q)
+                                   | Q(supplier__name_ar__icontains=q) | Q(supplier_vat_number__icontains=q)
+                                   | Q(description__icontains=q))
+    return queryset.select_related("supplier").order_by("-issue_date", "-id")
+
+
+QUERIES = {"sales": sales, "purchases": purchases, "expenses": expenses}
 
 
 def sign(kind):
@@ -203,7 +237,23 @@ def purchase_row(document):
     }
 
 
-ROWS = {"sales": sales_row, "purchases": purchase_row}
+def expense_row(document):
+    s = sign(document.kind)
+    supplier = document.supplier
+    return {
+        "id": document.pk, "number": document.number, "kind": document.kind,
+        "issue_date": document.issue_date, "claim_date": document.claim_date,
+        "supplier": supplier.name_en or supplier.name_ar, "supplier_id": supplier.pk,
+        "supplier_vat": document.supplier_vat_number, "category": document.category,
+        "description": document.description, "capital_asset": document.capital_asset,
+        "not_claimable_reason": document.not_claimable_reason if document.not_claimable else "",
+        "net": s * document.net, "vat": s * document.vat, "total": s * document.total,
+        "claimable_vat": document.claimable_vat, "attachment_url": document.attachment_url,
+        "attachment_name": document.attachment_name,
+    }
+
+
+ROWS = {"sales": sales_row, "purchases": purchase_row, "expenses": expense_row}
 
 
 def totals(side, queryset):

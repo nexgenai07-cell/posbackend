@@ -7,7 +7,11 @@ from common.validators import reject_branch_mismatch, require_bilingual_pair
 from inventory.models import InventoryItem, StockMovement
 from vat_returns import periods as vat_periods
 
+from . import expenses as expense_rules
 from .models import (
+    Expense,
+    ExpenseCategory,
+    NotClaimableReason,
     Purchase,
     PurchaseItem,
     PurchaseStatus,
@@ -136,6 +140,128 @@ class SupplierDocumentSerializer(serializers.ModelSerializer):
         if obj.claim_date == obj.issue_date:
             return None
         return vat_periods.period_on(obj.purchase.branch, obj.issue_date)
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    """A business expense (VAT plan §12), as keyed in from the supplier's
+    paper, PDF or photo. The QR is checked on every save, like a supplier
+    document. Supplier VAT details, claimable VAT and claim date are written
+    by Expense.save(); flags and why_not_claimed explain the figure."""
+
+    amount_messages = SupplierDocumentSerializer.amount_messages
+    net = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    vat = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, error_messages=amount_messages)
+    number = serializers.CharField(max_length=64, error_messages={"blank": "error.supplierInvoiceNumberRequired",
+                                                                  "required": "error.supplierInvoiceNumberRequired"})
+    issue_date = serializers.DateField(error_messages={"invalid": "error.dateInvalid", "required": "error.dateInvalid",
+                                                       "null": "error.dateInvalid"})
+    supplier = serializers.PrimaryKeyRelatedField(queryset=Supplier.objects.all(), error_messages={
+        "required": "error.expenseSupplierRequired", "null": "error.expenseSupplierRequired",
+        "does_not_exist": "error.expenseSupplierRequired", "incorrect_type": "error.expenseSupplierRequired"})
+    category = serializers.ChoiceField(choices=ExpenseCategory.choices, error_messages={
+        "required": "error.expenseCategoryRequired", "invalid_choice": "error.expenseCategoryRequired"})
+    supplier_name_en = serializers.CharField(source="supplier.name_en", read_only=True)
+    supplier_name_ar = serializers.CharField(source="supplier.name_ar", read_only=True)
+    keep_in_filed_period = serializers.BooleanField(write_only=True, required=False)
+    claim_period = serializers.SerializerMethodField()
+    issue_period = serializers.SerializerMethodField()
+    flags = serializers.SerializerMethodField()
+    why_not_claimed = serializers.SerializerMethodField()
+    voided_by_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Expense
+        fields = ["id", "branch", "supplier", "supplier_name_en", "supplier_name_ar", "kind", "number", "issue_date",
+                  "category", "description", "net", "vat", "total", "vat_category", "not_claimable",
+                  "not_claimable_reason", "not_claimable_note", "capital_asset", "qr_text", "qr_check",
+                  "attachment_url", "attachment_name", "supplier_vat_registered", "supplier_vat_number",
+                  "supplier_crn", "claimable_vat", "claim_date", "claim_period", "issue_period", "flags",
+                  "why_not_claimed", "keep_in_filed_period", "voided", "voided_reason", "voided_by_name", "voided_at",
+                  "created_by_name", "created_at", "updated_at"]
+        read_only_fields = ["id", "branch", "qr_check", "supplier_vat_registered", "supplier_vat_number",
+                            "supplier_crn", "claimable_vat", "claim_date", "voided", "voided_reason", "voided_at",
+                            "created_at", "updated_at"]
+        extra_kwargs = {name: {"required": False} for name in (
+            "kind", "description", "vat_category", "not_claimable", "not_claimable_reason", "not_claimable_note",
+            "capital_asset", "qr_text", "attachment_url", "attachment_name")}
+
+    def validate(self, attrs):
+        def value(name):
+            return attrs.get(name, getattr(self.instance, name, None))
+
+        errors = {}
+        supplier = value("supplier")
+        if supplier is not None and not supplier.vat_registered and value("vat"):
+            errors["vat"] = "error.supplierNotVatRegistered"
+        if value("vat"):
+            category = attrs.get("vat_category")
+            if category in (SupplierVatCategory.ZERO, SupplierVatCategory.EXEMPT):
+                errors["vat_category"] = "error.vatCategoryNeedsZeroVat"
+            elif category is None and self.instance is not None:
+                attrs["vat_category"] = SupplierVatCategory.STANDARD
+        if value("category") == ExpenseCategory.OTHER and not (value("description") or "").strip():
+            errors["description"] = "error.expenseDescriptionRequired"
+        if value("not_claimable"):
+            reason = value("not_claimable_reason")
+            if reason not in NotClaimableReason.values:
+                errors["not_claimable_reason"] = "error.expenseNotClaimableReasonRequired"
+            elif reason == NotClaimableReason.OTHER and not (value("not_claimable_note") or "").strip():
+                errors["not_claimable_note"] = "error.expenseNotClaimableNoteRequired"
+        elif "not_claimable" in attrs:
+            # Switched back to claimable: the reason no longer applies.
+            attrs["not_claimable_reason"], attrs["not_claimable_note"] = "", ""
+        url = (attrs.get("attachment_url") or "").strip()
+        if url and not url.startswith("https://"):
+            errors["attachment_url"] = "error.attachmentUrlInvalid"
+        if self.instance is None and "capital_asset" not in attrs:
+            # Equipment is usually a capital asset; the tick can be changed.
+            attrs["capital_asset"] = attrs.get("category") == ExpenseCategory.EQUIPMENT
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+    def save(self, **kwargs):
+        saved = ({name: getattr(self.instance, name) for name in ("qr_text", "issue_date", "total", "vat", "supplier")}
+                 if self.instance else {})
+        values = {**saved, **self.validated_data}
+        supplier = values.get("supplier")
+        kwargs["qr_check"] = check_qr(values.get("qr_text", ""), supplier_vat=supplier.vat_number if supplier else "",
+                                      issue_date=values.get("issue_date"), total=values.get("total"),
+                                      vat=values.get("vat"))
+        return super().save(**kwargs)
+
+    def create(self, validated_data):
+        keep = validated_data.pop("keep_in_filed_period", False)
+        expense = Expense(**validated_data)
+        expense.keep_in_filed_period = keep
+        expense.save()
+        return expense
+
+    def update(self, instance, validated_data):
+        instance.keep_in_filed_period = validated_data.pop("keep_in_filed_period", False)
+        return super().update(instance, validated_data)
+
+    def get_claim_period(self, obj):
+        return vat_periods.period_on(obj.branch, obj.claim_date)
+
+    def get_issue_period(self, obj):
+        if obj.claim_date == obj.issue_date:
+            return None
+        return vat_periods.period_on(obj.branch, obj.issue_date)
+
+    def get_flags(self, obj):
+        return expense_rules.flags(obj, self.context.get("duplicates"))
+
+    def get_why_not_claimed(self, obj):
+        return expense_rules.why_not_claimed(obj)
+
+    def get_voided_by_name(self, obj):
+        return obj.voided_by.name if obj.voided_by_id else ""
+
+    def get_created_by_name(self, obj):
+        return obj.created_by.name if obj.created_by_id else ""
 
 
 class PurchaseItemSerializer(serializers.ModelSerializer):

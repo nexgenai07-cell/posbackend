@@ -435,7 +435,7 @@ class VatPeriodAuditView(APIView):
 
 
 class VatPeriodDocumentsView(APIView):
-    """GET ?list=output|not_counted|input|review&page=N: the documents behind
+    """GET ?list=output|not_counted|input|expenses|review|not_claimable&page=N: the documents behind
     a card, 100 a page, with totals over the whole list. Amounts are signed
     (credit notes negative) so the rows add up to the card."""
 
@@ -465,7 +465,7 @@ def _attachment(content, content_type, filename):
 
 
 class ArchiveListView(APIView):
-    """GET /vat/archive/<sales|purchases>/?filters&page=N: one page of the
+    """GET /vat/archive/<sales|purchases|expenses>/?filters&page=N: one page of the
     archive (50 rows) with the count and signed totals over the whole
     filtered list. Filters as in vat_returns/archive.py; a value that
     can't be read is a 400 keyed by its name."""
@@ -527,7 +527,7 @@ class ArchivePurchaseXmlView(APIView):
 
 class ArchiveExportsView(APIView):
     """GET: the branch's latest ZIP exports (newest first), for the page to
-    list and poll. POST {sides: [sales, purchases], ...filters}: request a
+    list and poll. POST {sides: [sales, purchases, expenses], ...filters}: request a
     ZIP of the matching documents; it is built in the background and comes
     back queued (201)."""
 

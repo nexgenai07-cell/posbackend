@@ -18,8 +18,10 @@ from inventory.services import adjust_stock
 from reports.filters import branch_datetime_bounds, parse_date_range
 from vat_returns import locks
 
-from . import input_vat, vat as purchase_vat
+from . import expenses as expense_rules, input_vat, vat as purchase_vat
 from .models import (
+    Expense,
+    ExpenseCategory,
     Purchase,
     PurchaseItem,
     PurchaseStatus,
@@ -29,7 +31,7 @@ from .models import (
     refresh_supplier_documents,
 )
 from .services import apply_purchase_stock, reverse_purchase_stock
-from .serializers import PurchaseSerializer, SupplierDocumentSerializer, SupplierSerializer
+from .serializers import ExpenseSerializer, PurchaseSerializer, SupplierDocumentSerializer, SupplierSerializer
 
 
 def lock_overridable(view):
@@ -80,7 +82,7 @@ class SupplierViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         supplier = self.get_object()
-        if supplier.purchases.exists():
+        if supplier.purchases.exists() or supplier.expenses.exists():
             return Response({"error": "error.supplierInUse"}, status=status.HTTP_409_CONFLICT)
         supplier.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -529,3 +531,86 @@ class PurchaseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         report = input_vat.build(branch, from_date, to_date)
         return csv_response(f"input-vat_{from_date:%Y-%m-%d}_{to_date:%Y-%m-%d}.csv",
                             **input_vat.csv_parts(report, branch))
+
+
+class ExpenseViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
+    """
+    Business expenses with VAT, outside purchase orders (VAT plan §12).
+    Owner and manager only; a cashier gets a 403.
+
+    No DELETE: a wrong expense is voided with a reason (POST .../void/),
+    stays listed and stops counting. A change in a filed VAT period is
+    refused with 409 error.vatPeriodLocked unless the owner sends
+    `lock_override_reason`.
+    """
+
+    queryset = Expense.objects.select_related("supplier", "branch", "voided_by", "created_by")
+    serializer_class = ExpenseSerializer
+    permission_classes = [IsOwnerOrManager]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        from common.filters import bool_filter, choice_filter, fk_filter, ordering_filter, text_filter
+        from django.utils.dateparse import parse_date
+
+        qs = super().get_queryset()
+        if self.action != "list":
+            return qs
+        params = self.request.query_params
+        if (params.get("voided") or "").strip().lower() not in ("1", "true", "yes", "all"):
+            qs = qs.filter(voided=False)
+        qs = fk_filter(qs, params, "supplier", field="supplier_id")
+        qs = choice_filter(qs, params, "category", allowed=ExpenseCategory.values)
+        qs = bool_filter(qs, params, "capital_asset")
+        claim = (params.get("claim") or "").strip()
+        review = Q(supplier_vat_registered=False) | Q(supplier_vat_number="")
+        if claim == "claimable":
+            qs = qs.exclude(claimable_vat=0)
+        elif claim == "not_claimable":
+            qs = qs.filter(not_claimable=True)
+        elif claim == "review":
+            qs = qs.filter(review, vat__gt=0)
+        for param, lookup in (("from", "issue_date__gte"), ("to", "issue_date__lte")):
+            try:
+                day = parse_date((params.get(param) or "").strip())
+            except ValueError:
+                day = None
+            if day:
+                qs = qs.filter(**{lookup: day})
+        qs = text_filter(qs, params, "search", ["number", "description", "supplier__name_en", "supplier__name_ar"])
+        return ordering_filter(qs, params, {
+            "issue_date": "issue_date", "supplier": "supplier__name_en", "category": "category", "net": "net",
+            "vat": "vat", "claimable_vat": "claimable_vat", "total": "total",
+        }, ["-issue_date"])
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action == "list":
+            # Worked out once for the whole page, not per row. A single
+            # expense works it out after its own save (expenses.flags()).
+            context["duplicates"] = expense_rules.duplicate_keys(self.request.user.branch)
+        return context
+
+    @lock_overridable
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        serializer.save(branch=self.request.user.branch, created_by=self.request.user)
+
+    @lock_overridable
+    def partial_update(self, request, *args, **kwargs):
+        if self.get_object().voided:
+            return Response({"error": "error.expenseVoided"}, status=status.HTTP_409_CONFLICT)
+        return super().partial_update(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="void")
+    @lock_overridable
+    def void(self, request, pk=None):
+        """POST {reason, lock_override_reason?}: void a wrong expense."""
+        expense = self.get_object()
+        try:
+            expense_rules.void(expense, request.user, request.data.get("reason"))
+        except expense_rules.VoidRejected as exc:
+            return Response(exc.body, status=exc.status)
+        return Response(self.get_serializer(self.get_queryset().get(pk=expense.pk)).data)

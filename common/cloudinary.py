@@ -43,6 +43,11 @@ ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif", "im
 DOCUMENT_FOLDER = f"{UPLOAD_FOLDER}/supplier-documents"
 ALLOWED_DOCUMENT_TYPES = ("application/pdf",)
 
+# Business expense invoices (VAT plan §12): the supplier's PDF, or a photo
+# of the paper invoice. Raw files too, so a photo is kept as taken.
+EXPENSE_FOLDER = f"{UPLOAD_FOLDER}/expenses"
+ALLOWED_EXPENSE_TYPES = ("application/pdf", "image/jpeg", "image/png")
+
 # Campaign media, posted to Facebook and Instagram. Narrower than product
 # images: neither network takes SVG, and a GIF would post as a still. Video
 # is MP4/MOV, the formats both accept. Cloudinary's free plan caps a video
@@ -57,6 +62,7 @@ CAMPAIGN_VIDEO_TYPES = ("video/mp4", "video/quicktime")
 KINDS = {
     "image": (UPLOAD_FOLDER, "image", lambda: MAX_UPLOAD_BYTES, ALLOWED_IMAGE_TYPES),
     "document": (DOCUMENT_FOLDER, "raw", lambda: MAX_UPLOAD_BYTES, ALLOWED_DOCUMENT_TYPES),
+    "expense": (EXPENSE_FOLDER, "raw", lambda: MAX_UPLOAD_BYTES, ALLOWED_EXPENSE_TYPES),
     "campaign_image": (CAMPAIGN_FOLDER, "image", lambda: MAX_UPLOAD_BYTES, CAMPAIGN_IMAGE_TYPES),
     "campaign_video": (
         CAMPAIGN_FOLDER, "video", lambda: settings.CLOUDINARY_MAX_VIDEO_MB * 1024 * 1024, CAMPAIGN_VIDEO_TYPES,

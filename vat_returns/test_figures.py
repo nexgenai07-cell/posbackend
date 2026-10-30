@@ -116,7 +116,8 @@ class VatFiguresTests(VatFixture, TestCase):
         self.q3_scenario()
         data = self.period(self.q3)
         self.assertEqual(data["cards"], {
-            "output_vat": D("44.70"), "input_vat": D("12.00"), "credit_in": D("0.00"), "credit_source": "none",
+            "output_vat": D("44.70"), "input_vat": D("12.00"), "input_vat_purchases": D("12.00"),
+            "input_vat_expenses": D("0.00"), "credit_in": D("0.00"), "credit_source": "none",
             "previous_period": None, "correction": D("0.00"), "vat_due": D("32.70"), "zatca_amount": None, "difference": None,
             "paid": D("0.00"), "balance": D("32.70"),
         })

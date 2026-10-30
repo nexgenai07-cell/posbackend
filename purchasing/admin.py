@@ -10,7 +10,7 @@ from vat_returns import locks
 from inventory.models import InventoryItem, StockMovementReason
 from inventory.services import adjust_stock
 
-from .models import Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument
+from .models import Expense, Purchase, PurchaseItem, PurchaseStatus, Supplier, SupplierDocument
 
 
 class PurchaseItemInline(admin.TabularInline):
@@ -171,3 +171,31 @@ class SupplierDocumentAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return super().has_delete_permission(request, obj) and not self._locked(obj)
+
+
+@admin.register(Expense)
+class ExpenseAdmin(admin.ModelAdmin):
+    """Business expenses with VAT (VAT plan §12). Never deleted: a wrong one
+    is voided through the API, with a reason."""
+
+    list_display = ("id", "branch", "supplier", "kind", "number", "issue_date", "category", "net", "vat",
+                    "claimable_vat", "not_claimable", "capital_asset", "voided")
+    list_filter = ("branch", "category", "kind", "not_claimable", "capital_asset", "voided")
+    search_fields = ("number", "description", "supplier__name_en", "supplier__name_ar")
+    list_select_related = ("branch", "supplier")
+    raw_id_fields = ("supplier",)
+    date_hierarchy = "issue_date"
+    # The supplier copy, claimable VAT, claim date and void are written by
+    # save() and the API only.
+    readonly_fields = ("qr_check", "supplier_vat_registered", "supplier_vat_number", "supplier_crn", "claimable_vat",
+                       "claim_date", "voided", "voided_reason", "voided_by", "voided_at", "created_by", "created_at",
+                       "updated_at")
+
+    def has_change_permission(self, request, obj=None):
+        # In a filed VAT period an expense changes only through the API, with
+        # an owner override that is logged (vat_returns/locks.py).
+        locked = obj is not None and (obj.voided or locks.locked_period(obj.branch, obj.claim_date) is not None)
+        return super().has_change_permission(request, obj) and not locked
+
+    def has_delete_permission(self, request, obj=None):
+        return False

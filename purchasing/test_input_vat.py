@@ -139,16 +139,17 @@ class InputVatFixesTests(TestCase):
         self.assertEqual(lines[1], ["VAT number", ""])
         self.assertEqual(lines[2], ["Period", "2026-10-01 to 2026-10-31"])
         self.assertEqual(lines[4], [])
-        self.assertEqual(lines[5], ["Date", "Type", "Supplier", "Supplier VAT number", "Supplier CR",
-                                    "Document number", "Purchase", "VAT category", "Net", "VAT rate %", "VAT",
-                                    "Total", "Claimable VAT", "Flags"])
+        self.assertEqual(lines[5], ["Date", "Source", "Type", "Supplier", "Supplier VAT number", "Supplier CR",
+                                    "Document number", "Purchase", "Expense category", "Capital asset",
+                                    "VAT category", "Net", "VAT rate %", "VAT", "Total", "Claimable VAT",
+                                    "Not claimable reason", "Flags"])
         po = f"PO-{self.purchase.pk}"
-        self.assertEqual(lines[6], ["2026-10-15", "Tax invoice", "Fresh Meat Co", SUPPLIER_VAT, "1010010000",
-                                    "SINV-77", po, "Standard rated", "100.00", "15.00", "15.00", "115.00", "15.00",
-                                    ""])
-        self.assertEqual(lines[7], ["2026-10-16", "Credit note", "Fresh Meat Co", SUPPLIER_VAT, "1010010000",
-                                    "SCN-1", po, "Standard rated", "-10.00", "14.00", "-1.40", "-11.50", "-1.40",
-                                    "Net + VAT doesn't equal total; VAT not 15%"])
-        self.assertEqual(lines[8], ["TOTALS", "", "", "", "", "", "", "", "90.00", "", "13.60", "103.50", "13.60",
-                                    ""])
+        self.assertEqual(lines[6], ["2026-10-15", "Purchase order", "Tax invoice", "Fresh Meat Co", SUPPLIER_VAT,
+                                    "1010010000", "SINV-77", po, "", "", "Standard rated", "100.00", "15.00",
+                                    "15.00", "115.00", "15.00", "", ""])
+        self.assertEqual(lines[7], ["2026-10-16", "Purchase order", "Credit note", "Fresh Meat Co", SUPPLIER_VAT,
+                                    "1010010000", "SCN-1", po, "", "", "Standard rated", "-10.00", "14.00", "-1.40",
+                                    "-11.50", "-1.40", "", "Net + VAT doesn't equal total; VAT not 15%"])
+        self.assertEqual(lines[8], ["TOTALS", "", "", "", "", "", "", "", "", "", "", "90.00", "", "13.60", "103.50",
+                                    "13.60", "", ""])
         self.assertEqual(len(lines), 9)

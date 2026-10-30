@@ -44,7 +44,8 @@ def checklist(period, settings, data, branches=None):
     without_invoice = (Purchase.objects.filter(branch__in=branches, status=PurchaseStatus.RECEIVED,
                                                received_at__gte=start, received_at__lt=end)
                        .exclude(supplier_documents__kind="invoice").count())
-    flagged = sum(1 for document in figures.purchase_documents(branches, period)
+    expenses = figures.expense_documents(branches, period)
+    flagged = sum(1 for document in [*figures.purchase_documents(branches, period), *expenses]
                   if CHECK_FLAGS.intersection(purchase_vat.document_flags(document)))
     previous = (VatPeriod.objects.filter(branch=period.branch, environment=period.environment,
                                          end_date__lt=period.start_date).order_by("-start_date").first())
@@ -55,6 +56,7 @@ def checklist(period, settings, data, branches=None):
         ("rejectedDocuments", not_counted["rejected"]["count"]),
         ("purchasesWithoutInvoice", without_invoice),
         ("supplierDocumentsFlagged", flagged),
+        ("expensesWithoutAttachment", expenses.filter(attachment_url="").count()),
         ("missingBreakdown", data["missing_breakdown"]),
         ("previousNotFiled", int(previous_open)),
         ("periodNotEnded", int(vat_periods.today(settings) <= period.end_date)),

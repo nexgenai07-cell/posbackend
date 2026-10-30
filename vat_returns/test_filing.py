@@ -38,7 +38,8 @@ class VatFilingTests(VatFixture, TestCase):
         self.assertEqual(self.checklist(self.q3), {
             "pendingDocuments": 1, "rejectedDocuments": 1, "purchasesWithoutInvoice": 1,
             # No QR on the three invoices; one supplier also has no VAT number.
-            "supplierDocumentsFlagged": 3, "missingBreakdown": 0, "previousNotFiled": 0, "periodNotEnded": 0,
+            "supplierDocumentsFlagged": 3, "expensesWithoutAttachment": 0, "missingBreakdown": 0,
+            "previousNotFiled": 0, "periodNotEnded": 0,
         })
         q4 = self.checklist(self.q4)
         self.assertEqual((q4["previousNotFiled"], q4["periodNotEnded"]), (1, 1))

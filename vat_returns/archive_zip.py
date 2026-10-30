@@ -7,6 +7,7 @@ Invoice archive ZIPs (plan §11), built in the background:
     sales/INV-3-000123.xml          the XML this POS signed
     sales/INV-3-000123_cleared.xml  ZATCA's cleared copy (B2B)
     purchases/<supplier>_<number>.pdf / .xml   the supplier's own files
+    expenses/<supplier>_<number>.pdf|jpg|png   the expense's attachment
 
 A file that can't be included is written in index.csv as "missing (why)":
 nothing is skipped silently. The ZIP is a copy; no document is changed.
@@ -53,7 +54,10 @@ MAX_DOWNLOAD = 25 * 1024 * 1024
 _UNSAFE = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 INDEX_COLUMNS = ["Side", "Number", "Date", "Type", "B2C/B2B", "Customer / supplier", "Seller VAT", "Buyer VAT",
-                 "Net", "VAT", "Total", "Status", "Claim date", "PDF file", "XML file", "Cleared XML file"]
+                 "Net", "VAT", "Total", "Status", "Claim date", "PDF file", "XML file", "Cleared XML file",
+                 "Expense category", "Capital asset", "Not claimable reason"]
+# An expense attachment keeps its own type; anything else is saved as a PDF.
+ATTACHMENT_TYPES = (".pdf", ".jpg", ".jpeg", ".png")
 KIND_TEXT = {"invoice": "Invoice", "credit_note": "Credit note", "debit_note": "Debit note"}
 
 
@@ -92,7 +96,7 @@ def export_dir():
 
 
 def request(branch, settings, actor, data):
-    """Saves an export of `data["sides"]` (sales / purchases) matching the
+    """Saves an export of `data["sides"]` (sales / purchases / expenses) matching the
     filters in `data` and starts building it. Raises ExportRejected."""
     sides = data.get("sides") or list(archive.SIDES)
     if isinstance(sides, str):
@@ -196,9 +200,15 @@ def _build(export):
                 rows.append(row)
                 missing += count
                 _add_sums(sums["purchases"], archive.purchase_row(document))
+        if "expenses" in export.sides:
+            for document in _in_chunks(querysets["expenses"], export.document_ids["expenses"], ("issue_date", "id")):
+                row, count = _add_expense(zip_file, names, document, settings)
+                rows.append(row)
+                missing += count
+                _add_sums(sums["expenses"], archive.expense_row(document))
         for side, total in sums.items():
             rows.append([f"TOTALS {side}", "", "", "", "", "", "", "", money(total["net"]), money(total["vat"]),
-                         money(total["total"]), "", "", "", "", ""])
+                         money(total["total"]), "", "", "", "", "", "", "", ""])
         index = build_csv(header=_index_header(branch, settings, export), columns=INDEX_COLUMNS, rows=rows)
         zip_file.writestr("index.csv", index.encode("utf-8"))
     part.replace(final)
@@ -211,7 +221,13 @@ def _build(export):
     export.save(update_fields=["status", "file_path", "size", "missing_count", "finished_at"])
     audit(export, None, "archive_ready",
            f"Invoice archive ZIP ready: {export.sales_count} sales, {export.purchases_count} purchase documents, "
-           f"{missing} files missing")
+           f"{expenses_count(export)} expenses, {missing} files missing")
+
+
+def expenses_count(export):
+    """Frozen with the other IDs. No column of its own: sales_count and
+    purchases_count predate expenses."""
+    return len((export.document_ids or {}).get("expenses", []))
 
 
 def _in_chunks(queryset, ids, ordering):
@@ -259,7 +275,7 @@ def _add_sale(zip_file, names, document, settings):
         "sales", document.number, f"{issued:%Y-%m-%d %H:%M}", KIND_TEXT[document.kind], row["channel"].upper(),
         row["customer"], (document.receipt or {}).get("seller", {}).get("vat_number", "") or settings.vat_number,
         row["customer_vat"], money(row["net"]), money(row["vat"]), money(row["total"]),
-        DocumentStatus(document.status).label, "", pdf, xml, cleared,
+        DocumentStatus(document.status).label, "", pdf, xml, cleared, "", "", "",
     ]
     return data, missing
 
@@ -298,7 +314,36 @@ def _add_purchase(zip_file, names, document, settings):
     data = [
         "purchases", document.number, f"{document.issue_date:%Y-%m-%d}", KIND_TEXT[document.kind], "B2B",
         row["supplier"], document.supplier_vat_number, settings.vat_number, money(row["net"]), money(row["vat"]),
-        money(row["total"]), "", f"{document.claim_date:%Y-%m-%d}", pdf, xml, "",
+        money(row["total"]), "", f"{document.claim_date:%Y-%m-%d}", pdf, xml, "", "", "", "",
+    ]
+    return data, missing
+
+
+def _add_expense(zip_file, names, document, settings):
+    """The attachment (PDF or photo) under expenses/; an expense has no XML."""
+    from purchasing import expenses as expense_rules
+
+    supplier = document.supplier
+    stem = names.stem("expenses", f"{supplier.name_en or supplier.name_ar}_{document.number}")
+    missing = 0
+    if not document.attachment_url:
+        attachment, missing = _missing("not uploaded"), missing + 1
+    else:
+        source = (document.attachment_name or document.attachment_url.split("?")[0]).lower()
+        extension = next((ext for ext in ATTACHMENT_TYPES if source.endswith(ext)), ".pdf")
+        try:
+            zip_file.writestr(f"{stem}{extension}", _download(document.attachment_url))
+            attachment = f"{stem}{extension}"
+        except (requests.RequestException, ValueError) as exc:
+            attachment, missing = _missing(f"download failed: {exc}"), missing + 1
+    row = archive.expense_row(document)
+    data = [
+        "expenses", document.number, f"{document.issue_date:%Y-%m-%d}", KIND_TEXT[document.kind], "B2B",
+        row["supplier"], document.supplier_vat_number, settings.vat_number, money(row["net"]), money(row["vat"]),
+        money(row["total"]), "", f"{document.claim_date:%Y-%m-%d}", attachment, "", "",
+        expense_rules.CATEGORY_LABELS.get(document.category, document.category),
+        "Yes" if document.capital_asset else "",
+        expense_rules.REASON_LABELS.get(row["not_claimable_reason"], row["not_claimable_reason"]),
     ]
     return data, missing
 
@@ -374,7 +419,8 @@ def export_dict(export):
     return {
         "id": export.pk, "status": export.status, "sides": export.sides, "filters": export.filters,
         "period": export.period_id, "description": label, "sales_count": export.sales_count,
-        "purchases_count": export.purchases_count, "missing_count": export.missing_count,
+        "purchases_count": export.purchases_count, "expenses_count": expenses_count(export),
+        "missing_count": export.missing_count,
         "file_name": export.file_name, "size": export.size, "error": export.error,
         "requested_by": export.requested_by.name, "created_at": export.created_at,
         "finished_at": export.finished_at,
