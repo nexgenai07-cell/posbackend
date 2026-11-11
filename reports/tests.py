@@ -13,7 +13,7 @@ from orders.models import Order, OrderItem, OrderStatus, Payment, PaymentStatus
 class PaymentMethodReportTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Test", name_ar="Test")
-        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
+        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
         category = Category.objects.create(branch=self.branch, name_en="Food", name_ar="Food")
         self.product = Product.objects.create(branch=self.branch, category=category,
             name_en="Food", name_ar="Food", price=10, cost_price=4)

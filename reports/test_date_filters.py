@@ -22,7 +22,7 @@ class ReportDateFilterTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="B", name_ar="B", timezone="Asia/Riyadh")
         self.owner = Staff(branch=self.branch, name="O", role=StaffRole.OWNER)
-        self.owner.set_pin("1")
+        self.owner.set_password("1")
         self.owner.save()
         self.client = APIClient()
         self.client.force_authenticate(user=self.owner)
@@ -100,7 +100,7 @@ class ReportDateFilterTests(TestCase):
         from accounts.models import Shift
 
         waiter = Staff(branch=self.branch, name="Waiter", role=StaffRole.WAITER)
-        waiter.set_pin("2")
+        waiter.set_password("2")
         waiter.save()
         # 01:00-05:00 Riyadh on the 11th (22:00 UTC on the 10th) and an older shift.
         Shift.objects.create(staff=waiter, clock_in=datetime(2026, 10, 11, 1, 0, tzinfo=RIYADH),

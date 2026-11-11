@@ -547,7 +547,10 @@ ALREADY_PROCESSED = "already_processed"
 NEEDS_REVIEW = "needs_review"
 
 
-def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
+CASH_SHORT = "cash_short"
+
+
+def mark_bill_paid(bill_id, method, actor=None, moyasar=None, *, cash_tendered=None, tip=None):
     """
     The single atomic, idempotent path to `paid`. Every caller goes through
     here: the callback verification, the webhook, and the cashier's manual
@@ -563,6 +566,11 @@ def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
     never emit a phantom "Table X PAID".
 
     `moyasar` is the *verified* API response dict (never a webhook body).
+
+    `cash_tendered` / `tip` come from a cashier's cash settle. The tendered
+    notes are checked against what is outstanding + tip under the row lock
+    (CASH_SHORT if less), and the change is stored on the bill. The tip goes
+    on this settlement's last Payment row, where reports/ reads tips.
     Returns (outcome, bill).
     """
     with transaction.atomic():
@@ -584,18 +592,29 @@ def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
             logger.info("Bill %s already settled; ignoring duplicate %s settle", bill.pk, method)
             return ALREADY_PROCESSED, bill
 
+        tip = tip or None  # 0 is no tip
+        change = None
+        if cash_tendered is not None:
+            change = cash_tendered - amount_outstanding(bill) - (tip or _ZERO)
+            if change < _ZERO:
+                return CASH_SHORT, bill
+
         total = bill_total(bill)
         now = timezone.now()
         bill.status = BillStatus.PAID
         bill.paid_method = method
         bill.total_at_payment = total
+        bill.cash_tendered = cash_tendered
+        bill.change_given = change
+        bill.tip_at_payment = tip
         bill.paid_at = now
         bill.paid_by = actor
         bill.save(update_fields=[
-            "status", "paid_method", "total_at_payment", "paid_at", "paid_by", "updated_at",
+            "status", "paid_method", "total_at_payment", "cash_tendered", "change_given",
+            "tip_at_payment", "paid_at", "paid_by", "updated_at",
         ])
 
-        _write_order_payments(bill, method, actor, now)
+        _write_order_payments(bill, method, actor, now, tip=tip)
 
         # One tax invoice for the orders this settlement paid (after commit;
         # orders already invoiced at the till are skipped there).
@@ -603,6 +622,7 @@ def mark_bill_paid(bill_id, method, actor=None, moyasar=None):
         zatca_pos.orders_paid(
             [order.pk for order in billable_orders(bill) if order.payment_status == PaymentStatus.PAID],
             actor=actor, moyasar=moyasar,
+            cash={"tendered": cash_tendered, "change": change} if cash_tendered is not None else None,
         )
 
         if bill.table_id:
@@ -698,7 +718,7 @@ def _record_moyasar_payment(bill, moyasar):
     return None
 
 
-def _write_order_payments(bill, method, actor, now):
+def _write_order_payments(bill, method, actor, now, tip=None):
     """
     One Payment row per billable order for exactly what that order still
     owed, so reports/, the POS receipt and OrderDetailsPage keep reading
@@ -709,14 +729,19 @@ def _write_order_payments(bill, method, actor, now):
     reopened bill's second settlement can record the new items' money while
     the bill row lock and the paid/closed guard in mark_bill_paid() still stop
     the same settlement being written twice.
+
+    A `tip` is recorded once, on the last row written, so the rows' tips add
+    up to exactly the tip the guest left.
     """
     payment_method = _PAYMENT_METHOD_FOR[method]
     stamp = int(now.timestamp() * 1_000_000)
-    for order in billable_orders(bill):
-        due = order_due(order)
+    owing = [(order, order_due(order)) for order in billable_orders(bill)]
+    last_paying = max((index for index, (_, due) in enumerate(owing) if due > _ZERO), default=None)
+    for index, (order, due) in enumerate(owing):
         if due > _ZERO:
             Payment.objects.create(
                 order=order, amount=due, method=payment_method,
+                tip=tip if index == last_paying else None,
                 idempotency_key=f"bill-{bill.pk}-order-{order.pk}-{stamp}",
             )
             order._prefetched_objects_cache = {}

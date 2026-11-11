@@ -137,7 +137,7 @@ class BillingTestBase(TestCase):
 
     def _staff(self, name, role):
         staff = Staff(branch=self.branch, name=name, role=role)
-        staff.set_pin("1234")
+        staff.set_password("1234")
         staff.save()
         return staff
 

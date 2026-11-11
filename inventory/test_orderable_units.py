@@ -33,7 +33,7 @@ class OrderableUnitsTests(TestCase):
 
     def test_product_list_exposes_available_quantity(self):
         cashier = Staff(branch=self.branch, name="C", role=StaffRole.CASHIER)
-        cashier.set_pin("1")
+        cashier.set_password("1")
         cashier.save()
         client = APIClient()
         client.force_authenticate(user=cashier)

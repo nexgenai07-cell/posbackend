@@ -17,7 +17,7 @@ class OrderListPagingTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Main", name_ar="Main")
         owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
-        owner.set_pin("1234")
+        owner.set_password("1234")
         owner.save()
         self.client = APIClient()
         self.client.force_authenticate(user=owner)

@@ -21,8 +21,8 @@ class AdminCancelTests(TestCase):
         self.product = Product.objects.create(branch=self.branch, category=category, name_en="Pizza", name_ar="Pizza", price=10, cost_price=0)
         self.cheese = InventoryItem.objects.create(branch=self.branch, name="Cheese", unit="g", current_stock=Decimal("100"))
         RecipeItem.objects.create(product=self.product, inventory_item=self.cheese, quantity=6, unit="g")
-        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
-        self.cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, pin_hash="x")
+        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
+        self.cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, password_hash="x")
         self.client = APIClient()
 
     def order(self, status, *, fired=False, paid=None):

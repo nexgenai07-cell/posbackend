@@ -6,41 +6,60 @@ from common.validators import reject_branch_mismatch
 from kitchen.models import KitchenStation
 
 from .models import Shift, ShiftTemplate, Staff, StaffRole
+from .passwords import validate_new_password as check_password_strength
+from .usernames import USERNAME_MAX_LENGTH, is_valid_username, normalize_username
 
 
-class PinLoginSerializer(serializers.Serializer):
-    staff_id = serializers.IntegerField()
-    pin = serializers.CharField()
+class PasswordLoginSerializer(serializers.Serializer):
+    """Shape only. The credential check, counter and lockout live in
+    accounts/services.py authenticate_staff(), which needs a transaction."""
+
+    username = serializers.CharField(max_length=USERNAME_MAX_LENGTH)
+    password = serializers.CharField(max_length=128, trim_whitespace=False)
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(max_length=128, trim_whitespace=False)
+    new_password = serializers.CharField(max_length=128, trim_whitespace=False)
 
     def validate(self, attrs):
-        try:
-            staff = Staff.objects.get(pk=attrs["staff_id"], is_active=True)
-        except Staff.DoesNotExist:
-            raise serializers.ValidationError({"error": "error.invalidCredentials"})
-
-        if not staff.check_pin(attrs["pin"]):
-            raise serializers.ValidationError({"error": "error.invalidCredentials"})
-
-        attrs["staff"] = staff
+        staff = self.context["request"].user
+        if not staff.check_password(attrs["current_password"]):
+            raise serializers.ValidationError({"current_password": "error.invalidCurrentPassword"})
+        # The first login after the PIN migration uses the old PIN as the
+        # password; "changing" it to the same value would defeat the point.
+        if staff.check_password(attrs["new_password"]):
+            raise serializers.ValidationError({"new_password": "error.passwordSameAsCurrent"})
+        check_password_strength(attrs["new_password"], staff, field="new_password")
         return attrs
 
 
-class LoginStaffChoiceSerializer(serializers.ModelSerializer):
-    """
-    The login screen's name picker, and nothing more. Deliberately omits
-    `pin`, `is_active` and `created_at`/`updated_at`: this endpoint is
-    reachable *before* authentication, so it must not hand out anything a
-    name dropdown doesn't need. See LoginChoicesView.
-    """
+class TemporaryPasswordSerializer(serializers.Serializer):
+    """Owner-side unlock (password optional) and reset-password (required)."""
 
-    class Meta:
-        model = Staff
-        fields = ["id", "name", "role"]
-        read_only_fields = fields
+    new_password = serializers.CharField(max_length=128, trim_whitespace=False, required=False, allow_blank=True)
+
+    def __init__(self, *args, staff, required=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.staff = staff
+        self.fields["new_password"].required = required
+        self.fields["new_password"].allow_blank = not required
+
+    def validate_new_password(self, value):
+        if value:
+            check_password_strength(value, self.staff, field="new_password")
+        return value or None
 
 
 class StaffSerializer(serializers.ModelSerializer):
-    pin = serializers.CharField(write_only=True, required=False)
+    # Optional on create: a blank username is generated from the name
+    # (Staff.save), which the owner can then edit. Ignored when blank on update.
+    username = serializers.CharField(required=False, allow_blank=True, max_length=USERNAME_MAX_LENGTH)
+    # Create only. An owner changes someone's password through
+    # /staff/<id>/reset-password/, which is Owner-only and leaves an audit
+    # trail; PATCH is open to managers too and must not be a back door.
+    password = serializers.CharField(write_only=True, required=False, max_length=128, trim_whitespace=False)
+    is_locked = serializers.BooleanField(read_only=True)
     # Kitchen stations this chef works at. Only kept for the kitchen role:
     # anyone else is saved with none.
     stations = serializers.PrimaryKeyRelatedField(
@@ -51,10 +70,26 @@ class StaffSerializer(serializers.ModelSerializer):
     class Meta:
         model = Staff
         fields = [
-            "id", "branch", "name", "role", "pin", "is_active", "stations", "is_head_chef",
+            "id", "branch", "name", "username", "role", "password", "is_active", "stations", "is_head_chef",
+            "must_change_password", "is_locked", "locked_at", "unlocked_at",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "must_change_password", "is_locked", "locked_at", "unlocked_at", "created_at", "updated_at",
+        ]
+
+    def validate_username(self, value):
+        value = normalize_username(value)
+        if not value:
+            return value
+        if not is_valid_username(value):
+            raise serializers.ValidationError("error.usernameInvalid")
+        taken = Staff.all_objects.filter(username=value)
+        if self.instance:
+            taken = taken.exclude(pk=self.instance.pk)
+        if taken.exists():
+            raise serializers.ValidationError("error.usernameTaken")
+        return value
 
     def validate(self, attrs):
         branch = attrs.get("branch") or getattr(self.instance, "branch", None)
@@ -62,13 +97,14 @@ class StaffSerializer(serializers.ModelSerializer):
         if any(station.branch_id != getattr(branch, "pk", None) for station in attrs.get("stations", [])):
             raise serializers.ValidationError({"stations": "error.stationBranchMismatch"})
 
-        pin = attrs.get("pin")
-        if pin:
-            exclude_pk = self.instance.pk if self.instance else None
-            if Staff.pin_taken_in_branch(branch, pin, exclude_pk=exclude_pk):
-                raise serializers.ValidationError({"pin": "error.pinTaken"})
-        elif self.instance is None:
-            raise serializers.ValidationError({"pin": "error.pinRequired"})
+        if self.instance is None:
+            password = attrs.get("password")
+            if not password:
+                raise serializers.ValidationError({"password": "error.passwordRequired"})
+            # Unsaved stand-in so the similarity check sees the new username/name.
+            check_password_strength(password, Staff(name=attrs.get("name", ""), username=attrs.get("username", "")))
+        elif "password" in attrs:
+            raise serializers.ValidationError({"password": "error.useResetPassword"})
         return attrs
 
     def _save_stations(self, staff, stations):
@@ -83,24 +119,27 @@ class StaffSerializer(serializers.ModelSerializer):
             validated_data["is_head_chef"] = False
 
     def create(self, validated_data):
-        pin = validated_data.pop("pin")
+        password = validated_data.pop("password")
         stations = validated_data.pop("stations", None)
+        if not validated_data.get("username"):
+            validated_data.pop("username", None)
         self._kitchen_only(validated_data, validated_data.get("role"))
         with transaction.atomic():
             staff = Staff(**validated_data)
-            staff.set_pin(pin)
+            staff.set_password(password)
+            # Somebody else chose this password, so it is temporary by definition.
+            staff.must_change_password = True
             staff.save()
             self._save_stations(staff, stations)
         return staff
 
     def update(self, instance, validated_data):
-        pin = validated_data.pop("pin", None)
         stations = validated_data.pop("stations", None)
+        if not validated_data.get("username"):
+            validated_data.pop("username", None)
         self._kitchen_only(validated_data, validated_data.get("role", instance.role))
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
-        if pin:
-            instance.set_pin(pin)
         with transaction.atomic():
             instance.save()
             self._save_stations(instance, stations)

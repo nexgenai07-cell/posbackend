@@ -10,8 +10,8 @@ from .models import Branch
 class BranchLocationSettingsTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Test", name_ar="Test")
-        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
-        self.manager = Staff.objects.create(branch=self.branch, name="Manager", role=StaffRole.MANAGER, pin_hash="x")
+        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
+        self.manager = Staff.objects.create(branch=self.branch, name="Manager", role=StaffRole.MANAGER, password_hash="x")
         self.client = APIClient()
         self.url = "/api/branches/active/location/"
 
@@ -29,13 +29,13 @@ class BranchLocationSettingsTests(TestCase):
 
     def test_non_managers_cannot_read_or_change_location(self):
         for role in (StaffRole.CASHIER, StaffRole.WAITER, StaffRole.KITCHEN):
-            staff = Staff.objects.create(branch=self.branch, name=role, role=role, pin_hash="x")
+            staff = Staff.objects.create(branch=self.branch, name=role, role=role, password_hash="x")
             self.client.force_authenticate(user=staff)
             self.assertEqual(self.client.get(self.url).status_code, 403)
             self.assertEqual(self.client.patch(self.url, {"latitude": 24}, format="json").status_code, 403)
 
     def test_general_branch_response_does_not_expose_exact_coordinates(self):
-        cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, pin_hash="x")
+        cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, password_hash="x")
         self.client.force_authenticate(user=cashier)
         response = self.client.get("/api/branches/active/")
         self.assertEqual(response.status_code, 200)

@@ -29,10 +29,10 @@ class OrderStockWorkflowTests(TestCase):
         )
         RecipeItem.objects.create(product=self.second_product, inventory_item=self.salt, quantity=1, unit="g")
         self.waiter = Staff.objects.create(
-            branch=self.branch, name="Waiter", role=StaffRole.WAITER, pin_hash="x",
+            branch=self.branch, name="Waiter", role=StaffRole.WAITER, password_hash="x",
         )
         self.cashier = Staff.objects.create(
-            branch=self.branch, name="Cashier", role=StaffRole.CASHIER, pin_hash="x",
+            branch=self.branch, name="Cashier", role=StaffRole.CASHIER, password_hash="x",
         )
         self.order = Order.objects.create(
             branch=self.branch, status=OrderStatus.AWAITING_WAITER, assigned_waiter=self.waiter,
@@ -84,7 +84,7 @@ class OrderStockWorkflowTests(TestCase):
         self.assertEqual(OrderHistory.objects.filter(order=self.order).count(), history_before)
 
     def test_waiter_confirm_without_assigned_waiter_is_rejected_for_manager(self):
-        manager = Staff.objects.create(branch=self.branch, name="Manager", role=StaffRole.MANAGER, pin_hash="x")
+        manager = Staff.objects.create(branch=self.branch, name="Manager", role=StaffRole.MANAGER, password_hash="x")
         self.order.assigned_waiter = None
         self.order.save(update_fields=["assigned_waiter", "updated_at"])
         self.client.force_authenticate(user=manager)
@@ -238,7 +238,7 @@ class OrderStockWorkflowTests(TestCase):
             "inventory_item_id", "previous_stock", "quantity_delta", "resulting_stock", "unit_cost_snapshot",
         ))
 
-        kitchen = Staff.objects.create(branch=self.branch, name="Kitchen", role=StaffRole.KITCHEN, pin_hash="x")
+        kitchen = Staff.objects.create(branch=self.branch, name="Kitchen", role=StaffRole.KITCHEN, password_hash="x")
         self.client.force_authenticate(user=kitchen)
         response = self.client.patch(
             f"/api/orders/{self.order.pk}/items/{self.item.pk}/status/", {"status": OrderItemStatus.VOIDED}, format="json"
@@ -262,7 +262,7 @@ class OrderStockWorkflowTests(TestCase):
         response = self.client.post(f"/api/orders/{self.order.pk}/waiter-confirm/", {}, format="json")
         self.assertEqual(response.status_code, 200)
 
-        kitchen = Staff.objects.create(branch=self.branch, name="Kitchen", role=StaffRole.KITCHEN, pin_hash="x")
+        kitchen = Staff.objects.create(branch=self.branch, name="Kitchen", role=StaffRole.KITCHEN, password_hash="x")
         self.client.force_authenticate(user=kitchen)
         url = f"/api/orders/{self.order.pk}/items/{self.item.pk}/status/"
         response = self.client.patch(url, {"status": OrderItemStatus.VOIDED}, format="json")

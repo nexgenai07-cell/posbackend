@@ -158,9 +158,13 @@ if DATABASES['default']['ENGINE'] == 'django.db.backends.postgresql':
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
 
+# Also the rules for staff passwords (accounts/passwords.py): the similarity
+# check compares against Staff.username and Staff.name, since Staff is not
+# auth.User and has no first/last name or email.
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+        'OPTIONS': {'user_attributes': ('username', 'name')},
     },
     {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
@@ -202,14 +206,16 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'common.pagination.DefaultPagination',
     'PAGE_SIZE': 25,
     'EXCEPTION_HANDLER': 'common.exceptions.error_code_exception_handler',
-    # Only views that set `throttle_scope` (e.g. pin-login) are actually
+    # Only views that set `throttle_scope` (e.g. login) are actually
     # throttled — ScopedRateThrottle is a no-op for everything else.
     'DEFAULT_THROTTLE_CLASSES': ['rest_framework.throttling.ScopedRateThrottle'],
     'DEFAULT_THROTTLE_RATES': {
-        'pin-login': '10/min',
-        # The login screen fetches its branch/staff dropdown at most once per
-        # page load, so this is generous for real use and still bounds a
-        # scanner enumerating staff names.
+        # Per IP. The per-account lockout (3 wrong passwords, accounts/services.py)
+        # is the real brute-force guard; this bounds how fast one IP can
+        # burn through usernames.
+        'login': '10/min',
+        # The login screen fetches its branch name/logo at most once per
+        # page load, so this is generous for real use.
         'login-choices': '30/min',
         # Phase 13 public/customer-facing endpoints — all AllowAny, so these
         # are the only thing standing between them and abuse. ScopedRateThrottle

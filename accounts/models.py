@@ -1,9 +1,12 @@
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 from branches.models import Branch
 from common.models import BaseModel
+
+from .usernames import normalize_username, unique_username
 
 
 class StaffRole(models.TextChoices):
@@ -16,17 +19,44 @@ class StaffRole(models.TextChoices):
 
 class Staff(BaseModel):
     """
-    Not Django's AUTH_USER_MODEL. Login is PIN + JWT through a custom auth
-    flow, not Django's username/password system, so there's no need for
-    AbstractBaseUser's create_user/is_staff/USERNAME_FIELD machinery here.
-    Django admin login (for developers) stays on the default auth.User,
-    kept entirely separate from restaurant staff records.
+    Not Django's AUTH_USER_MODEL. Login is username + password + JWT through
+    a custom auth flow (accounts/services.py, accounts/authentication.py),
+    not Django's session system, so there's no need for AbstractBaseUser's
+    create_user/is_staff/USERNAME_FIELD machinery here. Django admin login
+    (for developers) stays on the default auth.User, kept entirely separate
+    from restaurant staff records.
+
+    Lockout: after MAX_FAILED_LOGINS wrong passwords in a row the row is
+    locked (`locked_at` set). A locked account refuses even the right
+    password and its existing tokens stop working; only an Owner (or
+    `manage.py unlock_staff`) clears it. "Locked" is deliberately separate
+    from `is_active`: inactive means the person left, locked means a
+    security block, and an unlock must never re-activate a leaver.
     """
+
+    MAX_FAILED_LOGINS = 3
+    LOCK_REASON_FAILED_LOGINS = "failed_logins"
 
     branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="staff")
     name = models.CharField(max_length=255)
+    # What the staff member types to sign in. Stored lowercase; unique across
+    # every branch (login has no branch picker) and across soft-deleted rows,
+    # so a removed account's name is never silently handed to a new hire.
+    username = models.CharField(max_length=64, unique=True)
     role = models.CharField(max_length=16, choices=StaffRole.choices)
-    pin_hash = models.CharField(max_length=128)
+    # Empty means "cannot log in" - e.g. an account created without a password.
+    password_hash = models.CharField(max_length=128, blank=True, default="")
+    # Set whenever someone *else* chose the password (migration from PINs, a
+    # new account, an owner's reset). The token then only works for
+    # change-password/logout/me until the staff member picks their own.
+    must_change_password = models.BooleanField(default=False)
+    failed_login_attempts = models.PositiveSmallIntegerField(default=0)
+    locked_at = models.DateTimeField(null=True, blank=True)
+    locked_reason = models.CharField(max_length=32, blank=True)
+    unlocked_by = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    unlocked_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     shift_template = models.ForeignKey(
         "accounts.ShiftTemplate", null=True, blank=True, on_delete=models.SET_NULL,
@@ -45,23 +75,45 @@ class Staff(BaseModel):
     is_authenticated = True
     is_anonymous = False
 
-    def set_pin(self, raw_pin):
-        self.pin_hash = make_password(raw_pin)
+    def save(self, *args, **kwargs):
+        # A row saved without a username gets one from its name, the same
+        # rule the migration applied to existing staff. The owner can edit it.
+        self.username = normalize_username(self.username)
+        if not self.username:
+            self.username = unique_username(
+                self.name,
+                lambda candidate: Staff.all_objects.filter(username=candidate).exclude(pk=self.pk).exists(),
+            )
+        super().save(*args, **kwargs)
 
-    def check_pin(self, raw_pin):
-        return check_password(raw_pin, self.pin_hash)
+    # -- credentials ---------------------------------------------------------
 
-    @classmethod
-    def pin_taken_in_branch(cls, branch, raw_pin, exclude_pk=None):
-        """
-        PINs are hashed with a random salt, so uniqueness can't be a DB
-        constraint on pin_hash — checked here instead, called from the
-        staff create/update serializer before saving.
-        """
-        qs = cls.objects.filter(branch=branch)
-        if exclude_pk:
-            qs = qs.exclude(pk=exclude_pk)
-        return any(staff.check_pin(raw_pin) for staff in qs)
+    def set_password(self, raw_password):
+        self.password_hash = make_password(raw_password)
+
+    def check_password(self, raw_password):
+        if not self.password_hash:
+            return False
+        return check_password(raw_password, self.password_hash)
+
+    # -- lockout -------------------------------------------------------------
+
+    @property
+    def is_locked(self):
+        return self.locked_at is not None
+
+    def lock(self, reason):
+        self.locked_at = timezone.now()
+        self.locked_reason = reason
+
+    def unlock(self, by=None):
+        """Clears the lock and the counter and records who did it. Does not
+        touch `is_active` - see the class docstring."""
+        self.locked_at = None
+        self.locked_reason = ""
+        self.failed_login_attempts = 0
+        self.unlocked_by = by
+        self.unlocked_at = timezone.now()
 
     def __str__(self):
         return f"{self.name} ({self.role})"

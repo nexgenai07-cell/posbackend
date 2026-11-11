@@ -204,8 +204,28 @@ class AddOrderItemSerializer(serializers.Serializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = ["id", "order", "amount", "method", "tip", "paid_at", "created_at", "updated_at"]
-        read_only_fields = ["id", "order", "paid_at", "created_at", "updated_at"]
+        fields = [
+            "id", "order", "amount", "method", "tip", "cash_tendered", "change_given",
+            "paid_at", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "order", "change_given", "paid_at", "created_at", "updated_at"]
+
+
+def cash_change(method, cash_tendered, due):
+    """
+    The change owed back for a cash handover, or None when no cash was handed
+    over. `due` is everything the guest is paying right now (amount + tip).
+
+    Shared by the till's order payment and the bill settlement so both apply
+    the same rules: tendered is cash-only, and never less than what is due.
+    """
+    if cash_tendered is None:
+        return None
+    if method != "cash":
+        raise serializers.ValidationError({"cash_tendered": "error.cashTenderedNotCash"})
+    if cash_tendered < due:
+        raise serializers.ValidationError({"cash_tendered": "error.cashTenderedTooLow"})
+    return cash_tendered - due
 
 
 class RecordPaymentSerializer(serializers.ModelSerializer):
@@ -215,10 +235,21 @@ class RecordPaymentSerializer(serializers.ModelSerializer):
         min_value=Decimal("0.01"),
         error_messages={"min_value": "error.amountInvalid", "required": "error.amountInvalid"},
     )
+    # Cash only: what the guest handed over. The change is worked out here
+    # (tendered - amount - tip) and stored with the payment.
+    cash_tendered = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.01"), required=False, allow_null=True,
+        error_messages={"min_value": "error.cashTenderedTooLow"},
+    )
 
     class Meta:
         model = Payment
-        fields = ["amount", "method", "tip"]
+        fields = ["amount", "method", "tip", "cash_tendered"]
+
+    def validate(self, attrs):
+        due = attrs["amount"] + (attrs.get("tip") or Decimal("0.00"))
+        attrs["change_given"] = cash_change(attrs.get("method"), attrs.get("cash_tendered"), due)
+        return attrs
 
 
 class OrderSerializer(serializers.ModelSerializer):

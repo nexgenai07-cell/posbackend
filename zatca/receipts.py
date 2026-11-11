@@ -52,6 +52,9 @@ def payload(document, *, settings=None, public=False):
         "totals": snapshot.get("totals", {}),
         "payments": [{key: p.get(key) for key in ("method", "amount", "tip")} for p in snapshot.get("payments", [])],
         "tip": snapshot.get("tip", "0.00"),
+        # {"tendered", "change"} for a cash handover; None on card payments
+        # and on receipts issued before this was recorded.
+        "cash": snapshot.get("cash"),
         "original": snapshot.get("original"),
         "reason": snapshot.get("reason", ""),
         "qr": document.qr if show_qr else "",

@@ -21,7 +21,7 @@ from .serializers import OrderSerializer
 
 def make_staff(branch, name, role, pin):
     staff = Staff(branch=branch, name=name, role=role)
-    staff.set_pin(pin)
+    staff.set_password(pin)
     staff.save()
     return staff
 
@@ -59,7 +59,7 @@ class CustomerSessionTestCase(TestCase):
         if staff.pk not in self.clients:
             cache.clear()
             client = APIClient()
-            token = client.post("/api/auth/pin-login/", {"staff_id": staff.pk, "pin": pin}, format="json").json()["access"]
+            token = client.post("/api/auth/login/", {"username": staff.username, "password": pin}, format="json").json()["access"]
             client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
             self.clients[staff.pk] = client
         return self.clients[staff.pk]

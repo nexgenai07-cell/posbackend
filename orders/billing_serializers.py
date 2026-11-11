@@ -2,11 +2,14 @@
 Read serializers for Bill, and the small input serializers for the billing
 endpoints.
 
-Nothing here accepts an amount. The only money that crosses this boundary goes
-outward, computed by orders/billing.py from the database.
+Nothing here accepts an amount to charge. What is owed always goes outward,
+computed by orders/billing.py from the database. The only money accepted is
+the cashier's record of a cash handover (notes tendered, tip on top), which
+never changes what the bill is charged.
 """
 
 import logging
+from decimal import Decimal
 
 from rest_framework import serializers
 
@@ -105,7 +108,7 @@ class BillSerializer(serializers.ModelSerializer):
         fields = [
             "id", "bill_code", "branch", "table", "table_label", "table_label_ar", "customer", "customer_phone", "customer_name", "status",
             "requested_method", "paid_method", "total", "total_halalas", "currency",
-            "total_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
+            "total_at_payment", "cash_tendered", "change_given", "tip_at_payment", "ready_to_pay", "unserved_order_ids", "needs_review",
             "amount_paid", "amount_outstanding",
             "payment_request_cancelled_by_add",
             "orders", "invoices", "pay_requested_at", "paid_at", "closed_at", "created_at", "updated_at",
@@ -221,3 +224,21 @@ class SettleBillSerializer(serializers.Serializer):
         default=BillMethod.CASH,
         error_messages={"invalid_choice": "error.paymentMethodInvalid"},
     )
+    # Cash only: the notes the guest handed over. Checked against what is
+    # outstanding (+ tip) under the bill lock in billing.mark_bill_paid(),
+    # which also works out the change.
+    cash_tendered = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.01"), required=False, allow_null=True,
+        error_messages={"min_value": "error.cashTenderedTooLow"},
+    )
+    # "Keep the change" lands here: money on top of the bill, recorded as a
+    # tip on the Payment rows so reports/ counts it with every other tip.
+    tip = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.00"), required=False, allow_null=True,
+        error_messages={"min_value": "error.tipInvalid"},
+    )
+
+    def validate(self, attrs):
+        if attrs.get("cash_tendered") is not None and attrs.get("method") != BillMethod.CASH:
+            raise serializers.ValidationError({"cash_tendered": "error.cashTenderedNotCash"})
+        return attrs

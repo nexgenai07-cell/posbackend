@@ -15,10 +15,10 @@ class ReceivedPurchaseReconciliationTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Main", name_ar="Main")
         self.owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
-        self.owner.set_pin("1234")
+        self.owner.set_password("1234")
         self.owner.save()
         self.cashier = Staff(branch=self.branch, name="Cashier", role=StaffRole.CASHIER)
-        self.cashier.set_pin("5678")
+        self.cashier.set_password("5678")
         self.cashier.save()
         self.supplier = Supplier.objects.create(name_en="Supplier", name_ar="Supplier")
         self.ingredient = InventoryItem.objects.create(
@@ -104,7 +104,7 @@ class PurchaseListPagingTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Main", name_ar="Main")
         owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
-        owner.set_pin("1234")
+        owner.set_password("1234")
         owner.save()
         self.client = APIClient()
         self.client.force_authenticate(user=owner)

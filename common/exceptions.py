@@ -103,5 +103,12 @@ def error_code_exception_handler(exc, context):
         if isinstance(exc, exc_type):
             response.data = {"error": code}
             break
+    else:
+        # An APIException subclass of our own whose detail *is* a code
+        # (e.g. accounts.authentication.PasswordChangeRequired): keep the
+        # project's {"error": code} shape rather than DRF's {"detail": ...}.
+        detail = getattr(exc, "detail", None)
+        if isinstance(detail, str) and str(detail).startswith("error."):
+            response.data = {"error": str(detail)}
 
     return response

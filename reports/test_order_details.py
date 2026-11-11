@@ -20,8 +20,8 @@ from tables.models import Table
 class ReportSetup(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="A", name_ar="A", timezone="Asia/Riyadh", currency="SAR")
-        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
-        self.waiter = Staff.objects.create(branch=self.branch, name="Ali", role=StaffRole.WAITER, pin_hash="x")
+        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
+        self.waiter = Staff.objects.create(branch=self.branch, name="Ali", role=StaffRole.WAITER, password_hash="x")
         self.client = APIClient()
         self.client.force_authenticate(user=self.owner)
         category = Category.objects.create(branch=self.branch, name_en="Food", name_ar="Food")

@@ -10,9 +10,9 @@ from branches.models import Branch
 from .models import Staff, StaffRole
 
 
-def make_staff(branch, name, role, pin, is_active=True):
-    staff = Staff(branch=branch, name=name, role=role, is_active=is_active)
-    staff.set_pin(pin)
+def make_staff(branch, name, role, password, is_active=True, username=""):
+    staff = Staff(branch=branch, name=name, role=role, is_active=is_active, username=username)
+    staff.set_password(password)
     staff.save()
     return staff
 
@@ -38,21 +38,21 @@ class AccountsApiTestCase(TestCase):
             timezone="Asia/Riyadh",
             currency="SAR",
         )
-        cls.owner = make_staff(cls.riyadh, "Amir", StaffRole.OWNER, "1111")
-        cls.cashier = make_staff(cls.riyadh, "Junaid", StaffRole.CASHIER, "3333")
-        cls.retired = make_staff(cls.riyadh, "Old Timer", StaffRole.MANAGER, "9999", is_active=False)
-        cls.jeddah_owner = make_staff(cls.jeddah, "Faisal", StaffRole.OWNER, "5555")
+        cls.owner = make_staff(cls.riyadh, "Amir", StaffRole.OWNER, "amir-secret-1")
+        cls.cashier = make_staff(cls.riyadh, "Junaid", StaffRole.CASHIER, "junaid-secret-3")
+        cls.retired = make_staff(cls.riyadh, "Old Timer", StaffRole.MANAGER, "retired-secret-9", is_active=False)
+        cls.jeddah_owner = make_staff(cls.jeddah, "Faisal", StaffRole.OWNER, "faisal-secret-5")
 
     def setUp(self):
         self.client = APIClient()
         # Throttle history lives in the shared LocMemCache and is *not* reset
-        # between tests, so pin-login's 10/min limit would otherwise leak
-        # across the classes in this file and start 429ing a suite that never
+        # between tests, so login's 10/min limit would otherwise leak across
+        # the classes in this file and start 429ing a suite that never
         # issues 10 requests to any one endpoint.
         cache.clear()
 
-    def pin_login(self, staff_id, pin):
-        return self.client.post("/api/auth/pin-login/", {"staff_id": staff_id, "pin": pin}, format="json")
+    def login(self, username, password):
+        return self.client.post("/api/auth/login/", {"username": username, "password": password}, format="json")
 
 
 def error_code(response):
@@ -77,26 +77,23 @@ class LoginChoicesTests(AccountsApiTestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_returns_default_branch_and_its_active_staff(self):
+    def test_returns_default_branch_only(self):
         body = self.client.get(self.url).json()
         self.assertEqual(body["branch"]["id"], self.riyadh.id)
         self.assertEqual(body["branch"]["name_en"], "Smoke & Char — Riyadh")
         self.assertEqual(body["branch"]["currency"], "SAR")
-        self.assertEqual({row["name"] for row in body["staff"]}, {"Amir", "Junaid"})
 
-    def test_excludes_inactive_and_other_branches_staff(self):
-        names = [row["name"] for row in self.client.get(self.url).json()["staff"]]
-        self.assertNotIn("Old Timer", names)  # is_active=False
-        self.assertNotIn("Faisal", names)  # a different branch
-
-    def test_never_exposes_credentials_or_internal_fields(self):
-        row = self.client.get(self.url).json()["staff"][0]
-        self.assertEqual(set(row), {"id", "name", "role"})
+    def test_never_lists_staff(self):
+        """The old name picker told any visitor who the owner was. Nothing
+        about staff - names, roles, usernames - may leave this endpoint."""
+        body = self.client.get(self.url).json()
+        self.assertEqual(set(body), {"branch"})
+        self.assertNotIn("Amir", str(body))
+        self.assertNotIn("amir", str(body))
 
     def test_branch_query_param_selects_that_branch(self):
         body = self.client.get(self.url, {"branch": self.jeddah.id}).json()
         self.assertEqual(body["branch"]["id"], self.jeddah.id)
-        self.assertEqual([row["name"] for row in body["staff"]], ["Faisal"])
 
     def test_unknown_branch_404s(self):
         response = self.client.get(self.url, {"branch": 999999})
@@ -111,50 +108,55 @@ class LoginChoicesTests(AccountsApiTestCase):
         self.assertEqual(response.json()["error"], "error.noBranch")
 
 
-class PinLoginTests(AccountsApiTestCase):
-    url = "/api/auth/pin-login/"
-
+class LoginTests(AccountsApiTestCase):
     def test_success_returns_tokens_and_staff(self):
-        body = self.pin_login(self.owner.id, "1111").json()
+        body = self.login("amir", "amir-secret-1").json()
         self.assertTrue(body["access"])
         self.assertTrue(body["refresh"])
         self.assertEqual(body["staff"]["id"], self.owner.id)
         self.assertEqual(body["staff"]["role"], StaffRole.OWNER)
-        # StaffSerializer's `pin` is write_only — the credential must never
-        # come back out, not even hashed.
-        self.assertNotIn("pin", body["staff"])
+        self.assertEqual(body["staff"]["username"], "amir")
+        self.assertFalse(body["staff"]["must_change_password"])
+        # The credential must never come back out, not even hashed.
+        self.assertNotIn("password", body["staff"])
+        self.assertNotIn("password_hash", body["staff"])
 
-    def test_wrong_pin_is_rejected(self):
-        response = self.pin_login(self.owner.id, "0000")
+    def test_username_is_case_and_space_insensitive(self):
+        self.assertEqual(self.login("  Amir ", "amir-secret-1").status_code, status.HTTP_200_OK)
+
+    def test_wrong_password_is_rejected_with_attempts_left(self):
+        response = self.login("amir", "nope-nope-nope")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(error_code(response), "error.invalidCredentials")
+        self.assertEqual(response.json()["attempts_left"], 2)
 
-    def test_unknown_staff_id_is_rejected_with_the_same_code(self):
-        """Same code as a wrong PIN on purpose — otherwise the response itself
-        tells an attacker which staff ids exist."""
-        response = self.pin_login(999999, "1111")
+    def test_unknown_username_is_rejected_with_the_same_code(self):
+        """Same code as a wrong password on purpose — otherwise the response
+        itself tells an attacker which usernames exist. And no attempts_left,
+        which would do the same."""
+        response = self.login("nobody", "amir-secret-1")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(error_code(response), "error.invalidCredentials")
+        self.assertNotIn("attempts_left", response.json())
 
     def test_inactive_staff_cannot_log_in(self):
-        response = self.pin_login(self.retired.id, "9999")
+        response = self.login("old.timer", "retired-secret-9")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(error_code(response), "error.invalidCredentials")
+        self.assertNotIn("attempts_left", response.json())
 
-    def test_one_branchs_pin_does_not_open_another_branchs_staff(self):
-        """Same PIN string, different branch's staff id."""
-        response = self.pin_login(self.jeddah_owner.id, "1111")
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_missing_fields_are_a_400(self):
+        self.assertEqual(self.client.post("/api/auth/login/", {}, format="json").status_code, 400)
 
     def test_access_token_authenticates_subsequent_requests(self):
-        access = self.pin_login(self.owner.id, "1111").json()["access"]
+        access = self.login("amir", "amir-secret-1").json()["access"]
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         response = self.client.get("/api/branches/active/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()["id"], self.riyadh.id)
 
     def test_refresh_mints_a_new_access_token(self):
-        refresh = self.pin_login(self.owner.id, "1111").json()["refresh"]
+        refresh = self.login("amir", "amir-secret-1").json()["refresh"]
         response = self.client.post("/api/auth/refresh/", {"refresh": refresh}, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.json()["access"])
@@ -163,24 +165,30 @@ class PinLoginTests(AccountsApiTestCase):
         response = self.client.post("/api/auth/refresh/", {"refresh": "not-a-token"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_me_returns_the_signed_in_staff(self):
+        access = self.login("junaid", "junaid-secret-3").json()["access"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        response = self.client.get("/api/auth/me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["username"], "junaid")
+
 
 class StaffAccessGateTests(AccountsApiTestCase):
-    """Guards the existing role gate. The login screen's staff *picker* is
-    public (login-choices), but the real staff resource must stay
-    owner/manager-only — easy to loosen by accident while wiring the former."""
+    """Guards the existing role gate: the staff resource must stay
+    owner/manager-only."""
 
     url = "/api/staff/"
 
-    def auth_as(self, staff, pin):
-        access = self.pin_login(staff.id, pin).json()["access"]
+    def auth_as(self, staff, password):
+        access = self.login(staff.username, password).json()["access"]
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
 
     def test_cashier_is_forbidden(self):
-        self.auth_as(self.cashier, "3333")
+        self.auth_as(self.cashier, "junaid-secret-3")
         self.assertEqual(self.client.get(self.url).status_code, status.HTTP_403_FORBIDDEN)
 
     def test_owner_sees_only_their_own_branch(self):
-        self.auth_as(self.owner, "1111")
+        self.auth_as(self.owner, "amir-secret-1")
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = [row["name"] for row in response.json()["results"]]
@@ -197,7 +205,7 @@ class StaffAccessGateTests(AccountsApiTestCase):
 class AttendanceGeofenceTests(AccountsApiTestCase):
     def setUp(self):
         super().setUp()
-        self.staff = make_staff(self.riyadh, "Employee", StaffRole.CASHIER, "4444")
+        self.staff = make_staff(self.riyadh, "Employee", StaffRole.CASHIER, "employee-secret-4")
         self.url = f"/api/staff/{self.staff.pk}"
 
     @staticmethod
@@ -234,4 +242,3 @@ class AttendanceGeofenceTests(AccountsApiTestCase):
         self.riyadh.longitude = None
         self.riyadh.save(update_fields=["latitude", "longitude", "updated_at"])
         self.assertEqual(self.client.post(f"{self.url}/clock-in/", self.fix(), format="json").status_code, 400)
-

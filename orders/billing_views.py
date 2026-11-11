@@ -449,11 +449,15 @@ class BillDetailView(APIView):
 
 class BillMarkPaidView(APIView):
     """
-    POST /api/bills/<id>/mark-paid/   {method: "cash"|"card"}
+    POST /api/bills/<id>/mark-paid/
+        {method: "cash"|"card", cash_tendered?: "1500.00", tip?: "0.00"}
 
     The cashier took the money at the till — notes in the drawer, or a card on
     the restaurant's own terminal. Online payments never come through here;
     they can only be settled by verifying a real Moyasar payment.
+
+    For cash, `cash_tendered` is what the guest handed over; the response
+    carries `change_given`. A "keep the change" goes in as `tip`.
     """
 
     permission_classes = [IsCashierStaff]
@@ -474,7 +478,18 @@ class BillMarkPaidView(APIView):
         if not billing.is_ready_to_pay(bill):
             return Response({"error": "error.billNotServed"}, status=status.HTTP_409_CONFLICT)
 
-        outcome, bill = billing.mark_bill_paid(bill.pk, method, actor=request.user)
+        tip = serializer.validated_data.get("tip")
+        if tip and billing.amount_outstanding(bill) <= 0:
+            # Nothing left to charge means no Payment row to carry the tip,
+            # so it would never reach the tips report.
+            return Response({"error": "error.tipNeedsPayment"}, status=status.HTTP_400_BAD_REQUEST)
+
+        outcome, bill = billing.mark_bill_paid(
+            bill.pk, method, actor=request.user,
+            cash_tendered=serializer.validated_data.get("cash_tendered"), tip=tip,
+        )
+        if outcome == billing.CASH_SHORT:
+            return Response({"cash_tendered": ["error.cashTenderedTooLow"]}, status=status.HTTP_400_BAD_REQUEST)
         return _bill_response(bill, result=outcome)
 
 

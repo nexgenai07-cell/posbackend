@@ -19,7 +19,7 @@ class FinancialAnalyticsTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Branch A", name_ar="A", timezone="Asia/Riyadh", currency="SAR")
         self.other_branch = Branch.objects.create(name_en="Branch B", name_ar="B", timezone="UTC")
-        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
+        self.owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
         self.client = APIClient()
         self.client.force_authenticate(user=self.owner)
         category = Category.objects.create(branch=self.branch, name_en="Food", name_ar="Food")
@@ -198,6 +198,6 @@ class DailySalesReportTests(TestCase):
         self.assertEqual(response.json()["days"], [])
         self.assertEqual(Decimal(response.json()["totals"]["revenue"]), Decimal("0"))
 
-        cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, pin_hash="x")
+        cashier = Staff.objects.create(branch=self.branch, name="Cashier", role=StaffRole.CASHIER, password_hash="x")
         self.client.force_authenticate(user=cashier)
         self.assertEqual(self.client.get("/api/reports/daily-sales/?preset=today").status_code, 403)

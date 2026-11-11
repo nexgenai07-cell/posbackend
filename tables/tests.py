@@ -19,7 +19,7 @@ from .services import parse_qr_payload
 
 def make_staff(branch, name, role, pin, is_active=True):
     staff = Staff(branch=branch, name=name, role=role, is_active=is_active)
-    staff.set_pin(pin)
+    staff.set_password(pin)
     staff.save()
     return staff
 
@@ -129,7 +129,7 @@ class TablesApiTestCase(TestCase):
 
     def auth_as(self, staff, pin):
         access = self.client.post(
-            "/api/auth/pin-login/", {"staff_id": staff.id, "pin": pin}, format="json"
+            "/api/auth/login/", {"username": staff.username, "password": pin}, format="json"
         ).json()["access"]
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
 

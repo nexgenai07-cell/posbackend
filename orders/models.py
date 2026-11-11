@@ -98,6 +98,13 @@ class Bill(models.Model):
     requested_method = models.CharField(max_length=8, choices=BillMethod.choices, blank=True)
     paid_method = models.CharField(max_length=8, choices=BillMethod.choices, blank=True)
     total_at_payment = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Cash handover at the latest settlement (cash only, null otherwise):
+    # what the guest handed over, what went back as change, and any tip
+    # taken on top. Payment.amount stays the bill amount, so reports and VAT
+    # never see the tendered figure.
+    cash_tendered = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    change_given = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    tip_at_payment = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     pay_requested_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
     closed_at = models.DateTimeField(null=True, blank=True)
@@ -280,6 +287,11 @@ class Payment(BaseModel):
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     method = models.CharField(max_length=8, choices=PaymentMethod.choices)
     tip = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Cash only: notes the guest handed over, and the change returned
+    # (cash_tendered - amount - tip). Null for card/other, and for cash taken
+    # before this was recorded. `amount` is always what the order was charged.
+    cash_tendered = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    change_given = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     paid_at = models.DateTimeField(auto_now_add=True)
 
     class Meta(BaseModel.Meta):

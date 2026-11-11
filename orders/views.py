@@ -945,6 +945,7 @@ class OrderPaymentsView(APIView):
                     and existing.amount == serializer.validated_data["amount"]
                     and existing.method == serializer.validated_data["method"]
                     and existing.tip == serializer.validated_data.get("tip")
+                    and existing.cash_tendered == serializer.validated_data.get("cash_tendered")
                 )
                 if not same_request:
                     return Response({"error": "error.idempotencyKeyConflict"}, status=status.HTTP_409_CONFLICT)

@@ -27,7 +27,7 @@ class QueryCountTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Main", name_ar="Main")
         self.owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
-        self.owner.set_pin("1234")
+        self.owner.set_password("1234")
         self.owner.save()
         self.client = APIClient()
         self.client.force_authenticate(user=self.owner)

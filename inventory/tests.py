@@ -169,14 +169,14 @@ class InventoryPermissionTests(TestCase):
         paths = ["/api/inventory-items/", "/api/inventory-items/low-stock/",
                  "/api/stock-movements/", "/api/recipes/"]
         for role in (StaffRole.CASHIER, StaffRole.WAITER, StaffRole.KITCHEN):
-            staff = Staff.objects.create(branch=self.branch, name=role, role=role, pin_hash="x")
+            staff = Staff.objects.create(branch=self.branch, name=role, role=role, password_hash="x")
             self.client.force_authenticate(user=staff)
             for path in paths:
                 with self.subTest(role=role, path=path):
                     self.assertEqual(self.client.get(path).status_code, 403)
 
     def test_owner_can_read_inventory_and_product_orderability_has_no_stock_detail(self):
-        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
+        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
         category = Category.objects.create(branch=self.branch, name_en="Food", name_ar="Food")
         product = Product.objects.create(
             branch=self.branch, category=category, name_en="No recipe", name_ar="No recipe", price=1, cost_price=1,
@@ -189,7 +189,7 @@ class InventoryPermissionTests(TestCase):
         self.assertNotIn("current_stock", response.data)
 
     def test_initial_stock_and_positive_adjustments_increment_with_history(self):
-        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
+        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
         self.client.force_authenticate(user=owner)
         response = self.client.post("/api/inventory-items/", {
             "branch": self.branch.pk, "name": "Flour", "unit": "g", "current_stock": "5",
@@ -213,7 +213,7 @@ class InventoryPermissionTests(TestCase):
         self.assertEqual(movement.resulting_stock, Decimal("10.000"))
 
     def test_adjustment_api_rejects_a_negative_resulting_balance(self):
-        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, pin_hash="x")
+        owner = Staff.objects.create(branch=self.branch, name="Owner", role=StaffRole.OWNER, password_hash="x")
         item = InventoryItem.objects.create(branch=self.branch, name="Flour", unit="g", current_stock=5)
         self.client.force_authenticate(user=owner)
         response = self.client.post(f"/api/inventory-items/{item.pk}/adjust/", {

@@ -10,6 +10,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.settings import api_settings as jwt_settings
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from branches.models import Branch
@@ -17,59 +18,75 @@ from branches.serializers import BranchSerializer
 from common.mixins import BranchScopedQuerysetMixin
 from common.geofence import validate_branch_location
 
+from .authentication import resolve_staff
 from .models import Shift, ShiftTemplate, Staff, StaffRole
-from .permissions import IsOwnerOrManager
+from .permissions import IsOwner, IsOwnerOrManager
 from .serializers import (
-    LoginStaffChoiceSerializer,
-    PinLoginSerializer,
     AttendanceSettingsSerializer,
+    ChangePasswordSerializer,
+    PasswordLoginSerializer,
     ShiftSerializer,
     ShiftTemplateSerializer,
     StaffSerializer,
+    TemporaryPasswordSerializer,
 )
+from .services import LoginRejected, authenticate_staff, change_own_password, reset_password, unlock_staff
 
 
-class PinLoginView(APIView):
+def _issue_tokens(staff):
+    refresh = RefreshToken.for_user(staff)
+    refresh["role"] = staff.role
+    refresh["branch_id"] = staff.branch_id
+    return {"access": str(refresh.access_token), "refresh": str(refresh)}
+
+
+class LoginView(APIView):
+    """
+    POST /api/auth/login/ {username, password}.
+
+    * 200: tokens + the staff record. If `staff.must_change_password` is set
+      the access token only opens change-password/logout/me (see
+      accounts/authentication.py) until the staff member picks their own.
+    * 400 error.invalidCredentials: unknown username, inactive account or
+      wrong password - deliberately the same code, so the response doesn't
+      confirm which usernames exist. A wrong password on a real account
+      also carries `attempts_left` (2, then 1).
+    * 423 error.accountLocked: three wrong passwords in a row, or any
+      attempt - even the right password - while locked. Only an Owner
+      (/staff/<id>/unlock/) or `manage.py unlock_staff` clears it.
+    * 429: more than the `login` throttle scope allows from one IP.
+    """
+
     permission_classes = [AllowAny]
-    throttle_scope = "pin-login"
+    throttle_scope = "login"
 
     def post(self, request):
-        serializer = PinLoginSerializer(data=request.data)
+        serializer = PasswordLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        staff = serializer.validated_data["staff"]
+        try:
+            staff = authenticate_staff(**serializer.validated_data)
+        except LoginRejected as rejected:
+            body = {"error": rejected.code}
+            if rejected.attempts_left is not None:
+                body["attempts_left"] = rejected.attempts_left
+            return Response(body, status=rejected.status_code)
 
-        refresh = RefreshToken.for_user(staff)
-        refresh["role"] = staff.role
-        refresh["branch_id"] = staff.branch_id
+        return Response({**_issue_tokens(staff), "staff": StaffSerializer(staff).data})
 
-        return Response({
-            "access": str(refresh.access_token),
-            "refresh": str(refresh),
-            "staff": StaffSerializer(staff).data,
-        })
 
 class LoginChoicesView(APIView):
     """
-    Everything the login screen needs *before* it holds a token: which branch
-    this terminal is for, and who to put in the name picker.
+    What the login screen needs *before* it holds a token: which branch this
+    terminal is for (name and logo). Nothing else - in particular no staff
+    list: the old name picker handed every visitor half of each credential.
 
-    This exists because the two obvious endpoints both require auth:
-    `branches/active/` is `IsAuthenticated` and `staff/` is owner/manager-only,
-    while the login screen by definition has no token yet. Loosening either of
-    those to serve the login screen would have opened the whole staff/branch
-    resource — a dedicated public endpoint exposes exactly a name, a role and
-    a branch name instead.
+    `branches/active/` is `IsAuthenticated`, and loosening it to serve the
+    login screen would open the whole branch resource; this public endpoint
+    exposes exactly the branch's display fields instead.
 
     `?branch=<id>` picks the branch; with no query param it falls back to the
     lowest-id branch, which is the single seeded one until multi-branch
-    terminal selection is a real flow. Only `is_active` staff are returned, so
-    a deactivated account disappears from the picker (and pin-login rejects it
-    anyway — see PinLoginSerializer).
-
-    Known trade-off, accepted deliberately: staff names are readable by anyone
-    who can reach this endpoint. That is inherent to a name-picker login, not
-    a leak of credentials — no PIN material is returned by anything here, and
-    pin-login itself is rate-limited (see SIMPLE_JWT/throttle settings).
+    terminal selection is a real flow.
     """
 
     permission_classes = [AllowAny]
@@ -87,21 +104,17 @@ class LoginChoicesView(APIView):
             if branch is None:
                 return Response({"error": "error.noBranch"}, status=status.HTTP_404_NOT_FOUND)
 
-        staff = branch.staff.filter(is_active=True).order_by("name")
-        return Response({
-            "branch": BranchSerializer(branch).data,
-            "staff": LoginStaffChoiceSerializer(staff, many=True).data,
-        })
-
-
+        return Response({"branch": BranchSerializer(branch).data})
 
 
 class RefreshView(APIView):
     """
     Not SimpleJWT's built-in TokenRefreshView: that serializer re-validates
     the token's user-id claim against get_user_model() (auth.User), which
-    Staff isn't. This does the same job — mint a new access token from a
-    valid refresh token — without that lookup.
+    Staff isn't. This does the same job - mint a new access token from a
+    valid refresh token - and applies the same "still allowed in" rule as
+    StaffJWTAuthentication, so a locked or deactivated account can't keep
+    minting access tokens from an old refresh token.
     """
 
     permission_classes = [AllowAny]
@@ -109,22 +122,54 @@ class RefreshView(APIView):
     def post(self, request):
         try:
             refresh = RefreshToken(request.data["refresh"])
+            staff_id = refresh[jwt_settings.USER_ID_CLAIM]
         except (KeyError, TokenError):
+            return Response({"error": "error.invalidToken"}, status=status.HTTP_401_UNAUTHORIZED)
+        if resolve_staff(staff_id) is None:
             return Response({"error": "error.invalidToken"}, status=status.HTTP_401_UNAUTHORIZED)
         return Response({"access": str(refresh.access_token)})
 
 
 class LogoutView(APIView):
     """
-    No server-side token blacklist (see config/settings.py) — logout is the
+    No server-side token blacklist (see config/settings.py) - logout is the
     client discarding its tokens. This endpoint exists for API symmetry and
     so the frontend has a clear call to make, but it's a no-op here.
     """
 
     permission_classes = [IsAuthenticated]
+    allow_password_change_required = True
 
     def post(self, request):
         return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+class MeView(APIView):
+    """The signed-in staff record, e.g. to re-check `must_change_password`
+    after a page reload."""
+
+    permission_classes = [IsAuthenticated]
+    allow_password_change_required = True
+
+    def get(self, request):
+        return Response(StaffSerializer(request.user).data)
+
+
+class ChangePasswordView(APIView):
+    """
+    POST /api/auth/change-password/ {current_password, new_password}.
+    The one write a `must_change_password` token is allowed to make; a
+    success clears that flag so the rest of the API opens up.
+    """
+
+    permission_classes = [IsAuthenticated]
+    allow_password_change_required = True
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        staff = change_own_password(request.user, serializer.validated_data["new_password"])
+        return Response(StaffSerializer(staff).data)
 
 
 def _is_self_or_manager(request, staff):
@@ -162,9 +207,10 @@ def _is_late_for_staff(staff, local_now):
 
 class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
     """CRUD is owner/manager only. clock-in/clock-out relax that to 'self or
-    a manager', overriding permission_classes per-action below. Queryset is
-    scoped to the requester's own branch — an owner can't see or edit
-    another branch's staff."""
+    a manager', unlock/reset-password tighten it to Owner only, overriding
+    permission_classes per-action below. Queryset is scoped to the
+    requester's own branch - an owner can't see, edit or unlock another
+    branch's staff."""
 
     queryset = Staff.objects.select_related("branch").prefetch_related("stations").all()
     serializer_class = StaffSerializer
@@ -174,13 +220,35 @@ class StaffViewSet(BranchScopedQuerysetMixin, viewsets.ModelViewSet):
         qs = super().get_queryset()
         from common.filters import text_filter, choice_filter
         params = self.request.query_params
-        qs = text_filter(qs, params, "search", ["name"])
+        qs = text_filter(qs, params, "search", ["name", "username"])
         qs = choice_filter(
             qs, params, "role", field="role",
             allowed=["owner", "manager", "cashier", "waiter", "kitchen"]
         )
         from common.filters import ordering_filter
         return ordering_filter(qs, params, {"name": "name", "role": "role"}, ["name"])
+
+    @action(detail=True, methods=["post"], url_path="unlock", permission_classes=[IsOwner])
+    def unlock(self, request, pk=None):
+        """Owner only. Clears the lock and the failed-attempt counter and
+        records who did it. Optional `new_password` sets a temporary one."""
+        staff = self.get_object()
+        serializer = TemporaryPasswordSerializer(data=request.data, staff=staff, required=False)
+        serializer.is_valid(raise_exception=True)
+        if not staff.is_locked:
+            return Response({"error": "error.accountNotLocked"}, status=status.HTTP_400_BAD_REQUEST)
+        unlock_staff(staff, by=request.user, new_password=serializer.validated_data.get("new_password"))
+        return Response(StaffSerializer(staff).data)
+
+    @action(detail=True, methods=["post"], url_path="reset-password", permission_classes=[IsOwner])
+    def reset_password(self, request, pk=None):
+        """Owner only. Temporary password for someone who forgot theirs; they
+        must change it on their next login."""
+        staff = self.get_object()
+        serializer = TemporaryPasswordSerializer(data=request.data, staff=staff, required=True)
+        serializer.is_valid(raise_exception=True)
+        reset_password(staff, by=request.user, new_password=serializer.validated_data["new_password"])
+        return Response(StaffSerializer(staff).data)
 
     @action(detail=True, methods=["get"], url_path="shifts", permission_classes=[IsAuthenticated])
     def shifts(self, request, pk=None):

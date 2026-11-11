@@ -24,7 +24,7 @@ class InputVatFixesTests(TestCase):
     def setUp(self):
         self.branch = Branch.objects.create(name_en="Main", name_ar="الرئيسي")
         self.owner = Staff(branch=self.branch, name="Owner", role=StaffRole.OWNER)
-        self.owner.set_pin("1234")
+        self.owner.set_password("1234")
         self.owner.save()
         self.supplier = Supplier.objects.create(name_en="Fresh Meat Co", name_ar="لحوم", vat_number=SUPPLIER_VAT,
                                                 crn="1010010000")

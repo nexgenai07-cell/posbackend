@@ -6,15 +6,13 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.settings import api_settings
 from rest_framework_simplejwt.tokens import AccessToken
 
-from accounts.models import Staff
+from accounts.authentication import resolve_staff
 
 
 @database_sync_to_async
 def _get_staff(staff_id):
-    try:
-        return Staff.objects.get(pk=staff_id, is_active=True)
-    except Staff.DoesNotExist:
-        return None
+    # Same rule as the REST side: active and not locked (accounts/authentication.py).
+    return resolve_staff(staff_id)
 
 
 class JWTAuthMiddleware(BaseMiddleware):

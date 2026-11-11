@@ -69,14 +69,17 @@ _MOYASAR_MEANS = {
 # -- entry points (called from orders/, inside their transactions) -----------
 
 
-def orders_paid(order_ids, *, actor=None, moyasar=None):
-    """Register: these orders were just settled together."""
+def orders_paid(order_ids, *, actor=None, moyasar=None, cash=None):
+    """Register: these orders were just settled together.
+
+    `cash` = {"tendered", "change"} for a bill-level cash handover, which has
+    no Payment row of its own to carry it (till payments carry theirs)."""
     order_ids = [order_id for order_id in order_ids if order_id]
     if not order_ids:
         return
     source = moyasar_source(moyasar) if moyasar else None
     actor_id = getattr(actor, "pk", None)
-    transaction.on_commit(lambda: _quietly(invoice_orders, order_ids, actor_id=actor_id, moyasar=source))
+    transaction.on_commit(lambda: _quietly(invoice_orders, order_ids, actor_id=actor_id, moyasar=source, cash=cash))
 
 
 def order_cancelled(order_id, *, actor=None):
@@ -103,7 +106,7 @@ def _quietly(function, *args, send=True, **kwargs):
 # -- issuing ---------------------------------------------------------------
 
 
-def invoice_orders(order_ids, *, actor_id=None, moyasar=None, source="pos"):
+def invoice_orders(order_ids, *, actor_id=None, moyasar=None, source="pos", cash=None):
     """Issue one invoice for the given orders' settlement, or None when
     there's nothing to invoice (ZATCA off, already invoiced, nothing paid)."""
     from orders.models import Order
@@ -144,7 +147,8 @@ def invoice_orders(order_ids, *, actor_id=None, moyasar=None, source="pos"):
             log.info("Orders %s were invoiced concurrently; nothing to do", [o.pk for o in eligible])
             return None
         document.buyer = buyer
-        document.receipt = _receipt(settings, eligible, sale, totals, payments, buyer)
+        document.receipt = _receipt(settings, eligible, sale, totals, payments, buyer,
+                                    cash=_cash_handover(eligible, cash))
         document.save(update_fields=["buyer", "receipt"])
     log.info("Invoice %s issued for orders %s", document.number, [o.pk for o in eligible])
     return document
@@ -400,6 +404,28 @@ def _payments_of(orders, moyasar):
     return payments
 
 
+def _cash_handover(orders, bill_cash):
+    """
+    Notes received and change returned for this settlement, printed on the
+    receipt only — never part of the invoice totals or the XML. Adds up the
+    till payments' own records and a bill-level handover; None when no cash
+    handover was recorded.
+    """
+    tendered = change = _ZERO
+    recorded = False
+    for order in orders:
+        for payment in order.payments.all():
+            if payment.cash_tendered is not None:
+                tendered += payment.cash_tendered
+                change += payment.change_given or _ZERO
+                recorded = True
+    if bill_cash and bill_cash.get("tendered") is not None:
+        tendered += Decimal(bill_cash["tendered"])
+        change += Decimal(bill_cash.get("change") or _ZERO)
+        recorded = True
+    return {"tendered": str(tendered), "change": str(change)} if recorded else None
+
+
 def _party(buyer):
     if buyer is None:
         return None
@@ -438,7 +464,7 @@ def _with_vat_lines(items, totals):
     return [{**item, "lines": by_key.get(item.get("key"), [])} for item in items]
 
 
-def _receipt(settings, orders, sale, totals, payments, buyer):
+def _receipt(settings, orders, sale, totals, payments, buyer, cash=None):
     tables = [order.table.label_en for order in orders if order.table_id]
     return {
         "seller": {
@@ -458,6 +484,7 @@ def _receipt(settings, orders, sale, totals, payments, buyer):
         "sale_lines": sale["per_order"],
         "payments": payments,
         "tip": str(sum((Decimal(p["tip"]) for p in payments), _ZERO)),
+        "cash": cash,
         "totals": _totals(totals),
         "issued_for": timezone.now().isoformat(),
     }

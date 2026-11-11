@@ -24,7 +24,7 @@ class ShiftTemplateApiTests(TestCase):
 
     @staticmethod
     def make_staff(branch, name, role):
-        staff = Staff(branch=branch, name=name, role=role, pin_hash="unused")
+        staff = Staff(branch=branch, name=name, role=role, password_hash="unused")
         staff.save()
         return staff
 

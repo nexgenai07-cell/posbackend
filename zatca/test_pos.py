@@ -70,10 +70,12 @@ class PosTestBase(TestCase):
                                  price_snapshot=price, quantity=quantity, status=OrderItemStatus.SERVED)
         return order
 
-    def pay(self, order, amount, method="cash", tip=None):
+    def pay(self, order, amount, method="cash", tip=None, cash_tendered=None):
         body = {"request_id": uuid.uuid4().hex, "amount": str(amount), "method": method}
         if tip is not None:
             body["tip"] = str(tip)
+        if cash_tendered is not None:
+            body["cash_tendered"] = str(cash_tendered)
         with self.captureOnCommitCallbacks(execute=True):
             response = self.api.post(f"/api/orders/{order.pk}/payments/", body, format="json")
         self.assertEqual(response.status_code, 201, response.data)
@@ -121,6 +123,26 @@ class TillPaymentTests(PosTestBase):
         self.assertIn("<cbc:PaymentMeansCode>48</cbc:PaymentMeansCode>", invoice.signed_xml)
         self.assertIn("<cbc:PaymentMeansCode>10</cbc:PaymentMeansCode>", invoice.signed_xml)
         self.assertEqual([p["method"] for p in invoice.receipt["payments"]], ["card", "cash"])
+
+    def test_receipt_prints_cash_received_and_change_outside_the_invoice(self):
+        order = self.served_order()
+        self.pay(order, "30.00", tip="5.00", cash_tendered="50.00")
+        invoice = self.invoice_of(order)
+        self.assertEqual(invoice.receipt["cash"], {"tendered": "50.00", "change": "15.00"})
+        self.assertIn('<cbc:PayableAmount currencyID="SAR">30.00</cbc:PayableAmount>', invoice.signed_xml)
+        [receipt] = self.receipts(order=order.pk)
+        self.assertEqual(receipt["cash"], {"tendered": "50.00", "change": "15.00"})
+
+    def test_split_cash_payments_add_up_on_the_receipt(self):
+        order = self.served_order()
+        self.pay(order, "10.00", cash_tendered="10.00")
+        self.pay(order, "20.00", cash_tendered="50.00")
+        self.assertEqual(self.invoice_of(order).receipt["cash"], {"tendered": "60.00", "change": "30.00"})
+
+    def test_card_receipt_has_no_cash_block(self):
+        order = self.served_order()
+        self.pay(order, "30.00", method="card")
+        self.assertIsNone(self.invoice_of(order).receipt["cash"])
 
     def test_zatca_off_changes_nothing(self):
         ZatcaSettings.objects.update(enabled=False)
@@ -172,9 +194,24 @@ class BillSettlementTests(PosTestBase):
         self.first = self.served_order(quantity=3, table=self.table, bill=self.bill)
         self.second = self.served_order(quantity=1, price=D("1.11"), table=self.table, bill=self.bill)
 
-    def settle(self, method, moyasar=None):
+    def settle(self, method, moyasar=None, **cash):
         with self.captureOnCommitCallbacks(execute=True):
-            return billing.mark_bill_paid(self.bill.pk, method, actor=self.cashier, moyasar=moyasar)
+            return billing.mark_bill_paid(self.bill.pk, method, actor=self.cashier, moyasar=moyasar, **cash)
+
+    def test_bill_cash_handover_is_on_the_receipt(self):
+        # Bill is 31.11; 50.00 handed over with a 2.00 tip leaves 16.89 change.
+        outcome, _ = self.settle(BillMethod.CASH, cash_tendered=D("50.00"), tip=D("2.00"))
+        self.assertEqual(outcome, billing.SETTLED)
+        invoice = self.invoice_of(self.first)
+        self.assertEqual(invoice.receipt["cash"], {"tendered": "50.00", "change": "16.89"})
+        self.assertEqual(invoice.receipt["tip"], "2.00")
+        self.assertEqual(invoice.receipt["totals"]["payable"], "31.11")
+
+    def test_short_bill_cash_issues_no_invoice(self):
+        outcome, _ = self.settle(BillMethod.CASH, cash_tendered=D("30.00"))
+        self.assertEqual(outcome, billing.CASH_SHORT)
+        self.assertFalse(ZatcaDocument.objects.exists())
+        self.assertFalse(Payment.objects.exists())
 
     def test_one_invoice_for_the_whole_settlement(self):
         self.settle(BillMethod.CARD)
