@@ -31,6 +31,13 @@ DEBUG = env("DEBUG")
 
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=[])
 
+# Full origins (scheme + host) allowed to POST Django's own forms, i.e. the
+# /admin/ login and edit pages. Behind an HTTPS proxy Django sees plain http,
+# so its same-origin check fails without this.
+# e.g. CSRF_TRUSTED_ORIGINS=https://backendpos.nxgenai.pro
+# The REST API uses JWT, not cookies, and is not affected.
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
+
 
 # Application definition
 
